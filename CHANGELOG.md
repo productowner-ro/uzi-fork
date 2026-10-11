@@ -22,60 +22,12 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Added
-
-- **Schedules keep the last 10 fires that started or skipped something, so an earlier dispatch is no longer hidden by a later empty tick ([#2519](https://github.com/vtmocanu/uzi/issues/2519)).**
-  A new `recent_fires` list (newest first, same shape as `last_fire`) is exposed on the schedule API, in an expandable **Recent fires** panel on the Schedules page, and as a **Recent fires** block in `uzi schedule get` (`--json` `.recent_fires`); `last_fire` is unchanged and can differ from `recent_fires[0]`. Only fires with `matched > 0` are appended, so a capacity-blocked tick, a tick that examined nothing, run-now, and the parked and transient paths add nothing; skips count, so a long pause (a `schedules_paused` skip on every tick) can push older dispatches out of the 10. Existing schedules are backfilled with their current `last_fire` when it matched something.
-
-### Changed
-
-- **The lead context meter reads the Claude SDK's summary context usage ([#1300](https://github.com/vtmocanu/uzi/issues/1300)).**
-  It skips the per-category token-count API calls the full reading made each turn; the summary answers from the last response's usage plus local estimates, and the meter's fields and timeout are unchanged.
-- **A run requeued because its worker went stale is held for that worker's return, and the wait is explained ([#2705](https://github.com/vtmocanu/uzi/issues/2705)).**
-  `WORKER_STALE_REQUEUE_GRACE` (default `10m`, `0` disables) keeps such a run pinned to its previous worker while that worker's row exists, so a worker killed and restarted resumes its own run from local recovery state instead of a peer starting cold; `WORKER_AFFINITY_CEILING` still releases it and a deleted worker row falls open at once. Ephemeral provisioning does not count a held run as demand. Health shows `waiting_worker` with "waiting until <time> for its previous worker <name> to return; another worker may take it after that", `uzi run get` shows `HEALTH_REASON`, and the TUI crew rail shows a `queued` line. `queue.waiting` and `fleet.capacity` exclude runs showing that explanation, so it does not trip either alarm early. Both keep their previous timing, measured from the end of the hold: for an owner whose only worker died `fleet.capacity` fires about max(grace, queued threshold) + 5m after the requeue, which is 15m by default. A genuinely dead owner whose row remains delays takeover by up to the grace. Limitation: a Codex account park and promotion renews both the grace and the ceiling, so there is no global bound across cycles. The variable is in `docker-compose.yml` and `.env.example`; the chart is unchanged.
-- **Docs, `uzi admin review-bots` help and the bundled uzi-cli skill use on-screen labels, and Docker-capable workers explain the repo allowlist trade-off ([#2502](https://github.com/vtmocanu/uzi/issues/2502)).**
-  Web UI locations now read Admin → Instance and Boards instead of Admin Settings and Repos page; the Docker-capable hosted-worker card and the worker docs say a Docker-capable worker claims repo runs only for repos on the Docker worker repo allowlist, and the skill gains a queued-run playbook.
-
-### Fixed
-
-- **Cancelled runs stop counting as active once their exact generation's archive covers retained source ([#2652](https://github.com/vtmocanu/uzi/issues/2652)).**
-  After execution ends, workers can retire an authenticated terminal or finalize report when fresh terminal ownership and a verified archive cover the same generation and its current clean source. Uncertain, changed or dirty sources retain the report; retirement keeps custody holds, source pins and clone cleanup protections intact.
-
-- **Worker images exclude run-local artifacts from their baked source ([#2523](https://github.com/vtmocanu/uzi/issues/2523)).**
-  Both worker templates exclude `.uzi/`, keeping scratch and recovery artifacts out of `/opt/uzi-src` and preventing scratch updates from invalidating the source-copy cache.
-
-- **Codex evidence is refused as soon as an unterminated line exceeds 64 KiB ([#2522](https://github.com/vtmocanu/uzi/issues/2522)).**
-  The launcher counts incoming bytes before readline buffers them and destroys an oversized evidence stream immediately, while retaining the existing delimiter handling and refusal classification.
-
-- **Mock Docker allowlist saves match the server UUID parser.**
-  Saves accept compact UUIDs, URN prefixes, ASCII wrappers and Go whitespace while preserving the raw input; invalid tokens, including BOM padding, leave the saved allowlist unchanged.
-
-- **Run actions ignore responses from earlier visits or superseded requests.**
-  Navigating between runs resets action feedback; late resume, cancel, pool-resume and plan-gate responses cannot alter a newer action's busy state, errors or confirmation notices.
-
-- **A queued run blocked by the Docker worker repo allowlist is flagged waiting for worker right away, with wording that fits its owner ([#2501](https://github.com/vtmocanu/uzi/issues/2501)).**
-  When the owner has workers online but all of them are Docker workers and the run's repo isn't on the Docker worker repo allowlist, the next health sweep sets the waiting-for-worker flag and reason instead of showing health ok until **Stuck queued after** (`health_queued_seconds`, default 600s) elapsed; every other waiting reason keeps the threshold, a higher-precedence block (vault locked, custody limit) still hides it, and `health_queued_seconds=0` still disables all queued flags. The reason now depends on the owner's role: an admin owner is told to add the repo under Admin → Instance → Docker worker repo allowlist, any other owner to ask an admin to do so, since only an admin can change it (an admin viewing another user's run sees the owner's variant). Side effects: the owner's Slack nudge for this flag arrives sooner (still subject to the nudge cooldown), the admin `queue.waiting` check warns about 10 minutes sooner for these runs because it ages them from the flag, and in a mixed fleet whose only non-Docker worker is briefly offline the run is flagged at once and clears on the next sweep once an eligible worker is back.
-
-- **Checkpoint publication tolerates extra flush packets after a plain receive-pack report ([#2703](https://github.com/vtmocanu/uzi/issues/2703)).**
-  A plain (non-sideband) receive-pack report followed by one or more bare flush packets is still read as the complete report, so publication no longer fails with "missing or incomplete receive-pack acknowledgement"; data or contradictory packets after the report are still not treated as an acknowledgement.
-- **A transient storage or deadline error during pre-clone retained-recovery discovery no longer fails the claim ([#2613](https://github.com/vtmocanu/uzi/issues/2613)).**
-  Discovery now retries only confirmed operational errors (the operation deadline, identified by an elapsed deadline plus positive deadline evidence, and EAGAIN, EMFILE, ENFILE or ENOMEM), at most twice per claim across both discovery callers with the existing exponential delay; typed, corruption and unsafe-storage errors stay terminal, and an exhausted allowance fails with "local recovery storage busy or unavailable after bounded retries" while keeping local work and custody. The allowance is in-memory, never parks, and does not touch the persisted episode budget; it adds about 2 x codexBoundaryDeadlineMs plus 3 x recoveryRetryMs of scheduled time (about 63 s at defaults), not a wall-clock guarantee. See [ADR-1197](adr/1197-transient-recovery-park.md).
-- **A refused checkpoint publish now says why ([#2704](https://github.com/vtmocanu/uzi/issues/2704)).**
-  The push broker's refusals were all reported as `skipped: unsupported`. They now carry their own reason: `tip_missing` (the pack did not contain the declared commit), `pack_too_large` (the pack exceeded an inflation budget) or `pack_invalid` (empty or malformed pack). `unsupported` now means only a run kind with no checkpoint branch. The api logs each refusal at WARN as `worker run publish refused`, with the run id, the reason and a content-free detail naming the exceeded budget and its limit or the parse check that failed. The run feed shows `checkpoint publish skipped: <reason>`, including `superseded`, which used to show as `other`. Publishing is still best-effort: a refusal is a 200 skip and the run continues. Older workers show the new reasons as `other`.
-- **Release checks cover the full worker runtime ([#1466](https://github.com/vtmocanu/uzi/issues/1466)).**
-  Changelog coverage and release promotion now share the worker autobump runtime paths, including templates and Codex assets, while excluding tests.
-- **Recovery release acknowledgments are bounded ([#2402](https://github.com/vtmocanu/uzi/issues/2402)).**
-  The worker rejects release ACKs exceeding 16 KiB and retains local recovery evidence when the server response overflows.
-- **Neutralized Markdown links no longer look clickable ([#1968](https://github.com/vtmocanu/uzi/issues/1968)).**
-  A Markdown link whose URL is empty or uses a dangerous scheme (`javascript:`, `data:`, `file:`) now renders as plain text rather than an href-less anchor that was still styled as a link, so a report author cannot present a fake call to action.
-- **The usage panel now counts the spend of the intent, plan and PR-description summaries ([#2686](https://github.com/vtmocanu/uzi/issues/2686)).**
-  These passes run on the run's own credential (intent and plan on Claude; the PR description on Claude or Codex), but their tokens and cost never reached the run's usage. The worker now sends one `summary_usage` message per pass that reported usage, and the api stores it under a separate `summary_pass:<model>` key so it cannot collapse into the run's own figure; the run page shows it as an **Intent, plan & PR summaries** row that adds up to the **Run total**. The messages are hidden from the transcript, activity feed, `uzi run logs`, the TUI and the run judge's input (`--json` still carries them). On Claude, a credential switch also waits up to 3 seconds for an in-flight intent summary to finish, then up to 3 more after cancelling it. A pass that finishes after the run's claim is fenced reports nothing. Roll the api before the workers: an api that predates this change stores the message but does not count its usage. The usage panel also appears when a run's only spend is summary or Now-summary spend (for example a lead that failed early), showing those rows and a **Run total**, with the total's cost shown as unavailable when that spend could not be priced.
-
 ## [0.86.0] - 2026-10-06
 
 ### Changed
 
 - **Routine dependency bump: `gitlab.com/gitlab-org/api/client-go/v3` to v3.15.0 ([#2315](https://github.com/vtmocanu/uzi/pull/2315)).**
+- **Routine agent dependency updates (agent lockfile changes now count as shipping, #1466): Renovate batch ([#2557](https://github.com/vtmocanu/uzi/pull/2557)), oxlint 1.86.0 ([#2314](https://github.com/vtmocanu/uzi/pull/2314)), npm audit fix for proxy-addr and source-map-js ([#2319](https://github.com/vtmocanu/uzi/pull/2319)).**
   No uzi code change required.
 
 - **Ephemeral Docker preference on the Workers page ([#2278](https://github.com/vtmocanu/uzi/issues/2278)).**
@@ -182,6 +134,13 @@ through `[0.52.0]`.)
 - **Documentation heading links work in the app ([#2262](https://github.com/vtmocanu/uzi/issues/2262)).**
   In-app documentation headings have fragment IDs, and links to a heading scroll it into view with space for the mobile navigation bar.
 
+- **The lead context meter reads the Claude SDK's summary context usage ([#1300](https://github.com/vtmocanu/uzi/issues/1300)).**
+  It skips the per-category token-count API calls the full reading made each turn; the summary answers from the last response's usage plus local estimates, and the meter's fields and timeout are unchanged.
+- **A run requeued because its worker went stale is held for that worker's return, and the wait is explained ([#2705](https://github.com/vtmocanu/uzi/issues/2705)).**
+  `WORKER_STALE_REQUEUE_GRACE` (default `10m`, `0` disables) keeps such a run pinned to its previous worker while that worker's row exists, so a worker killed and restarted resumes its own run from local recovery state instead of a peer starting cold; `WORKER_AFFINITY_CEILING` still releases it and a deleted worker row falls open at once. Ephemeral provisioning does not count a held run as demand. Health shows `waiting_worker` with "waiting until <time> for its previous worker <name> to return; another worker may take it after that", `uzi run get` shows `HEALTH_REASON`, and the TUI crew rail shows a `queued` line. `queue.waiting` and `fleet.capacity` exclude runs showing that explanation, so it does not trip either alarm early. Both keep their previous timing, measured from the end of the hold: for an owner whose only worker died `fleet.capacity` fires about max(grace, queued threshold) + 5m after the requeue, which is 15m by default. A genuinely dead owner whose row remains delays takeover by up to the grace. Limitation: a Codex account park and promotion renews both the grace and the ceiling, so there is no global bound across cycles. The variable is in `docker-compose.yml` and `.env.example`; the chart is unchanged.
+- **Docs, `uzi admin review-bots` help and the bundled uzi-cli skill use on-screen labels, and Docker-capable workers explain the repo allowlist trade-off ([#2502](https://github.com/vtmocanu/uzi/issues/2502)).**
+  Web UI locations now read Admin → Instance and Boards instead of Admin Settings and Repos page; the Docker-capable hosted-worker card and the worker docs say a Docker-capable worker claims repo runs only for repos on the Docker worker repo allowlist, and the skill gains a queued-run playbook.
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -247,6 +206,9 @@ through `[0.52.0]`.)
 
 - **Answer agent questions from the TUI ([#2550](https://github.com/vtmocanu/uzi/issues/2550)).**
   Run owners can press `i` to compose option selections and details, review each answer before sending, and reopen drafts kept in the current TUI session; uncertain delivery blocks resending in that session and points to the web or Slack, which remain the fallback for read-only viewers and unsupported payloads.
+
+- **Schedules keep the last 10 fires that started or skipped something, so an earlier dispatch is no longer hidden by a later empty tick ([#2519](https://github.com/vtmocanu/uzi/issues/2519)).**
+  A new `recent_fires` list (newest first, same shape as `last_fire`) is exposed on the schedule API, in an expandable **Recent fires** panel on the Schedules page, and as a **Recent fires** block in `uzi schedule get` (`--json` `.recent_fires`); `last_fire` is unchanged and can differ from `recent_fires[0]`. Only fires with `matched > 0` are appended, so a capacity-blocked tick, a tick that examined nothing, run-now, and the parked and transient paths add nothing; skips count, so a long pause (a `schedules_paused` skip on every tick) can push older dispatches out of the 10. Existing schedules are backfilled with their current `last_fire` when it matched something.
 
 ### Fixed
 
@@ -451,6 +413,39 @@ through `[0.52.0]`.)
 
 - **CLI updates verify the installed version and tell you when to restart ([#2496](https://github.com/vtmocanu/uzi/issues/2496)).**
   Homebrew upgrades use tap-qualified stable or RC targets and inherit your auto-update settings; a zero Homebrew exit succeeds only when the formula-owned CLI reaches the offered version. The TUI detects external upgrades on successful five-minute build-info polls, closes the update modal and shows the actual installed version with a restart hint, without automatic re-exec. Server release checks use the persisted checked-at timestamp to schedule their first attempt after startup, then wait the full configured interval after each attempt; existing opt-outs remain in effect.
+
+- **Cancelled runs stop counting as active once their exact generation's archive covers retained source ([#2652](https://github.com/vtmocanu/uzi/issues/2652)).**
+  After execution ends, workers can retire an authenticated terminal or finalize report when fresh terminal ownership and a verified archive cover the same generation and its current clean source. Uncertain, changed or dirty sources retain the report; retirement keeps custody holds, source pins and clone cleanup protections intact.
+
+- **Worker images exclude run-local artifacts from their baked source ([#2523](https://github.com/vtmocanu/uzi/issues/2523)).**
+  Both worker templates exclude `.uzi/`, keeping scratch and recovery artifacts out of `/opt/uzi-src` and preventing scratch updates from invalidating the source-copy cache.
+
+- **Codex evidence is refused as soon as an unterminated line exceeds 64 KiB ([#2522](https://github.com/vtmocanu/uzi/issues/2522)).**
+  The launcher counts incoming bytes before readline buffers them and destroys an oversized evidence stream immediately, while retaining the existing delimiter handling and refusal classification.
+
+- **Mock Docker allowlist saves match the server UUID parser.**
+  Saves accept compact UUIDs, URN prefixes, ASCII wrappers and Go whitespace while preserving the raw input; invalid tokens, including BOM padding, leave the saved allowlist unchanged.
+
+- **Run actions ignore responses from earlier visits or superseded requests.**
+  Navigating between runs resets action feedback; late resume, cancel, pool-resume and plan-gate responses cannot alter a newer action's busy state, errors or confirmation notices.
+
+- **A queued run blocked by the Docker worker repo allowlist is flagged waiting for worker right away, with wording that fits its owner ([#2501](https://github.com/vtmocanu/uzi/issues/2501)).**
+  When the owner has workers online but all of them are Docker workers and the run's repo isn't on the Docker worker repo allowlist, the next health sweep sets the waiting-for-worker flag and reason instead of showing health ok until **Stuck queued after** (`health_queued_seconds`, default 600s) elapsed; every other waiting reason keeps the threshold, a higher-precedence block (vault locked, custody limit) still hides it, and `health_queued_seconds=0` still disables all queued flags. The reason now depends on the owner's role: an admin owner is told to add the repo under Admin → Instance → Docker worker repo allowlist, any other owner to ask an admin to do so, since only an admin can change it (an admin viewing another user's run sees the owner's variant). Side effects: the owner's Slack nudge for this flag arrives sooner (still subject to the nudge cooldown), the admin `queue.waiting` check warns about 10 minutes sooner for these runs because it ages them from the flag, and in a mixed fleet whose only non-Docker worker is briefly offline the run is flagged at once and clears on the next sweep once an eligible worker is back.
+
+- **Checkpoint publication tolerates extra flush packets after a plain receive-pack report ([#2703](https://github.com/vtmocanu/uzi/issues/2703)).**
+  A plain (non-sideband) receive-pack report followed by one or more bare flush packets is still read as the complete report, so publication no longer fails with "missing or incomplete receive-pack acknowledgement"; data or contradictory packets after the report are still not treated as an acknowledgement.
+- **A transient storage or deadline error during pre-clone retained-recovery discovery no longer fails the claim ([#2613](https://github.com/vtmocanu/uzi/issues/2613)).**
+  Discovery now retries only confirmed operational errors (the operation deadline, identified by an elapsed deadline plus positive deadline evidence, and EAGAIN, EMFILE, ENFILE or ENOMEM), at most twice per claim across both discovery callers with the existing exponential delay; typed, corruption and unsafe-storage errors stay terminal, and an exhausted allowance fails with "local recovery storage busy or unavailable after bounded retries" while keeping local work and custody. The allowance is in-memory, never parks, and does not touch the persisted episode budget; it adds about 2 x codexBoundaryDeadlineMs plus 3 x recoveryRetryMs of scheduled time (about 63 s at defaults), not a wall-clock guarantee. See [ADR-1197](adr/1197-transient-recovery-park.md).
+- **A refused checkpoint publish now says why ([#2704](https://github.com/vtmocanu/uzi/issues/2704)).**
+  The push broker's refusals were all reported as `skipped: unsupported`. They now carry their own reason: `tip_missing` (the pack did not contain the declared commit), `pack_too_large` (the pack exceeded an inflation budget) or `pack_invalid` (empty or malformed pack). `unsupported` now means only a run kind with no checkpoint branch. The api logs each refusal at WARN as `worker run publish refused`, with the run id, the reason and a content-free detail naming the exceeded budget and its limit or the parse check that failed. The run feed shows `checkpoint publish skipped: <reason>`, including `superseded`, which used to show as `other`. Publishing is still best-effort: a refusal is a 200 skip and the run continues. Older workers show the new reasons as `other`.
+- **Release checks cover the full worker runtime ([#1466](https://github.com/vtmocanu/uzi/issues/1466)).**
+  Changelog coverage and release promotion now share the worker autobump runtime paths, including templates and Codex assets, while excluding tests.
+- **Recovery release acknowledgments are bounded ([#2402](https://github.com/vtmocanu/uzi/issues/2402)).**
+  The worker rejects release ACKs exceeding 16 KiB and retains local recovery evidence when the server response overflows.
+- **Neutralized Markdown links no longer look clickable ([#1968](https://github.com/vtmocanu/uzi/issues/1968)).**
+  A Markdown link whose URL is empty or uses a dangerous scheme (`javascript:`, `data:`, `file:`) now renders as plain text rather than an href-less anchor that was still styled as a link, so a report author cannot present a fake call to action.
+- **The usage panel now counts the spend of the intent, plan and PR-description summaries ([#2686](https://github.com/vtmocanu/uzi/issues/2686)).**
+  These passes run on the run's own credential (intent and plan on Claude; the PR description on Claude or Codex), but their tokens and cost never reached the run's usage. The worker now sends one `summary_usage` message per pass that reported usage, and the api stores it under a separate `summary_pass:<model>` key so it cannot collapse into the run's own figure; the run page shows it as an **Intent, plan & PR summaries** row that adds up to the **Run total**. The messages are hidden from the transcript, activity feed, `uzi run logs`, the TUI and the run judge's input (`--json` still carries them). On Claude, a credential switch also waits up to 3 seconds for an in-flight intent summary to finish, then up to 3 more after cancelling it. A pass that finishes after the run's claim is fenced reports nothing. Roll the api before the workers: an api that predates this change stores the message but does not count its usage. The usage panel also appears when a run's only spend is summary or Now-summary spend (for example a lead that failed early), showing those rows and a **Run total**, with the total's cost shown as unavailable when that spend could not be priced.
 
 ### Security
 
