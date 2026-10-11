@@ -241,10 +241,17 @@ type RunDTO struct {
 	// persisted plan yet; chat/judge excluded). Derived, not stored — no new column or
 	// status value. A pre-feature api pod omits it; absent reads as not-planning.
 	IsPlanning bool `json:"is_planning"`
+	// IsRevising is a server-computed display predicate (issues #750, #2760): true when the
+	// run's latest plan-ish message ({plan, plan_revising}) is a plan_revising, i.e. a revise
+	// re-plan is in flight. Meaningful only while status == "awaiting_approval" (a revise
+	// leaves runs.status there). Set by the handlers' applyRevising, which also re-derives
+	// Progress; false from the pure runToDTO. A pre-feature api pod omits it; absent is false.
+	IsRevising bool `json:"is_revising"`
 	// Progress is the server-derived progress estimate (PRD #2602): a percent from the
 	// frozen milestone list, or a state flag when a percent would mislead. null for a
-	// terminal run. Derived in runToDTO (runprogress.Derive), never stored; Phase is
-	// filled only where current_activity is. A pre-feature api pod omits it.
+	// terminal run. Derived in runToDTO (runprogress.Derive) and re-derived by the handlers'
+	// applyRevising once is_revising is known, never stored; Phase is filled only where
+	// current_activity is. A pre-feature api pod omits it.
 	Progress                  *RunProgress `json:"progress"`
 	AutoApprove               bool         `json:"auto_approve"`
 	AutoApproveBlockedReasons []string     `json:"auto_approve_blocked_reasons"`
@@ -1057,8 +1064,9 @@ type RunSummaryItemDTO struct {
 	IsPlanning bool `json:"is_planning"`
 	// Progress is the server-derived progress estimate (PRD #2602): a percent from the
 	// frozen milestone list, or a state flag when a percent would mislead. null for a
-	// terminal run. Derived in runToDTO (runprogress.Derive), never stored; Phase is
-	// filled only where current_activity is. A pre-feature api pod omits it.
+	// terminal run. Derived in runToDTO (runprogress.Derive) and re-derived by the handlers'
+	// applyRevising once is_revising is known, never stored; Phase is filled only where
+	// current_activity is. A pre-feature api pod omits it.
 	Progress                  *RunProgress `json:"progress"`
 	AutoApprove               bool         `json:"auto_approve"`
 	AutoApproveBlockedReasons []string     `json:"auto_approve_blocked_reasons"`
@@ -1753,7 +1761,7 @@ type RunSummaryItemDTO struct {
 	// WorkerName is the list-level worker display name (see RunListItemDTO.WorkerName).
 	WorkerName *string `json:"worker_name"`
 	OwnerEmail *string `json:"owner_email,omitempty"`
-	// JudgeVerdict, JudgeTodoCount and IsRevising mirror the RunListItemDTO list-only fields.
+	// JudgeVerdict and JudgeTodoCount mirror the RunListItemDTO list-only fields; IsRevising mirrors RunDTO.IsRevising.
 	JudgeVerdict   *string `json:"judge_verdict"`
 	JudgeTodoCount int     `json:"judge_todo_count"`
 	IsRevising     bool    `json:"is_revising"`
@@ -2065,13 +2073,13 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			CredentialSwitch:          s.CredentialSwitch,
 			CredentialEpochs:          s.CredentialEpochs,
 			OutcomePending:            s.OutcomePending,
+			IsRevising:                s.IsRevising,
 		},
 		RepoPath:       s.RepoPath,
 		WorkerName:     s.WorkerName,
 		OwnerEmail:     s.OwnerEmail,
 		JudgeVerdict:   s.JudgeVerdict,
 		JudgeTodoCount: s.JudgeTodoCount,
-		IsRevising:     s.IsRevising,
 	}
 }
 
@@ -2102,15 +2110,6 @@ type RunListItemDTO struct {
 	// bucketed in Go. See queries/runtime.sql for why the count cannot ride the join.
 	JudgeVerdict   *string `json:"judge_verdict"`
 	JudgeTodoCount int     `json:"judge_todo_count"`
-	// IsRevising is a server-computed display predicate (issue #750): true when the run's
-	// latest plan-ish message ({plan, plan_revising}) is a plan_revising — i.e. a "revise"
-	// replan is in flight. Like IsPlanning it is derived, not stored (no new column or
-	// status value), and meaningful only while status == "awaiting_approval": a plan
-	// revise leaves runs.status at awaiting_approval, so surfaces classifying from status
-	// alone need this to keep the run out of the human-attention grouping. It is
-	// deliberately NOT on RunDTO (the detail page keeps its own derivePlanRevision panel).
-	// A pre-feature api pod omits it; clients treat absent as false.
-	IsRevising bool `json:"is_revising"`
 }
 
 // MessageDTO is one persisted run message (the replay source a reconnecting
