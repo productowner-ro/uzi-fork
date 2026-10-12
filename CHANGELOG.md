@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Provider outages have a bounded automatic recovery streak ([#1733](https://github.com/vtmocanu/uzi/issues/1733)).**
+  Claude and Codex provider outages now retry under a separate elapsed streak, including Codex’s exact `rateLimitExceeded` token (#2361). After the default 24 hours, the next qualifying park waits for the owner without failing the run; `0` disables the hold. Completed model turns restart the streak, and owner Resume clears it. CLI, TUI, web and Slack distinguish automatic retries from owner attention, with Resume, Cancel and eligible Stop-then-Resume actions. Work remains on the assigned worker, subject to storage and recovery-copy availability; the hold has no automatic expiry.
+
 ### Fixed
 
 - **A non-closing issue delivery can no longer close its issue through a commit message or the PR title ([#2779](https://github.com/vtmocanu/uzi/issues/2779)).**
