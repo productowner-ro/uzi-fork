@@ -252,6 +252,12 @@ func isolatedPublicationDB(t *testing.T) (context.Context, string, interlockLive
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
+	// The generated hold queries select final_publication_id (migration 00333), which this
+	// database deliberately stops short of. Add the bare column so production code can run
+	// against the 319/320 schemas under test; 00320 and its Down never touch it.
+	if _, err = pool.Exec(ctx, "ALTER TABLE recovery_custody_holds ADD COLUMN final_publication_id uuid"); err != nil {
+		t.Fatal(err)
+	}
 	// This fixture tests migration 320's publication semantics with the current DAO.
 	// Later nullable worker evidence is unrelated to that migration; provide its
 	// default-null projection without applying or testing later migrations here.
@@ -349,9 +355,10 @@ func TestCompletedPublicationDowngradeMigrationLiveDB(t *testing.T) {
 		return fresh
 	}
 	// isolatedPublicationDB's shims stand in for the code cross-check columns 00324, 00327 and 00329 add
-	// and the worker roll columns 00330 adds;
+	// and the worker roll columns 00330 adds, and the held-publication column 00333 adds;
 	// drop them so the walk to head adds the real columns instead of colliding with the shims.
 	for _, ddl := range []string{
+		"ALTER TABLE recovery_custody_holds DROP COLUMN IF EXISTS final_publication_id",
 		`ALTER TABLE workers DROP COLUMN IF EXISTS registered_pod_uid,
 			DROP COLUMN IF EXISTS roll_heartbeat_at,
 			DROP COLUMN IF EXISTS draining_reason`,

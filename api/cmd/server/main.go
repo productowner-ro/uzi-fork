@@ -386,6 +386,8 @@ func run() error {
 		// PRD #1867 failed-run salvage: the forge kinds whose failed runs the run_salvage
 		// pass enqueues (UZI_SALVAGE_FORGES). Empty is off; it gates only the enqueue.
 		SalvageForges: cfg.SalvageForges,
+		// Issue #2545 held-work publication step A switch (UZI_HELD_PUBLICATION, default on).
+		HeldPublication: cfg.HeldPublication,
 	})
 
 	// Job files (PRD #1909 M1): the bounded, sealed file store the /api/v1 upload and the worker
@@ -915,6 +917,14 @@ func run() error {
 		sweeper.Pass{
 			Name: "run_salvage",
 			Run:  wsvc.SweepSalvage,
+		},
+		// Held-work publication cleanup (issue #2545): reconcile of unknown creates and deletes, the
+		// retention expiry of acknowledged refs and the orphan delete of never-acknowledged ones.
+		// ALWAYS registered: UZI_HELD_PUBLICATION gates only new step A and B work, never cleanup,
+		// so refs already published are still released with the switch off.
+		sweeper.Pass{
+			Name: "held_publication",
+			Run:  wsvc.SweepHeldPublications,
 		},
 		// Stale fetch reservations (PRD #1906 M3): a reservation older than
 		// fetchctl.StaleReservationAge belongs to a fetch whose fetcher crashed or lost its

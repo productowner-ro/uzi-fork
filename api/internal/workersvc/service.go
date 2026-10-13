@@ -1628,6 +1628,11 @@ type Params struct {
 	// the list, and a pending row there settles 'disabled' after a CAS delete of any unrecorded
 	// copy. Empty (the zero value) is off.
 	SalvageForges []string
+
+	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) carries config.Config.HeldPublication.
+	// It gates step A only (held_publish.go). The zero value is off; the default-on lives in
+	// config.go where the env is read.
+	HeldPublication bool
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -1954,7 +1959,22 @@ type Service struct {
 	salvageCreateRefFn   func(ctx context.Context, o pushbroker.CreateRefOptions) error
 	salvageDeleteRefFn   func(ctx context.Context, o pushbroker.DeleteOptions) error
 	salvagePassBudget    time.Duration
-	salvageLeadPending   bool
+	// heldPrepareFn / heldSendFn / heldListFn are step A's broker seams (issue #2545): the
+	// read-only pack pre-verify, the single create-only push and the reconcile listing. They
+	// default to pushbroker.PrepareHeldPack, SendHeldCreate and ListRefTips (set in New); tests
+	// stub them with a fake forge. heldSlots is the process-wide step-A semaphore.
+	// heldOutcomeHook, when set, runs inside tx2 before its commit (fault injection).
+	heldPrepareFn   func(ctx context.Context, o pushbroker.HeldPackOptions) (*pushbroker.PreparedHeldPack, error)
+	heldSendFn      func(ctx context.Context, p *pushbroker.PreparedHeldPack) (pushbroker.HeldCreateOutcome, error)
+	heldListFn      func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
+	heldSlots       chan struct{}
+	heldOutcomeHook func() error
+	// heldDeleteFn is the held cleanup's CAS delete (default pushbroker.Delete); heldCleanupHook,
+	// when set, runs inside the cleanup transaction after the run lock and before any forge call
+	// (test fault injection). Both belong to SweepHeldPublications (held_cleanup.go).
+	heldDeleteFn       func(ctx context.Context, o pushbroker.DeleteOptions) error
+	heldCleanupHook    func(stage string)
+	salvageLeadPending bool
 	// createRefFn is the go-git recovery-ref CREATOR (PRD #1810 M3, D2): supersession preserves
 	// a retained checkpoint tip under refs/uzi-recovery/<run id> before freeing the branch ref.
 	// Defaults to pushbroker.CreateRef (set in New); tests stub it with an in-memory forge.
@@ -2281,6 +2301,11 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		salvageListRefTipsFn: pushbroker.ListRefTips,
 		salvageCreateRefFn:   pushbroker.CreateRef,
 		salvageDeleteRefFn:   pushbroker.Delete,
+		heldPrepareFn:        pushbroker.PrepareHeldPack,
+		heldSendFn:           pushbroker.SendHeldCreate,
+		heldListFn:           pushbroker.ListRefTips,
+		heldDeleteFn:         pushbroker.Delete,
+		heldSlots:            make(chan struct{}, heldPublishMaxConcurrent),
 		createRefFn:          pushbroker.CreateRef,
 		listRefTipsFn:        pushbroker.ListRefTips,
 		background:           func(fn func()) { go fn() },
