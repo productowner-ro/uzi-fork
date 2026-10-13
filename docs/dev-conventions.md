@@ -623,6 +623,27 @@ dev-server start), or use the Dockerfile above for a full static build.
 (`src/mocks/mockApi/shared.ts`'s `mockScenario()`). It's a single string, so
 scenarios are mutually exclusive by construction. Known values:
 
+- `run-progress` — the PRD #2789 M1 progress card, seeded by
+  `web/src/mocks/data/unifiedProgress.ts`. Open
+  `/runs/run-progress-running?mock=run-progress`,
+  `/runs/run-progress-approval?mock=run-progress`,
+  `/runs/run-progress-failed?mock=run-progress`,
+  `/runs/run-progress-completed?mock=run-progress` or
+  `/runs/run-progress-assigned?mock=run-progress`.
+  The running fixture has a live documenter owner plus a second spec-keeper
+  lane, a `now_note`, iteration 4 and an estimated usage tail. The assigned
+  fixture declares an architect owner with no attributed live lane while
+  documenter and spec-keeper are live, exercising the quiet
+  `Assigned owner:` strip. Approval has candidate rows but no frozen list;
+  failed and completed retain frozen rows with null progress and no live
+  lanes or Now note. These routes cover the unified card and
+  header settings/controls. Open Run settings to inspect the token epochs
+  and toggles; the assigned fixture includes one recorded pin and its time.
+  Approval, holds and outcomes precede progress. The footer uses recorded
+  usage with separate estimated tails; summaries remember saved choices and
+  otherwise collapse after approval. Now fixtures illustrate intended work
+  from titles and role labels. Prompt tests check instructions and fences;
+  live model wording remains a maintainer spot-check.
 - `oidc`, `oidc-degraded`, `sso-only` — the PRD #45 OIDC UX, otherwise
   unreachable in the demo (OIDC off, password on, by default).
 - `truncated-backlog` — `/judge?mock=truncated-backlog` puts the

@@ -1,6 +1,6 @@
 # PRD #2789: Run page, one progress card for milestones, live work and Now
 
-**Status**: Draft
+**Status**: Done — M1–M4 implemented and validated
 **Priority**: Medium
 **GitHub issue**: #2789
 **Design mock**: `prds/mockups/2789-run-page-unified-progress-mock.html` (open it in a browser; a Before/After toggle and a run-state switch sit at the top)
@@ -96,48 +96,56 @@ Acceptance examples:
 - **Spinner**: shared by PlanPanel, JudgePanel and others; under `prefers-reduced-motion: reduce` it renders a static frame and starts no interval. jsdom has no `matchMedia`, so the test stubs it.
 - **Agent (M4)**: `now-summary.test.ts` asserts through the fake harness's captured `opts.systemPrompt` and prompt on both the Claude and Codex controller paths (`SYSTEM_PROMPT` is not exported): label and title framed as intended work, never an outcome; no prediction of next steps; a leading `[mN]` tag ignored; tool named only when nothing else is known; fencing, redaction, 120-character cap and no-command disclosure unchanged. A prompt assertion proves the instruction, not model output; live wording is a maintainer spot check, not a merge gate.
 - **Mock parity**: mock-mode screenshots of running, awaiting approval, failed and completed, light and dark, beside the mock, in the PR.
-- **Gates**: `task gate:web`, `task gate:agent` (M4), `task gate:repo` (check-docs for the mock path, `check:changelog-entry`).
+- **Gates**: `task gate:web`, `task gate:agent` (M4), `task gate:repo` (including `check:changelog-entry`), plus the separate `task check-docs:web` for PRD/mock links in the primary checkout.
 
 ## Milestones
 
 ### M1: One progress card holds the milestones, live lanes and Now
 Blocked by: none
 
-- Extract the milestone rows component; `RunProgressCard` renders it; remove the standalone checklist render at `RunView.tsx:3193` and the `MilestoneChecklist` wrapper if nothing else uses it (`deadcode:web` and knip stay green).
-- Head: `≈N% · k of M reported complete` (not-reported form per example 4); the stepper and its caption become `phase: <phase> · iteration <n>` on the active row; Now under the active row; Active role line removed; doing-what fallback kept.
-- Track segment labels dropped, accessible text equivalent kept.
-- Delete `MilestoneBadge` (only RunView's header uses it) and update the comments that name it or `MilestoneChecklist` as twins: `web/src/lib/runBadge.ts`, `web/src/mocks/store.ts`, `api/cmd/uzi/run_render.go`, `tui_board_rows.go`, `tui_model_test.go`, `tui_detail_rail.go` (comment-only).
-- Mock data: add or extend a named mock scenario carrying `milestones_agents` and `milestones_live` (owner plus a second live lane, a declared owner with no attributed live lane), a `now_note`, iteration > 1 and a usage tail; list it in `docs/dev-conventions.md` (Demo scenarios).
-- Docs: `docs/run-activity.md` "Milestones and the now line" and the run-page bullet of "Progress estimate" (about lines 401-440 and 504-515); `task docs:sync`, mirror committed. `CHANGELOG.md` `[Unreleased]` line.
-- Acceptance: examples 1 and 4; mock parity for the progress card.
+- [x] Extract the milestone rows component; `RunProgressCard` renders it; remove the standalone checklist render at `RunView.tsx:3193` and the `MilestoneChecklist` wrapper if nothing else uses it (`deadcode:web` and knip stay green).
+- [x] Head: `≈N% · k of M reported complete` (not-reported form per example 4); the stepper and its caption become `phase: <phase> · iteration <n>` on the active row; Now under the active row; Active role line removed; doing-what fallback kept.
+- [x] Track segment labels dropped, accessible text equivalent kept.
+- [x] Delete `MilestoneBadge` (only RunView's header uses it) and update the comments that name it or `MilestoneChecklist` as twins: `web/src/lib/runBadge.ts`, `web/src/mocks/store.ts`, `api/cmd/uzi/run_render.go`, `tui_board_rows.go`, `tui_model_test.go`, `tui_detail_rail.go` (comment-only).
+- [x] Mock data: add or extend a named mock scenario carrying `milestones_agents` and `milestones_live` (owner plus a second live lane, a declared owner with no attributed live lane), a `now_note`, iteration > 1 and a usage tail; list it in `docs/dev-conventions.md` (Demo scenarios).
+- [x] Docs: `docs/run-activity.md` "Milestones and the now line" and the run-page bullet of "Progress estimate" (about lines 401-440 and 504-515); `task docs:sync`, mirror committed. `CHANGELOG.md` `[Unreleased]` line.
+- [x] Acceptance: examples 1 and 4; mock parity for the progress card.
+
+Evidence: [M1 validation, assertion migrations and deliberate breaks](../mockups/2789-m1-validation.md), with light/dark browser comparisons. Source reviewed at `bffcbb77`; web gate passed at `b05cc1b7` (identical source), repository gate and production build passed at `60e5ccc1`. M2–M4 remained pending at that M1 checkpoint.
 
 ### M2: Header shows identity and state; settings and controls move up
 Blocked by: M1 (the iteration count moves into the card first)
 
-- Header chips: status, health flag, live elapsed/budget (parked: clock stopped), harness and model, one token chip; both token chips only while a switch is pending or released (`RunCredentialOverride.tsx:63-72`). Iteration chip removed; the stage chip removed only where the card shows the stage (kept for runs without a card).
-- `Run settings ▾` disclosure in the header actions slot (contents per Modules); the inline Token history card and toggle rows leave the page body; the `RunView.tsx:2803-2822` comment updated.
-- Run controls component extracted and rendered in the header actions slot only; the Steer card keeps composer and queue, drops its Pause and Stop, and points to the header.
-- `Spinner` (`ui.tsx:590`) honours `prefers-reduced-motion`.
-- Motion: this PRD adds no new pulsing element; a lane pulses only with a live frame (PRD #1353); every pulse stays neutralised under `prefers-reduced-motion` (`web/src/index.css`).
-- `CHANGELOG.md` line.
-- Acceptance: example 1's header clauses; mock parity for the header.
+- [x] Header chips: status, health flag, live elapsed/budget (parked: clock stopped), harness and model, one token chip; both token chips only while a switch is pending or released (`RunCredentialOverride.tsx:63-72`). Iteration chip removed; the stage chip removed only where the card shows the stage (kept for runs without a card).
+- [x] `Run settings ▾` disclosure in the header actions slot (contents per Modules); the inline Token history card and toggle rows leave the page body; the `RunView.tsx:2803-2822` comment updated.
+- [x] Run controls component extracted and rendered in the header actions slot only; the Steer card keeps composer and queue, drops its Pause and Stop, and points to the header.
+- [x] `Spinner` (`ui.tsx:590`) honours `prefers-reduced-motion`.
+- [x] Motion: this PRD adds no new pulsing element; a lane pulses only with a live frame (PRD #1353); every pulse stays neutralised under `prefers-reduced-motion` (`web/src/index.css`).
+- [x] `CHANGELOG.md` line.
+- [x] Acceptance: example 1's header clauses; mock parity for the header.
+
+Evidence: [M2 validation, old → new assertion inventory and deliberate breaks](../mockups/2789-m2-validation.md), with light/dark header and mobile disclosure comparisons. Cumulative source review is clean through `e5d39e35`; full web/repository gates and production build passed at that revision. At that M2 snapshot, M3–M4 remained pending.
 
 ### M3: What needs you comes first, cost in the card, summary collapses after the gate
 Blocked by: M1 (the cost footer lives in the card)
 
-- Attention slot directly under the header with the members and order listed in Modules, moved with their existing content and gates.
-- Cost footer per Modules.
-- `summaryCollapse` tri-state read and the state default per Modules.
-- `CHANGELOG.md` line.
-- Acceptance: examples 2 and 3; mock parity for the attention slot and footer.
+- [x] Attention slot directly under the header with the members and order listed in Modules, moved with their existing content and gates.
+- [x] Cost footer per Modules.
+- [x] `summaryCollapse` tri-state read and the state default per Modules.
+- [x] `CHANGELOG.md` line.
+- [x] Acceptance: examples 2 and 3; mock parity for the attention slot and footer.
+
+Evidence: [M3 validation and isolated deliberate breaks](../mockups/2789-m3-validation.md), with [light](../mockups/2789-run-page-parity-light.png) and [dark](../mockups/2789-run-page-parity-dark.png) four-state Chromium comparisons. Source review is clean at `f2083e52`; full web gate, production build and uncached docs mirror passed. Thirteen valid deliberate breaks typechecked and failed intended assertions, followed by 72 unmodified passing cases. Final repository gate passed at `df1b5d28`; reviewer, tester and auditor verified the committed proof and screenshots with no mandatory findings. A fresh JSON-report run matched all 29 recorded failing test names to passing results among 72 tests. M4 evidence follows below.
 
 ### M4: The Now note describes the work, not the tool
 Blocked by: none
 
-- `SYSTEM_PROMPT` in `agent/src/now-summary.ts`: describe the work from the milestone title and the frames' role and label; treat the label and title as intended work, never an outcome; never predict next steps; ignore a leading `[mN]` tag; name a tool only when nothing else is known. PRD #2603 D6 (no inferred success), the single sentence and the 120-character cap stay.
-- Both harnesses use the same prompt.
-- Docs: `docs/run-activity.md` "What the model sees" (about line 575), and `docs/admin-settings.md` if it quotes the old behaviour; `task docs:sync` when a `docs/*.md` changes. `CHANGELOG.md` line.
-- Acceptance: example 5.
+- [x] `SYSTEM_PROMPT` in `agent/src/now-summary.ts`: describe the work from the milestone title and the frames' role and label; treat the label and title as intended work, never an outcome; never predict next steps; ignore a leading `[mN]` tag; name a tool only when nothing else is known. PRD #2603 D6 (no inferred success), the single sentence and the 120-character cap stay.
+- [x] Both harnesses use the same prompt.
+- [x] Docs: `docs/run-activity.md` "What the model sees" (about line 575), and `docs/admin-settings.md` if it quotes the old behaviour; `task docs:sync` when a `docs/*.md` changes. `CHANGELOG.md` line.
+- [x] Acceptance: example 5.
+
+Evidence: [M4 source validation and archived deliberate breaks](../mockups/2789-m4-validation.md). Source `9255f834` passed the full agent gate: 12,986 unit passes, 14 conditional skips, zero failures, plus 183 Codex conformance passes and the required clause matrix. All 79 Now cases executed. Twenty-three valid archived breaks typechecked and failed named intended assertions, followed by a fresh unmodified 79-case pass. Source reviewer/tester/auditor examined the unit and cumulative agent/docs scope; the stale demo-doc wording is corrected with its mirror. The repository gate passed at `5d20c1c1`; cumulative reviewer/tester/auditor proof checks passed. The separately detected PR-body link errors are fixed in the lifecycle integration and rechecked directly. Live model wording is a maintainer spot-check, not a merge criterion.
 
 ## Decision Log
 
