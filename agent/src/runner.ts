@@ -189,7 +189,7 @@ import {
 import { installJsDeps } from "./js-deps.js";
 import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js";
 import { isCIConfigPlan } from "./prompt.js";
-import { flagCIConfigPaths, flagCIConfigPathsRaw, DEFAULT_CI_CONFIG_PATHS, DEFAULT_CI_REPAIR_CONFIG_PATHS } from "./ci-config-guard.js";
+import { flagCIConfigPathsRaw, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 import { computeSize } from "./pr-size.js";
 import { buildDeliveryContext } from "./pr-description-context.js";
 import { resolvePrdInputFromBare } from "./prd-link.js";
@@ -6884,7 +6884,7 @@ export class RunRunner {
     // too (ciConfigGuardBlocksPublication), where a match skips the upload. All use the raw-path
     // matcher and the --no-renames diff; an uncomputable diff refuses too.
     const ciConfigGuarded = claim.config?.ci_config_guard === true;
-    const ciConfigGuardGlobs = [...DEFAULT_CI_REPAIR_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])];
+    const ciConfigGuardGlobs = [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])];
     let ciConfigGuardReported = false;
     const failCIConfigGuard = async (guardBarePath: string, ref: string, paths: string[] | null) => {
       if (ciConfigGuardReported) return;
@@ -6918,15 +6918,11 @@ export class RunRunner {
       // Capture the narrowed bare path in a const the SAME way the push block does
       // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
       const pushBarePathForGuard = barePath;
-      // Worker-side FLOOR: when the claim omits ci_config_paths (a bug or an older
-      // server), fall back to the static defaults so the backstop cannot fail OPEN.
-      // This floor covers the static defaults only; the server-produced set additionally
-      // carries the project's real ci_config_path (see DEFAULT_CI_CONFIG_PATHS).
-      const ciConfigPaths = claim.config?.ci_config_paths?.length
-        ? claim.config.ci_config_paths
-        : DEFAULT_CI_CONFIG_PATHS;
-      const changed = await this.git.changedFiles(pushBarePathForGuard, trackingRef);
-      const flagged = changed === null ? null : flagCIConfigPaths(changed, ciConfigPaths);
+      // The worker floor is always unioned with the server set, never replaced by it, and the
+      // diff is the guarded raw-path one: no rename detection, every merge base, no trimming.
+      const ciConfigPaths = [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])];
+      const changed = await this.git.changedFilesNoRenames(pushBarePathForGuard, trackingRef);
+      const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, ciConfigPaths);
       if (changed === null || (flagged && flagged.length > 0)) {
         const reason =
           changed === null
@@ -8886,7 +8882,7 @@ export class RunRunner {
       lastAttemptedCheckpointRefTip: undefined,
       checkpointChainForge: claim.repo.forge_type === "github",
       ...(claim.config?.ci_config_guard === true
-        ? { ciConfigGuardGlobs: [...DEFAULT_CI_REPAIR_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])] }
+        ? { ciConfigGuardGlobs: [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])] }
         : {}),
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),

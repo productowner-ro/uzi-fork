@@ -10,24 +10,16 @@
 // special-casing. This module reuses that MECHANISM, parameterized by the claim's
 // ci_config_paths, rather than pulling in a glob library.
 
-// DEFAULT_CI_CONFIG_PATHS is a WORKER-SIDE FLOOR for the pre-push guard: the set the
-// backstop falls back to when a claim carries no ci_config_paths (a bug, or an older
-// server that never produced the field). It covers only the STATIC defaults —
-// the server-produced set additionally carries the project's real ci_config_path
-// (MergeCIConfigPaths), which the worker cannot know here — so this floor exists purely
-// so a missing field cannot fail the guard OPEN, never as a replacement for that set.
+// DEFAULT_CI_CONFIG_PATHS is the WORKER-SIDE FLOOR every CI-config guard unions with the claim's
+// ci_config_paths (never replaced by them): the GitLab files plus the GitHub, Forgejo and Gitea
+// workflow directories. The server-produced set adds the project's real ci_config_path
+// (MergeCIConfigPaths), which the worker cannot know; the floor guarantees a server set that
+// omits a forge's workflow directory, or a claim that omits the field, cannot fail the guard open.
 export const DEFAULT_CI_CONFIG_PATHS = [
   ".gitlab-ci.yml",
   ".gitlab/**",
   "**/*.gitlab-ci.yml",
   ".github/workflows/**",
-];
-
-// DEFAULT_CI_REPAIR_CONFIG_PATHS is the worker-side floor for a GUARDED run (a default-branch
-// CI repair run, claim.config.ci_config_guard): the ci_fix floor plus the Forgejo/Gitea workflow
-// directories. Guarded runs always union it with claim.config.ci_config_paths.
-export const DEFAULT_CI_REPAIR_CONFIG_PATHS = [
-  ...DEFAULT_CI_CONFIG_PATHS,
   ".forgejo/workflows/**",
   ".gitea/workflows/**",
 ];

@@ -107,15 +107,20 @@ sees the merge request closed or merged, since there is nothing left to fix.
 
 A fix that only touches code or tests pushes on its own, like any
 auto-approved run. A fix that would edit the CI/pipeline configuration
-itself — `.gitlab-ci.yml`, anything under `.gitlab/`, or the project's own
-configured CI config path — is different: uzi parks that plan for your
+itself — `.gitlab-ci.yml`, anything under `.gitlab/`, the GitHub, Forgejo
+and Gitea workflow directories (`.github/workflows/`, `.forgejo/workflows/`,
+`.gitea/workflows/`), or the project's own configured CI config path — is
+different: uzi parks that plan for your
 approval instead of pushing it unattended, the same gate a fix you started
 manually would hit if you didn't approve it.
 
 As a fail-closed backstop, the worker also refuses to push an
 auto-approved fix whose diff touches one of those protected paths (or whose
 diff it couldn't compute) — the run fails rather than risk an unattended
-change to the pipeline that judges it. A fix you (or an admin) approved by
+change to the pipeline that judges it. The check sees renames (both the old
+and the new path), compares against every merge base with the default branch,
+and matches paths exactly as git stores them. These protected paths are
+always included, whatever `CI_AUTOFIX_CONFIG_PATHS` adds. A fix you (or an admin) approved by
 hand — the manual button, or an approved CI-config plan — pushes normally.
 
 ## Notifications
@@ -141,8 +146,8 @@ Forgejo and GitHub, but automatic CI-fix has not been validated end-to-end on
 those forges yet — treat it as GitLab-first. In addition, the step that reads
 the project's own configured CI config path (used to widen the protected-path
 guard above) is stubbed on Forgejo and GitHub: they have no equivalent
-per-project setting today, so the guard there falls back to the default
-protected-path globs.
+per-project setting today, so the guard there uses the protected paths above
+(which include their workflow directories).
 
 On GitHub, an agent-MR branch's CI is exposed through check-runs / check-suites
 on the head commit rather than the Actions workflow-runs list; when that list

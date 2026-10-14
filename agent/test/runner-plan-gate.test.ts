@@ -1,7 +1,7 @@
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import fs, { writeFileSync } from "node:fs";
+import fs, { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { createInterface } from "node:readline";
@@ -1409,6 +1409,41 @@ describe("RunRunner — CI-config push guard on a pre-approved resume (PRD #71 M
     );
     assert.equal(calls.length, 0, "no MR opened for the refused push");
   });
+});
+
+describe("RunRunner — auto ci_fix guard keeps the worker floor and matches raw paths", () => {
+  const writeExec = (rel: string): Executor => ({
+    run: async (ctx) => {
+      const p = path.join(ctx.worktreePath, rel);
+      mkdirSync(path.dirname(p), { recursive: true });
+      writeFileSync(p, "on: push\n", "utf8");
+      const g = (args: string[]) => execFileSync("git", args, { cwd: ctx.worktreePath });
+      g(["add", "--", rel]);
+      g(["-c", "user.name=uzi-agent", "-c", "user.email=agent@uzi.test", "-c", "commit.gpgsign=false", "commit", "-m", "auto ci-fix"]);
+      return { branch: ctx.branch };
+    },
+  });
+
+  for (const [n, rel, name] of [
+    [74, ".forgejo/workflows/ci.yml", "a Forgejo workflow the GitLab-only server set omits"],
+    [75, ".github/workflows/a\nb.yml", "a newline-bearing workflow path"],
+  ] as const) {
+    it(`refuses ${name}`, async () => {
+      const { gitlab, calls } = fakeGitlab();
+      const claim = gitlabClaim(n, {
+        kind: "ci_fix",
+        auto_approve: true,
+        plan_md: "Fix the failing test",
+        config: { ci_config_paths: [".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml"] },
+      });
+      await runner(writeExec(rel), gitlab).execute(claim);
+      const bodies = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+      const failed = bodies.find((s) => s.status === "failed");
+      assert.ok(failed, "the guard fails the run closed");
+      assert.match(failed.failure_reason ?? "", /may not edit CI config/);
+      assert.equal(calls.length, 0, "no MR opened for the refused push");
+    });
+  }
 });
 
 // PRD #122 M1: the CANDIDATE milestone list rides awaiting_approval (human-gated)

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ClaimResponse } from "../src/protocol.js";
-import { DEFAULT_CI_REPAIR_CONFIG_PATHS, flagCIConfigPathsRaw } from "../src/ci-config-guard.js";
+import { DEFAULT_CI_CONFIG_PATHS, flagCIConfigPathsRaw } from "../src/ci-config-guard.js";
 
 // Issue #2865 cross-side contract: the default-branch CI repair claim. The worker parses the SAME
 // golden file the Go producer pins (api/internal/workersvc/testdata/claim_ci_repair_wire.json), so
@@ -19,11 +19,11 @@ test("ci repair claim wire contract: the worker reads config.ci_config_guard and
   // The worker floor covers everything the server sends for this lane, so a missing server list
   // can never narrow the guard.
   for (const glob of claim.config?.ci_config_paths ?? []) {
-    assert.ok(DEFAULT_CI_REPAIR_CONFIG_PATHS.includes(glob), `${glob} is in the worker repair floor`);
+    assert.ok(DEFAULT_CI_CONFIG_PATHS.includes(glob), `${glob} is in the worker repair floor`);
   }
   const flagged = flagCIConfigPathsRaw(
     ["src/app.ts", ".forgejo/workflows/x.yml", ".github/workflows/ci.yml"],
-    [...DEFAULT_CI_REPAIR_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])],
+    [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])],
   );
   assert.deepEqual(flagged, [".forgejo/workflows/x.yml", ".github/workflows/ci.yml"]);
 });

@@ -5,7 +5,6 @@ import { join } from "node:path";
 
 import {
   DEFAULT_CI_CONFIG_PATHS,
-  DEFAULT_CI_REPAIR_CONFIG_PATHS,
   ciConfigGuardRegex,
   flagCIConfigPaths,
   flagCIConfigPathsRaw,
@@ -38,14 +37,15 @@ describe("guarded CI-config matcher: shared parity fixture", () => {
 });
 
 describe("guarded CI-config matcher: contract", () => {
-  test("the repair floor is the ci_fix floor plus the forgejo workflow directory", () => {
-    assert.deepEqual(DEFAULT_CI_REPAIR_CONFIG_PATHS, [
-      ...DEFAULT_CI_CONFIG_PATHS,
+  test("one floor covers the GitLab files and every forge's workflow directory", () => {
+    assert.deepEqual(DEFAULT_CI_CONFIG_PATHS, [
+      ".gitlab-ci.yml",
+      ".gitlab/**",
+      "**/*.gitlab-ci.yml",
+      ".github/workflows/**",
       ".forgejo/workflows/**",
       ".gitea/workflows/**",
     ]);
-    assert.ok(!DEFAULT_CI_CONFIG_PATHS.includes(".forgejo/workflows/**"), "the ci_fix floor is unchanged");
-    assert.ok(!DEFAULT_CI_CONFIG_PATHS.includes(".gitea/workflows/**"), "the ci_fix floor is unchanged");
   });
 
   test("the guarded regex is anchored without the multiline flag", () => {
@@ -58,7 +58,7 @@ describe("guarded CI-config matcher: contract", () => {
   test("the ci_fix matcher keeps its trim and its line-terminator gap (unchanged)", () => {
     // flagCIConfigPaths is the ci_fix lane's matcher and stays as it was: it trims the path and
     // its `.*` does not cross a newline. The guarded lane must not inherit either behaviour.
-    const floor = DEFAULT_CI_REPAIR_CONFIG_PATHS;
+    const floor = DEFAULT_CI_CONFIG_PATHS;
     assert.deepEqual(flagCIConfigPaths([" .github/workflows/a.yml"], floor), [".github/workflows/a.yml"]);
     assert.deepEqual(flagCIConfigPaths([".github/workflows/a\n.yml"], floor), []);
     assert.deepEqual(flagCIConfigPathsRaw([".github/workflows/a\n.yml"], floor), [".github/workflows/a\n.yml"]);

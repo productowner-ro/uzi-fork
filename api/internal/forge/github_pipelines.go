@@ -542,8 +542,8 @@ func (g *github) JobLogTail(ctx context.Context, projectID, jobID int64, maxByte
 }
 
 // ProjectCIConfigPath returns the empty string: GitHub Actions has no
-// ci_config_path override, so callers get the driver's default. Runtime auto-fix
-// parity is GitLab-only (PRD #71 Out-of-Scope); this satisfies the interface.
+// ci_config_path override, so callers get the driver's default. The auto CI-fix guard
+// still protects this forge's workflow directory through its always-included floor.
 func (g *github) ProjectCIConfigPath(context.Context, int64) (string, error) {
 	return "", nil
 }
