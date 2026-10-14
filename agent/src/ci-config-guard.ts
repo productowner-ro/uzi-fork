@@ -61,8 +61,8 @@ export function flagCIConfigPaths(changedFiles: string[], paths: string[]): stri
   return hits;
 }
 
-// ciConfigGuardRegex is the matcher for GUARDED runs only (the ci_fix lane keeps
-// ciConfigPathToRegex unchanged). The glob is server-trusted configuration, so it is trimmed and an
+// ciConfigGuardRegex is the matcher both CI-config guards use (the default-branch repair lane and
+// the automatic ci_fix push guard). The glob is server-trusted configuration, so it is trimmed and an
 // empty one is dropped by the caller; the FILE PATH is matched raw. `**/` is an optional run of any
 // characters ending in `/`, `**` is any characters, `*` is any character except `/`; "any"
 // includes newlines (`[\s\S]`, never `.`). Anchored on the full input, without the `m` flag.
