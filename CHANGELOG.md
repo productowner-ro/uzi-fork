@@ -22,11 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Security
-
-- **Security: hardened the automatic CI-fix guard against CI-configuration changes.**
-  `CI_AUTOFIX_CONFIG_PATHS` now adds to a fixed set of protected paths instead of replacing it.
-
 ### Fixed
 
 - **Plan summary after a credential-switch give-up ([#2945](https://github.com/vtmocanu/uzi/issues/2945)).**
@@ -37,6 +32,11 @@ through `[0.52.0]`.)
 
 - **Human plan gates no longer wait for the plan summary ([#2901](https://github.com/vtmocanu/uzi/issues/2901)).**
   The worker now starts the advisory plan summary after the plan is stored without awaiting it, so approving, revising or rejecting a plan is no longer delayed by up to the summary timeout, and a summary of a plan you revised is no longer kept for the run or generated after the revise.
+
+### Security
+
+- **The automatic CI-fix guard is hardened against CI-configuration changes.**
+  `CI_AUTOFIX_CONFIG_PATHS` now adds to a fixed set of protected paths instead of replacing it.
 
 ## [0.86.0] - 2026-10-06
 

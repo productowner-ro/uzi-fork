@@ -28,6 +28,7 @@ import {
   assistant,
   client,
   fakeGitlab,
+  fx,
   git,
   gitlabClaim,
   homeDir,
@@ -1444,6 +1445,35 @@ describe("RunRunner — auto ci_fix guard keeps the worker floor and matches raw
       assert.equal(calls.length, 0, "no MR opened for the refused push");
     });
   }
+
+  it("refuses a rename of a protected workflow out of its directory", async () => {
+    const wf = ".github/workflows/ci.yml";
+    mkdirSync(path.join(fx.originPath, ".github/workflows"), { recursive: true });
+    writeFileSync(path.join(fx.originPath, wf), "on: push\n", "utf8");
+    const og = (args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@uzi.test", "-c", "commit.gpgsign=false", ...args], { cwd: fx.originPath });
+    og(["add", "--", wf]);
+    og(["commit", "-m", "add workflow"]);
+    const renameExec: Executor = {
+      run: async (ctx) => {
+        const g = (args: string[]) => execFileSync("git", args, { cwd: ctx.worktreePath });
+        g(["mv", wf, "moved.yml"]);
+        g(["-c", "user.name=uzi-agent", "-c", "user.email=agent@uzi.test", "-c", "commit.gpgsign=false", "commit", "-m", "auto ci-fix"]);
+        return { branch: ctx.branch };
+      },
+    };
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(76, {
+      kind: "ci_fix",
+      auto_approve: true,
+      plan_md: "Fix the failing test",
+      config: { ci_config_paths: [".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml"] },
+    });
+    await runner(renameExec, gitlab).execute(claim);
+    const failed = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body).find((s) => s.status === "failed");
+    assert.ok(failed, "the guard fails the run closed");
+    assert.match(failed.failure_reason ?? "", /may not edit CI config/);
+    assert.equal(calls.length, 0, "no MR opened for the refused push");
+  });
 });
 
 // PRD #122 M1: the CANDIDATE milestone list rides awaiting_approval (human-gated)

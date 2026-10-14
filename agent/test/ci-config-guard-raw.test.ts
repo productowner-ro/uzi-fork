@@ -6,7 +6,6 @@ import { join } from "node:path";
 import {
   DEFAULT_CI_CONFIG_PATHS,
   ciConfigGuardRegex,
-  flagCIConfigPaths,
   flagCIConfigPathsRaw,
 } from "../src/ci-config-guard.js";
 import { composeCIConfigGuardReason } from "../src/runner.js";
@@ -55,12 +54,9 @@ describe("guarded CI-config matcher: contract", () => {
     assert.equal(re.test("x\n.github/workflows/a.yml"), false);
   });
 
-  test("the ci_fix matcher keeps its trim and its line-terminator gap (unchanged)", () => {
-    // flagCIConfigPaths is the ci_fix lane's matcher and stays as it was: it trims the path and
-    // its `.*` does not cross a newline. The guarded lane must not inherit either behaviour.
+  test("raw paths: no trim, and a newline does not hide a protected path", () => {
     const floor = DEFAULT_CI_CONFIG_PATHS;
-    assert.deepEqual(flagCIConfigPaths([" .github/workflows/a.yml"], floor), [".github/workflows/a.yml"]);
-    assert.deepEqual(flagCIConfigPaths([".github/workflows/a\n.yml"], floor), []);
+    assert.deepEqual(flagCIConfigPathsRaw([" .github/workflows/a.yml"], floor), []);
     assert.deepEqual(flagCIConfigPathsRaw([".github/workflows/a\n.yml"], floor), [".github/workflows/a\n.yml"]);
   });
 });

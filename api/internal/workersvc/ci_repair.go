@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -67,14 +68,8 @@ const (
 // CIRepairConfigFloor is the server-side set of CI-config path globs a default-branch repair
 // run may never push a change to. CreateCIRepairRun always unions it into the run's
 // ci_config_paths, whatever the operator configured.
-var CIRepairConfigFloor = []string{
-	".gitlab-ci.yml",
-	".gitlab/**",
-	"**/*.gitlab-ci.yml",
-	".github/workflows/**",
-	".forgejo/workflows/**",
-	".gitea/workflows/**",
-}
+// It is the same floor the automatic CI-fix guard always carries.
+var CIRepairConfigFloor = config.CIAutofixConfigFloor
 
 // CIObservation is the identity of one workflow execution as a fire saw it.
 type CIObservation struct {
