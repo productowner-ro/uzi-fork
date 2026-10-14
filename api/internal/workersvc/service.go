@@ -1098,6 +1098,10 @@ type Store interface {
 	// CountOnlineWorkersSatisfyingCaps above, and off the hot path for the same reason — it runs
 	// only for an interlocked queued run already past its health threshold.
 	CountOnlineWorkersSatisfyingProtocol(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingCIConfigGuard backs PRD #2865's queued-reason rung: a GUARDED
+	// queued run (runs.ci_config_guard) whose owner has NO online worker self-reporting the
+	// 'ci_config_guard_v1' protocol capability gets reasonNoCIConfigGuardCapableWorker.
+	CountOnlineWorkersSatisfyingCIConfigGuard(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineWorkersSatisfyingCodexHarness backs PRD #1332 M5A's (D3) queued-reason rung: a
 	// CODEX-INDICATING queued run whose owner has NO online worker advertising the 'codex_harness_v1'
 	// protocol capability gets reasonNoCodexCapableWorker — the run's non-bypassable Codex claim
@@ -2009,6 +2013,10 @@ type Service struct {
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
 	// run without the permit transaction. A LEGACY completion never touches it.
 	txBeginner TxBeginner
+	// ciRepairAfterInsert is a test seam (nil in production): CreateCIRepairRun calls it inside
+	// the create transaction after the run INSERT and before the episode write, so a test can
+	// inject a failure and prove the run and the episode roll back together.
+	ciRepairAfterInsert func(runID uuid.UUID) error
 	// codexFreezeFn is the createRunAtomic Codex-binding freeze, a SEAM defaulting (nil) to
 	// s.freezeCodexBinding (PRD #1429 M1). It exists so a test can inject a failing freeze and
 	// prove the create transaction rolls the run INSERT back (D1: a freeze failure leaves NO
@@ -6063,7 +6071,7 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
 // advance the ref ("no_ref" | "not_descendant" | "unsupported" | "tip_missing" |
-// "pack_too_large" | "pack_invalid" | "workflow_scope" | "superseded"); it
+// "pack_too_large" | "pack_invalid" | "workflow_scope" | "ci_config_guard" | "superseded"); it
 // is empty on a successful publish. Either way Ref is the checkpoint ref the worker
 // asked about.
 type PublishResult struct {
@@ -6174,6 +6182,9 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		PAT:           string(botPAT),
 		DeclaredTip:   tipOid,
 		Pack:          pack,
+		// Guarded repair runs (PRD #2865): the broker refuses a tip that touches a protected path.
+		CIConfigGuard: owned.CiConfigGuard,
+		CIConfigPaths: owned.CiConfigPaths,
 	}
 
 	// PRD #1810: a worker still bound to a TERMINAL run may publish (a shutdown checkpoint of a
@@ -6364,6 +6375,11 @@ func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, term
 		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
 		// run's work.
 		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, false, nil
+	case errors.Is(err, pushbroker.ErrCIConfigGuard):
+		// A guarded run's tip touches a protected CI-config path (or the broker could not prove
+		// it does not): a benign best-effort skip, like workflow_scope. The worker's own
+		// merge-base check decides the final branch push.
+		return PublishResult{Published: false, Ref: ref, Skipped: "ci_config_guard", Detail: secretscrub.Scrub(err.Error())}, false, nil
 	case errors.Is(err, pushbroker.ErrTipMissing):
 		// A tip the pack never delivered: a best-effort skip, never a 5xx. Detail carries the
 		// broker's content-free reason for the operator log (never serialized to the worker).
