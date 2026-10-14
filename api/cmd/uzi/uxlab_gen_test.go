@@ -92,6 +92,12 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-human-stop-reject":          func(d bool) string { return humanStopDetailScene(d, "reject") },
 		"detail-human-stop-stop":            func(d bool) string { return humanStopDetailScene(d, "stop") },
 		"detail-human-stop-failure":         func(d bool) string { return humanStopDetailScene(d, "failure") },
+		"board-wide-title-120":              func(d bool) string { return boardWideTitleScene(d, now, 120) },
+		"board-wide-title-200":              func(d bool) string { return boardWideTitleScene(d, now, 200) },
+		"board-accounts-one-each-100":       func(d bool) string { return boardAccountScene(d, now, 1, 100) },
+		"board-accounts-two-plus-one-100":   func(d bool) string { return boardAccountScene(d, now, 2, 100) },
+		"board-accounts-one-each":           func(d bool) string { return boardAccountScene(d, now, 1, 140) },
+		"board-accounts-two-plus-one":       func(d bool) string { return boardAccountScene(d, now, 2, 140) },
 		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
 		"board-codex":                       func(d bool) string { return boardCodex(d, now) },
 		"board-empty":                       boardEmpty,
@@ -1434,5 +1440,44 @@ func humanStopDetailScene(dark bool, id string) string {
 			break
 		}
 	}
+	return m.View().Content
+}
+
+// Mixed credentials share measured cells across the needs-you, floor and done bands.
+func boardAccountScene(dark bool, now time.Time, claudeCount, width int) string {
+	runs := boardRuns(now)[:4]
+	for i := range runs {
+		runs[i].AnthropicSecretID, runs[i].AnthropicSecretLabel = sp("claude-id"), sp("default")
+	}
+	runs[0].Harness = "codex"
+	runs[0].CodexSecretID, runs[0].CodexSecretLabel = sp("codex-id"), sp("default")
+	runs[0].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 3}
+	if claudeCount > 1 {
+		runs[2].AnthropicSecretLabel = sp("acct-a")
+	}
+	runs[2].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 10}
+	runs[3].Status = "completed"
+	runs[3].AnthropicSecretLabel, runs[3].AnthropicSecretID = nil, nil
+	fake := &uzicli.FakeClient{Runs: runs}
+	m := uxModel(fake, "", dark)
+	m.width = width
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
+	m = step(m, secretsMsg{count: claudeCount, codexCount: 1})
+	return m.View().Content
+}
+
+// Wide titles consume the space before the reserved judge and worker columns.
+func boardWideTitleScene(dark bool, now time.Time, width int) string {
+	runs := boardRuns(now)[:4]
+	runs[0].IssueTitle = strings.Repeat("Keep account labels readable while aligning costs and judge markers across the board. ", 5)
+	runs[0].JudgeVerdict, runs[0].JudgeTodoCount = sp("issues"), 2
+	for i := range runs {
+		runs[i].WorkerName = sp("worker-a")
+	}
+	fake := &uzicli.FakeClient{Runs: runs}
+	m := uxModel(fake, "", dark)
+	m.width = width
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
+	m = step(m, secretsMsg{count: 2, codexCount: 1})
 	return m.View().Content
 }
