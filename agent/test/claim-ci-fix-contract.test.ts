@@ -66,9 +66,10 @@ test("ci_fix claim wire contract: worker parses the server's ci_fix shape", () =
 // PRD #71 M5 cross-side contract: the server produces the guard's protected-path
 // set as `ClaimConfig.CIConfigPaths` with the json tag `ci_config_paths` (see
 // api/internal/workersvc/claim.go), and the worker's pre-push guard reads exactly
-// that field (`claim.config.ci_config_paths`) and drives flagCIConfigPathsRaw with it (after the worker floor).
-// A drift in the wire name between the two sides would silently fail the guard OPEN
-// (an empty path set flags nothing), so both halves are pinned here.
+// that field (`claim.config.ci_config_paths`) and drives flagCIConfigPathsRaw with it, unioned
+// after the worker floor. A drift in the wire name would silently drop the server's custom paths
+// (the project's ci_config_path and any operator additions; the floor still applies), so both
+// halves are pinned here.
 test("ci_fix guard contract: config.ci_config_paths reaches the worker guard by its exact wire name", () => {
   // 1. The Go producer's json tag is exactly `ci_config_paths` (omitempty). Pin the
   //    literal string against the Go source so a rename on either side is caught.
