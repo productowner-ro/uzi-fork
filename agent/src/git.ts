@@ -61,6 +61,9 @@ const CODE_UUID = codePattern(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-
 const CODE_READER_KEY = codePattern(/^cross-check-[A-Za-z0-9_-]{1,128}-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?![\s\S])/);
 const CODE_MAX_READERS = 128;
 type LocalMetadataDirectory = "uzi-owed" | "uzi-code-snapshots";
+interface RecoveryPhysicalWarningScope {
+  emitted: boolean;
+}
 const codeGeneration = (value: number): boolean => Number.isSafeInteger(value) && value >= 0;
 const codeTerminal = (value: string): boolean => ["completed", "failed", "cancelled"].includes(value);
 
@@ -1163,8 +1166,8 @@ function recoveryCaptureKey(branch: string): string {
 }
 
 /** The recovery-capture journal value (one per branch, in the bare's `config --local`). A
- *  Docker-wired worker (issue #1783 M2) adds the attempt id; an entry an older worker wrote has
- *  none, and is still read. */
+ *  worker seeding an attempt path (Docker-wired or recovery-enabled) adds the attempt id;
+ *  older entries without it are still read. */
 export class ForeignRetainedRecoveryError extends Error {
   constructor() { super("foreign retained recovery"); }
 }
@@ -1491,12 +1494,15 @@ function attemptGenerationEvidence(attemptId: string): { generation: number | nu
   return { generation: g ?? null, unreadable: g === undefined && /-g[0-9]+-/.test(attemptId) };
 }
 
-/** How many abandoned attempts (each with its skills sibling) the retention sweep keeps per key. */
+/** Best-effort abandoned-attempt target per key (each with its skills sibling); refusals stay. */
 const RETAINED_ABANDONED_PER_KEY = 3;
 /** The private temp-file prefix of the atomic ledger compaction (inside the bare, beside `config`). */
 const LEDGER_COMPACT_TMP_PREFIX = "config.uzi-compact-";
-/** How many `.uzi-residue-*` entries the retention sweep keeps per clone key. */
+/** Best-effort residue retention target per clone key; protected or unproven excess stays. */
 const RETAINED_RESIDUE_PER_KEY = 5;
+const RESIDUE_ENUMERATION_BUDGET = 4096;
+const RESIDUE_SWEEP_ATTEMPT_BUDGET = 16;
+const RESIDUE_SWEEP_CURSOR_KEYS = 128;
 /** The retention sweep's runner-uid delete: the image's root-owned busybox rm (absolute, so it
  *  never resolves from a runner-writable PATH), and its deadline. */
 const RETENTION_RM_BIN = "/bin/rm";
@@ -1525,8 +1531,8 @@ class RunnerDeleteUnsettledError extends Error {
  * issue #1783 M3 — what the runner hands {@link GitCache.runnerCloneForBranch} so a CANONICAL
  * reseed (an unwired worker, or any canonical-path seed) frees `<runnerRoot>/<repoDir>/<key>`
  * only after a scoped process proof, and quarantines what it cannot delete instead of failing on
- * it. REQUIRED on every entry point (N5): there is no unproven plain-`fs.rm` fallback. A
- * Docker-wired attempt seed never frees the canonical path, so it never calls this.
+ * it. REQUIRED on every entry point (N5): there is no unproven plain-`fs.rm` fallback.
+ * Fresh attempt seeds (Docker-wired or recovery-enabled) never free the canonical path here.
  */
 export interface CanonicalReseedOptions {
   /** The process proof over the canonical path, called under the bare lock AFTER the journal
@@ -1535,12 +1541,18 @@ export interface CanonicalReseedOptions {
    *  entry moves nothing a process can be inside). Throws (a {@link CloneResidueBlockedError}) to
    *  block: nothing is removed or moved. */
   beforeFree: (canonicalPath: string) => Promise<void>;
+  /** Retention predicates, with the same contract as AttemptSeedOptions. */
+  isLive: AttemptSeedOptions["isLive"];
+  quiescent: AttemptSeedOptions["quiescent"];
+  /** Internal control errors must escape best-effort retention. */
+  isInterruption?: (error: unknown) => boolean;
 }
 
 /**
- * issue #1783 M2 — what a Docker-wired worker hands {@link GitCache.runnerCloneForBranch} to seed
+ * issue #1783 M2 — what an attempt-path worker hands {@link GitCache.runnerCloneForBranch} to seed
  * a fresh ATTEMPT path `<runnerRoot>/<repoDir>/<key>.attempt-<attemptId>` instead of the fixed
- * canonical `<key>` path. Absent ⇒ today's canonical seed, byte-for-byte.
+ * canonical `<key>` path. Docker wiring enables this by default; retained recovery can enable it
+ * on unwired workers too. Absent ⇒ canonical free, residue retention, then canonical seed.
  */
 export interface AttemptSeedOptions {
   /** The attempt id minted for this execution attempt (the marker carries the same id). */
@@ -1557,8 +1569,11 @@ export interface AttemptSeedOptions {
    *  run its sweep. */
   onSeeded?: (clonePath: string) => void;
   /** The retention sweep's quiescence predicate: true when the scoped process scan over `paths`
-   *  finds nothing in scope. A false (or a throw) keeps the entry. */
+   *  finds nothing in scope. False, absent/unverified proof or a generic throw keeps the entry;
+   *  classified control/recovery interruptions escape best-effort retention. */
   quiescent: (paths: string[], canonicalPath: string) => Promise<boolean>;
+  /** Internal control errors must escape best-effort retention. */
+  isInterruption?: (error: unknown) => boolean;
 }
 
 // issue #909 — the PRE-#887 flattened owner-key form. Kept ONLY so a resume can still READ a
@@ -1699,7 +1714,7 @@ export interface RunnerClone {
    *  for the re-gate decision). Absent/false on every other leg. */
   wipRecovered?: boolean;
   /** issue #1783 M2: the attempt id when the clone was seeded at an ATTEMPT path (a
-   *  Docker-wired worker); absent for a canonical-path seed. */
+   *  Docker-wired or recovery-enabled worker); absent for a canonical-path seed. */
   attemptId?: string;
 }
 
@@ -1917,6 +1932,9 @@ export class GitCache {
   readonly recoveryArchiveRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
+  /** Availability-only LRU progress, never a cached safety verdict. Restart/eviction
+   * restarts from the oldest excess; empty excess removes the key. */
+  private readonly residueSweepCursors = new Map<string, { mtimeMs: number; name: string }>();
   // Fresh no-child authority exists only in the GitCache invocation that created the pin.
   // At capacity, pinning still works but returns no retirement receipt (retention).
   private readonly codeSnapshotFreshReceipts = new Set<string>();
@@ -2675,9 +2693,9 @@ export class GitCache {
    * the untrusted direction (worker fetching BACK from the runner clone) is the one
    * forced onto the pack transport in fetchAgentBranch (B2 invariant 3).
    *
-   * issue #1783 M2 — `attempt` (a Docker-wired worker only) seeds a FRESH per-attempt path
-   * instead of this canonical one and classifies the journal by identity; see
-   * {@link attemptCloneForBranch}. Absent ⇒ everything above, byte-for-byte.
+   * issue #1783 M2 — `attempt` seeds a FRESH per-attempt path on Docker-wired or recovery-enabled
+   * workers and classifies the journal by identity; see {@link attemptCloneForBranch}.
+   * Absent ⇒ canonical free, shared per-key residue retention, then the canonical seed above.
    *
    * issue #1783 M3 — `reseed` (REQUIRED: the runner passes it on every claim, and there is no
    * unproven plain-`fs.rm` fallback) makes the canonical reseed free the canonical path through
@@ -2690,7 +2708,7 @@ export class GitCache {
    * from the bare (materializeRunnerClone), because the Codex command sandbox does not grant
    * the bare and planning capture refuses alternates. Default false: ordinary Claude
    * runs keep the shared clone unchanged. It applies to BOTH seeds: the canonical one and
-   * (issue #1783) the per-attempt one on a Docker-wired worker.
+   * (issue #1783) the per-attempt one, including recovery-enabled unwired workers.
    */
   async runnerCloneForBranch(
     barePath: string,
@@ -2737,8 +2755,16 @@ export class GitCache {
       if (await this.readRecoveryAttemptMode(barePath, key)) {
         throw new Error("recovered key requires a fresh attempt path");
       }
-      if ((await this.journaledClonePaths(barePath)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
+      const warningScope: RecoveryPhysicalWarningScope = { emitted: false };
+      if ((await this.journaledClonePaths(barePath, warningScope)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
       await this.freeCanonicalClonePath(clonePath, key, reseed);
+      await this.sweepResidue(barePath, clonePath, reseed, warningScope).catch((err: unknown) => {
+        if (reseed.isInterruption?.(err)) throw err;
+        this.checkRecoveryInterruption();
+        this.log.warn("runner clone retention sweep failed; nothing further removed", {
+          key, error: sanitizeForLog(gitErrorMessage(err), 157),
+        });
+      });
       return this.seedRunnerClone(barePath, branch, clonePath, runId, resume, expectedCheckpointTip, opts);
     });
   }
@@ -2778,8 +2804,9 @@ export class GitCache {
    *      FAILED yet left nothing to rename has an unknown outcome and blocks.
    *   6. Confirm the canonical path is free (lstat ENOENT).
    *
-   * The residue is KEPT: nothing here deletes it. Only the retention sweep may, later, as the runner
-   * uid and under the per-key cap (a root-owned residue then fails that delete and stays). Any
+   * The residue is KEPT: nothing here deletes it. Only revalidated retention may reclaim it toward
+   * the best-effort per-key target: directories use the runner uid under the uid split, while files
+   * and symlinks are unlinked as entries. A directory the runner cannot delete stays. Any
    * failure of steps 1, 3, 5 or 6 is a {@link CloneResidueBlockedError}.
    */
   private async freeCanonicalClonePath(canonical: string, key: string, reseed: CanonicalReseedOptions): Promise<void> {
@@ -2900,10 +2927,10 @@ export class GitCache {
   }
 
   /**
-   * issue #1783 M2 — the Docker-wired seed: EVERY execution attempt gets a fresh clone path
-   * `<runnerRoot>/<repoDir>/<key>.attempt-<attemptId>`. A predecessor's path is never reseeded,
-   * executed in, moved or deleted here: prior work reaches the new attempt only through the
-   * tracking ref, checkpoint adoption and the journal/capture flow, all resolved in the bare.
+   * issue #1783 M2 — the attempt-path seed (Docker-wired or recovery-enabled): a fresh clone path
+   * `<runnerRoot>/<repoDir>/<key>.attempt-<attemptId>`. The seed itself does not reuse or move a
+   * predecessor's path: prior work reaches the new attempt through the tracking ref, checkpoint
+   * adoption and journal/capture flow in the bare. Post-seed retention may delete eligible excess.
    *
    * The recovery journal is classified by IDENTITY — the (runId, repoDir/key) pair plus the
    * attempt grammar — not by literal path equality, so a journal naming the predecessor's
@@ -2994,6 +3021,7 @@ export class GitCache {
       }
       attempt.onSeeded?.(clonePath);
       await this.sweepRetainedArtifacts(barePath, canonical, clonePath, attempt).catch((err: unknown) => {
+        if (attempt.isInterruption?.(err)) throw err;
         this.checkRecoveryInterruption();
         this.log.warn("runner clone retention sweep failed; nothing further removed", {
           key,
@@ -3050,7 +3078,7 @@ export class GitCache {
   /**
    * issue #1783 M2 — the retention sweep, run at each attempt seed under the bare lock.
    *
-   * Attempts: keeps at most {@link RETAINED_ABANDONED_PER_KEY} DISPOSABLE-KIND attempts per key and
+   * Attempts: targets {@link RETAINED_ABANDONED_PER_KEY} DISPOSABLE-KIND attempts per key and
    * deletes the oldest beyond that (attempt-id order), each with its `.uzi-skills-*` sibling as a
    * pair (the sibling first, so a failed attempt delete never orphans it). A skills sibling whose
    * attempt dir is already gone and whose ledger entry is not `reclaimed`/`live` is swept too. The disposable kinds are `abandoned` (a verified capture released it in place) and a
@@ -3059,13 +3087,9 @@ export class GitCache {
    * uncaptured foreign owner's attempt), `retired`, a live attempt and a dir with no ledger identity
    * are never counted and never deleted.
    *
-   * Residue: keeps at most {@link RETAINED_RESIDUE_PER_KEY} `.uzi-residue-<key>.residue-<uuid>`
-   * entries of this key (the one grammar, see formatResidueName) and deletes the oldest beyond that,
-   * OLDEST by the residue directory's own lstat mtime, the name as the tie-break. A uuid is not
-   * sortable, and mtime is what the producer's rename leaves; a runner-uid process that touches a
-   * residue can only reorder which disposable residue goes first. Residue is un-journaled by
-   * definition and carries no run id: it is disposable when no journal names it (or a path inside
-   * it), it is not live, and the scoped scan over it is quiescent.
+   * Residue: delegates to {@link sweepResidue}, the shared best-effort per-key helper also called
+   * by canonical reseeds. This attempt-only path retains the abandoned-attempt and orphaned-skills
+   * phases above; its residue phase runs after seed and live registration.
    *
    * `seeding` (the attempt path this seed just made) is never a candidate.
    * Every deletion goes through {@link deleteRetainedArtifact} (re-validated, runner-uid). A deletion
@@ -3079,9 +3103,9 @@ export class GitCache {
     attempt: AttemptSeedOptions,
   ): Promise<void> {
     const parent = path.dirname(canonical);
-    const key = path.basename(canonical);
     const names = await fs.readdir(parent);
-    const journaled = [...(await this.journaledClonePaths(barePath))];
+    const warningScope: RecoveryPhysicalWarningScope = { emitted: false };
+    const journaled = [...(await this.journaledClonePaths(barePath, warningScope))];
     const ledgers = await this.readAllAttemptLedgers(barePath);
     const namedByJournal = (p: string): boolean => journaled.some((j) => isWithinPath(j, p));
     const entryFor = (attemptId: string, p: string): (AttemptLedgerEntry & { branch: string }) | undefined => {
@@ -3091,7 +3115,9 @@ export class GitCache {
     const quiescent = async (paths: string[]): Promise<boolean> => {
       try {
         return await attempt.quiescent(paths, canonical);
-      } catch {
+      } catch (err) {
+        if (attempt.isInterruption?.(err)) throw err;
+        this.checkRecoveryInterruption();
         return false;
       }
     };
@@ -3151,7 +3177,51 @@ export class GitCache {
       }
     }
 
-    // 2. This key's residue, oldest (mtime) first beyond the cap.
+    await this.sweepResidue(barePath, canonical, attempt, warningScope);
+  }
+
+  /** Residue-only retention under the bare lock: canonical seeds call this AFTER successful
+   * canonical free and BEFORE the new seed; attempt seeds call it after seed/live registration.
+   * Only exact parser-valid `.uzi-residue-<key>.residue-<uuid>` direct siblings of this key count.
+   * Validate the parent and enumerate its complete direct-entry set within the private fixed
+   * 4096-entry enumeration budget before reclamation; overflow or validation failure skips reclamation.
+   * No excess returns without another journal discovery. Sort by lstat mtime, then basename, and
+   * try at most 16 candidates from the original oldest excess slice toward
+   * {@link RETAINED_RESIDUE_PER_KEY}. An in-process round-robin cursor (128-key LRU)
+   * advances even on refusal, without caching safety evidence; restart/eviction starts
+   * from the oldest again, and no excess clears the cursor. Refused excess stays, with
+   * no newer compensating deletes and no hard disk or wall-time bound.
+   * Fresh readable journals (candidate or descendant), live registry and quarantine are checked
+   * around an affirmative scoped seed-process proof and again before deletion. A latched or newly
+   * latched unreadable-unattributed worker quarantine vetoes residue deletion. False, absent,
+   * unverified or generic thrown proof keeps the entry with bounded diagnostics; classified
+   * control/recovery interruptions propagate. Fresh-attempt unreadable relaxation grants no delete
+   * authority, and off-Linux absent process proof keeps entries. Canonical predicates retain
+   * configured best-effort Docker handling; attempt retention retains its process-only posture.
+   * {@link deleteRetainedArtifact} preserves uid/path/name checks and deletion deadlines; an rm
+   * possibly still alive stops further cleanup, and files/symlinks are unlinked without following.
+   */
+  private async sweepResidue(
+    barePath: string,
+    canonical: string,
+    predicates: Pick<AttemptSeedOptions, "isLive" | "quiescent" | "isInterruption">,
+    warningScope: RecoveryPhysicalWarningScope,
+  ): Promise<void> {
+    const parent = path.dirname(canonical);
+    const key = path.basename(canonical);
+    const validateParent = async (): Promise<void> => {
+      if (path.dirname(parent) !== path.resolve(this.runnerRoot)) throw new Error("not a direct runner repo dir");
+      const st = await fs.lstat(parent);
+      if (st.isSymbolicLink() || !st.isDirectory()) throw new Error("runner repo dir is not a real directory");
+    };
+    await validateParent();
+    const names: string[] = [];
+    // Bound all direct siblings before any candidate stat, proof or deletion. The async
+    // iterator closes the directory on completion, overflow and read failure.
+    for await (const entry of await fs.opendir(parent)) {
+      if (names.length === RESIDUE_ENUMERATION_BUDGET) throw new Error("residue enumeration exceeds 4096-entry work budget");
+      names.push(entry.name);
+    }
     const isOwnResidue = (n: string): boolean => {
       const art = parseRetainedArtifactName(n);
       return art?.kind === "residue" && art.key === key;
@@ -3160,14 +3230,71 @@ export class GitCache {
     for (const name of names) {
       if (!isOwnResidue(name)) continue;
       const p = path.join(parent, name);
-      const st = await fs.lstat(p).catch(() => undefined);
-      if (st) residue.push({ p, name, mtimeMs: st.mtimeMs });
+      try {
+        const st = await fs.lstat(p);
+        residue.push({ p, name, mtimeMs: st.mtimeMs });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
     }
-    residue.sort((a, b) => a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    for (const r of residue.slice(0, Math.max(0, residue.length - RETAINED_RESIDUE_PER_KEY))) {
-      if (namedByJournal(r.p) || attempt.isLive(r.p)) continue;
-      if (!(await quiescent([r.p]))) continue;
-      if (await this.deleteRetainedArtifact(parent, r.p, isOwnResidue, { unlinkNonDirectory: true })) {
+    this.checkRecoveryInterruption();
+    if (residue.length <= RETAINED_RESIDUE_PER_KEY) {
+      this.residueSweepCursors.delete(canonical);
+      return;
+    }
+    // Complete journal discovery is required before reclamation. Ordinary reseeds with
+    // no excess avoid repeating the caller's journal discovery when nothing can be deleted.
+    await this.journaledClonePaths(barePath, warningScope);
+    const compare = (a: { mtimeMs: number; name: string }, b: { mtimeMs: number; name: string }): number =>
+      a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    residue.sort(compare);
+    const excess = residue.slice(0, residue.length - RETAINED_RESIDUE_PER_KEY);
+    const cursor = this.residueSweepCursors.get(canonical);
+    // A deleted cursor entry still defines its ordering position. Wrap after the
+    // last excess entry; the newest five never enter the candidate list.
+    const next = cursor === undefined ? 0 : excess.findIndex(r => compare(r, cursor) > 0);
+    const start = next < 0 ? 0 : next;
+    for (let n = 0; n < Math.min(RESIDUE_SWEEP_ATTEMPT_BUDGET, excess.length); n++) {
+      const r = excess[(start + n) % excess.length]!;
+      this.residueSweepCursors.delete(canonical);
+      this.residueSweepCursors.set(canonical, { mtimeMs: r.mtimeMs, name: r.name });
+      if (this.residueSweepCursors.size > RESIDUE_SWEEP_CURSOR_KEYS) {
+        this.residueSweepCursors.delete(this.residueSweepCursors.keys().next().value!);
+      }
+      const refuse = (reason: string): false => {
+        this.log.warn("runner clone retention: refusing residue deletion; keeping it", {
+          path: r.p, reason: sanitizeForLog(reason, 157),
+        });
+        return false;
+      };
+      const open = (): boolean => {
+        this.checkRecoveryInterruption();
+        if (residueQuarantine() !== undefined) return refuse("worker quarantined");
+        if (predicates.isLive(r.p)) return refuse("live path");
+        return true;
+      };
+      const validate = async (): Promise<boolean> => {
+        await validateParent();
+        const journaled = await this.journaledClonePaths(barePath, warningScope);
+        if ([...journaled].some((j) => isWithinPath(j, r.p))) return refuse("named by recovery journal");
+        return open();
+      };
+      if (!(await validate())) continue;
+      let proven: boolean;
+      try {
+        proven = await predicates.quiescent([r.p], canonical);
+      } catch (err) {
+        if (predicates.isInterruption?.(err)) throw err;
+        this.checkRecoveryInterruption();
+        refuse(gitErrorMessage(err));
+        continue;
+      }
+      if (!open()) continue;
+      if (proven !== true) { refuse("no affirmative quiescence proof"); continue; }
+      if (!(await validate())) continue;
+      if (await this.deleteRetainedArtifact(parent, r.p, isOwnResidue, {
+        unlinkNonDirectory: true, beforeDelete: validate, canDelete: open, strictValidation: true,
+      })) {
         this.log.info("runner clone retention: deleted quarantined residue", { path: r.p });
       }
     }
@@ -3202,10 +3329,10 @@ export class GitCache {
     parent: string,
     target: string,
     isExpected: (name: string) => boolean,
-    opts: { unlinkNonDirectory?: boolean } = {},
+    opts: { unlinkNonDirectory?: boolean; beforeDelete?: () => Promise<boolean>; canDelete?: () => boolean; strictValidation?: boolean } = {},
   ): Promise<boolean> {
     const refuse = (why: string): false => {
-      this.log.warn("runner clone retention: refusing to delete; keeping it", { path: target, reason: why });
+      this.log.warn("runner clone retention: refusing to delete; keeping it", { path: target, reason: sanitizeForLog(why, 157) });
       return false;
     };
     const root = path.resolve(this.runnerRoot);
@@ -3215,24 +3342,39 @@ export class GitCache {
     // a second rm here would run beside it. Keep the target; a later sweep retries it after 'close'.
     for (const unsettled of this.unsettledDeletes.keys()) {
       if (isWithinPath(target, unsettled)) {
-        return refuse(`an earlier runner-uid delete of this path (${unsettled}) may still be running`);
+        return refuse("an earlier runner-uid delete of this path (or its parent) may still be running");
       }
     }
     const lstat = this.retentionDeleteSeam?.lstat ?? ((p: string) => fs.lstat(p));
+    let nonDirectory = false;
     try {
       const pst = await lstat(parent);
-      if (pst.isSymbolicLink() || !pst.isDirectory()) return refuse("the runner repo dir is not a real directory");
-      const st = await lstat(target);
-      if (st.isSymbolicLink() || !st.isDirectory()) {
-        if (!opts.unlinkNonDirectory) return refuse("not a real directory");
-        // issue #1783 M3: a symlink or file quarantined off the canonical path. unlink(2) removes
-        // the entry itself and never follows it; a directory swapped in meanwhile fails it (kept).
-        await fs.unlink(target);
-        return true;
+      if (pst.isSymbolicLink() || !pst.isDirectory()) {
+        if (opts.strictValidation) throw new Error("the runner repo dir is not a real directory");
+        return refuse("the runner repo dir is not a real directory");
       }
+      const st = await lstat(target);
+      nonDirectory = st.isSymbolicLink() || !st.isDirectory();
+      if (nonDirectory && !opts.unlinkNonDirectory) return refuse("not a real directory");
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+      if (opts.strictValidation) throw err;
       return refuse(gitErrorMessage(err));
+    }
+    // Journal reads await after lstat; live/quarantine/control vetoes run synchronously at the
+    // destruction boundary, after every awaited validation (for unlink and recursive delete).
+    if (opts.beforeDelete && !(await opts.beforeDelete())) return false;
+    if (opts.canDelete && !opts.canDelete()) return false;
+    if (nonDirectory) {
+      try {
+        await fs.unlink(target);
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+        refuse(gitErrorMessage(err));
+        if (opts.strictValidation) throw err;
+        return false;
+      }
     }
     try {
       await this.runRunnerUidDelete(target);
@@ -3240,7 +3382,8 @@ export class GitCache {
       // An rm that may still be alive: stop the whole sweep (the caller logs "nothing further
       // removed") rather than start another delete beside it.
       if (err instanceof RunnerDeleteUnsettledError) throw err;
-      this.log.warn("runner clone retention: could not delete; keeping it", { path: target, error: gitErrorMessage(err) });
+      this.log.warn("runner clone retention: could not delete; keeping it", { path: target, error: sanitizeForLog(gitErrorMessage(err), 157) });
+      if (opts.strictValidation) throw err;
       return false;
     }
     return true;
@@ -5547,8 +5690,8 @@ export class GitCache {
    * (retireRunnerClone), never before the rename. */
   async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string, attemptId?: string): Promise<void> {
     await this.withLock(barePath, async () => {
-      // issue #1783 M2: a Docker-wired worker also journals the attempt id (the same id its path
-      // and marker carry). Absent ⇒ today's `{ runId, clonePath }` byte-for-byte.
+      // issue #1783 M2: an attempt-path seed also journals the id its path and marker carry,
+      // including recovery-enabled unwired workers. Canonical sources omit the attempt id.
       await this.assertRecoveryBare(barePath);
       const source = recoverySource({ runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }) });
       const pending = await this.readRecoveryCapture(barePath, branch);
@@ -6454,7 +6597,7 @@ export class GitCache {
   }
 
   /**
-   * issue #1786 — retain a stopped ATTEMPT clone (a Docker-wired worker) under the ledger's
+   * issue #1786 — retain a stopped ATTEMPT clone (Docker-wired or recovery-enabled) under the ledger's
    * never-deleted `reclaimed` state, in ONE bare-lock section with no nested lock. Validates that
    * the source is this run's `live` (or already `reclaimed`) attempt at exactly this path, a real
    * directory with a real `.git`; appends ledger `reclaimed` (even when the active journal now names
@@ -7985,7 +8128,7 @@ export class GitCache {
 
   /** Every clone path any branch's recovery journal names (issue #1783 M2: the retention sweep
    *  never deletes a journaled path). Throws on an unreadable config or a malformed journal. */
-  private async journaledClonePaths(barePath: string): Promise<Set<string>> {
+  private async journaledClonePaths(barePath: string, warningScope?: RecoveryPhysicalWarningScope): Promise<Set<string>> {
     const out = new Set<string>();
     let physicalFailure = false;
     try {
@@ -8013,7 +8156,10 @@ export class GitCache {
       return out;
     } finally {
       this.checkRecoveryInterruption();
-      if (physicalFailure) this.warnRecoveryPhysicalFailure();
+      if (physicalFailure && !warningScope?.emitted) {
+        if (warningScope) warningScope.emitted = true;
+        this.warnRecoveryPhysicalFailure();
+      }
     }
   }
 
@@ -8181,7 +8327,7 @@ export class GitCache {
   }
 
   /**
-   * issue #1783 M2 — release a predecessor attempt IN PLACE: a Docker-wired worker's replacement for
+   * issue #1783 M2 — release a predecessor attempt IN PLACE: the attempt-path replacement for
    * retireRunnerClone after a VERIFIED capture (`state` `abandoned`: its work is in the tracking ref,
    * so the retention sweep may later dispose of it), and for a terminal FOREIGN owner's attempt in
    * the orphan reclaim, which captures nothing (`state` `reclaimed`: retained forever, never
