@@ -622,6 +622,13 @@ void _releaseCheckStatusFull;
   const _workerExtra: never = null as unknown as Exclude<keyof typeof workerFull, keyof Worker>;
   const _workerZero: ZeroOf<Worker, "capabilities" | "reported_runs" | "run_disk"> = workerZero;
   const _workerFull: Widen<Worker> = workerFull;
+  const _workerPendingZero: Pick<Worker, "pending_outcome_count" | "pending_overflow"> = {
+    pending_outcome_count: 0,
+    pending_overflow: false,
+  };
+  const _workerPendingUnavailable: Pick<Worker, "pending_outcome_count" | "pending_overflow"> = {};
+  void _workerPendingZero;
+  void _workerPendingUnavailable;
   void _workerMissing;
   void _workerExtra;
   void _workerZero;
@@ -1715,6 +1722,18 @@ it("plan-check findings permit a null item array", () => {
   expect(summary.findings?.items).toBeNull();
 });
 
+
+describe("worker pending outcome contract issue 2009", () => {
+  it.each([
+    ["owner", workerFull, workerZero],
+    ["admin", adminWorkerFull, adminWorkerZero],
+  ] as const)("records populated fresh evidence and legacy omissions for %s", (_scope, full, zero) => {
+    expect(full).toHaveProperty("pending_outcome_count", 1);
+    expect(full).toHaveProperty("pending_overflow", true);
+    expect(zero).not.toHaveProperty("pending_outcome_count");
+    expect(zero).not.toHaveProperty("pending_overflow");
+  });
+});
 
 describe("worker custody decision contract", () => {
   it("records populated counts while zero DTOs omit the optional field", () => {
