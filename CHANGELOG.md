@@ -22,34 +22,12 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Fixed
-
-- **Plan summary after a credential-switch give-up ([#2945](https://github.com/vtmocanu/uzi/issues/2945)).**
-  A plan accepted on the retry that follows a credential switch that could not complete (the run continued on its old token) now gets its plan summary on Claude runs, instead of silently going without one; an accepted plan summary is also no longer dropped from the run result by an earlier give-up.
-
-- **Normal canonical reseeds safely reclaim excess quarantined clone residue, including on unwired workers.**
-  Workers now try to reclaim the oldest excess residue toward a best-effort target of five entries per clone key during normal canonical reseeding as well as attempt seeding. Each sweep attempts at most 16 candidates, with bounded in-process round-robin progress past refusals and fresh safety checks on every revisit. Recovery-protected, live or unproven entries stay, and worker quarantine vetoes deletion, so safety can leave more than five; this is not a hard disk or wall-time bound (#1859).
-
-- **Human plan gates no longer wait for the plan summary ([#2901](https://github.com/vtmocanu/uzi/issues/2901)).**
-  The worker now starts the advisory plan summary after the plan is stored without awaiting it, so approving, revising or rejecting a plan is no longer delayed by up to the summary timeout, and a summary of a plan you revised is no longer kept for the run or generated after the revise.
-
-- **Pending outcomes keep their API age across worker snapshot rotation (#2009).**
-  Updated workers report complete pending identities so health warnings and worker counts survive active-list caps; fresh overflow is shown as “N confirmed pending; more may be pending” without inventing per-run ages. Coverage requires a worker fleet roll and a complete list within the ceiling in an accepted snapshot; rejected enclosing snapshots provide no pending identity coverage ([design and limits](adr/2009-pending-outcome-identities.md)).
-
-- **Codex capabilities survive provisional outage requeues ([#2988](https://github.com/vtmocanu/uzi/issues/2988)).**
-  Stale-worker and claimed-never-started requeues preserve the capability for same-generation re-adoption while queued suspends credential use. Every successful fresh claim revokes the old capability atomically before assembly; flights already revoked before rollout are not repaired.
-
-- **Merged runs automatically discard earlier custody holds after fresh verification of their recorded PR ([#2506](https://github.com/vtmocanu/uzi/issues/2506), partial, nonclosing).**
-  Earlier open holds stop occupying custody slots after the server freshly verifies the completed run's own recorded PR has merged and rechecks its exact binding. Available archives remain downloadable until their normal expiry; this discard policy does not prove earlier work was included in the merge and grants no worker source-deletion authority. Physical local-source and available-archive disposal remain deferred to #2823 and #1373. See [ADR-2506](adr/2506-merged-predecessor-discard.md) for safeguards and rollout limits.
-
-### Security
-
-- **The automatic CI-fix guard is hardened against CI-configuration changes (f6d4168a2).**
-  `CI_AUTOFIX_CONFIG_PATHS` now adds to a fixed set of protected paths instead of replacing it.
-
 ## [0.86.0] - 2026-10-06
 
 ### Changed
+
+- **Routine dependency updates ([#3027](https://github.com/vtmocanu/uzi/pull/3027), [#3024](https://github.com/vtmocanu/uzi/pull/3024), [#3026](https://github.com/vtmocanu/uzi/pull/3026), [#3022](https://github.com/vtmocanu/uzi/pull/3022)).**
+  Dependency manifest and image bumps that carry no entry of their own.
 
 - **Routine dependency updates ([#2939](https://github.com/vtmocanu/uzi/pull/2939), [#2940](https://github.com/vtmocanu/uzi/pull/2940), [#2941](https://github.com/vtmocanu/uzi/pull/2941), [#2250](https://github.com/vtmocanu/uzi/pull/2250)).**
   Dependency manifest and image bumps that carry no entry of their own.
@@ -721,10 +699,31 @@ through `[0.52.0]`.)
 - **Refresh worker protocol negotiation without restarting ([#1419](https://github.com/vtmocanu/uzi/issues/1419)).**
   Regular heartbeats refresh API-supported features and outbox quotas, and re-advertise the worker's implemented protocols so an API upgrade can restore claim eligibility within two successful regular heartbeats with complete responses no larger than 1 MiB. Refresh preserves worker identity, registration nonce, running work and custody; server capabilities and capacity limits only grow until ordinary registration.
 
+- **Plan summary after a credential-switch give-up ([#2945](https://github.com/vtmocanu/uzi/issues/2945)).**
+  A plan accepted on the retry that follows a credential switch that could not complete (the run continued on its old token) now gets its plan summary on Claude runs, instead of silently going without one; an accepted plan summary is also no longer dropped from the run result by an earlier give-up.
+
+- **Normal canonical reseeds safely reclaim excess quarantined clone residue, including on unwired workers.**
+  Workers now try to reclaim the oldest excess residue toward a best-effort target of five entries per clone key during normal canonical reseeding as well as attempt seeding. Each sweep attempts at most 16 candidates, with bounded in-process round-robin progress past refusals and fresh safety checks on every revisit. Recovery-protected, live or unproven entries stay, and worker quarantine vetoes deletion, so safety can leave more than five; this is not a hard disk or wall-time bound ([#1859](https://github.com/vtmocanu/uzi/pull/1859)).
+
+- **Human plan gates no longer wait for the plan summary ([#2901](https://github.com/vtmocanu/uzi/issues/2901)).**
+  The worker now starts the advisory plan summary after the plan is stored without awaiting it, so approving, revising or rejecting a plan is no longer delayed by up to the summary timeout, and a summary of a plan you revised is no longer kept for the run or generated after the revise.
+
+- **Pending outcomes keep their API age across worker snapshot rotation ([#2009](https://github.com/vtmocanu/uzi/pull/2009)).**
+  Updated workers report complete pending identities so health warnings and worker counts survive active-list caps; fresh overflow is shown as “N confirmed pending; more may be pending” without inventing per-run ages. Coverage requires a worker fleet roll and a complete list within the ceiling in an accepted snapshot; rejected enclosing snapshots provide no pending identity coverage ([design and limits](adr/2009-pending-outcome-identities.md)).
+
+- **Codex capabilities survive provisional outage requeues ([#2988](https://github.com/vtmocanu/uzi/issues/2988)).**
+  Stale-worker and claimed-never-started requeues preserve the capability for same-generation re-adoption while queued suspends credential use. Every successful fresh claim revokes the old capability atomically before assembly; flights already revoked before rollout are not repaired.
+
+- **Merged runs automatically discard earlier custody holds after fresh verification of their recorded PR ([#2506](https://github.com/vtmocanu/uzi/issues/2506), partial, nonclosing).**
+  Earlier open holds stop occupying custody slots after the server freshly verifies the completed run's own recorded PR has merged and rechecks its exact binding. Available archives remain downloadable until their normal expiry; this discard policy does not prove earlier work was included in the merge and grants no worker source-deletion authority. Physical local-source and available-archive disposal remain deferred to #2823 and #1373. See [ADR-2506](adr/2506-merged-predecessor-discard.md) for safeguards and rollout limits.
+
 ### Security
 
 - **Go toolchain 1.27.2 and golang.org/x/net 0.60.0 ([#2543](https://github.com/vtmocanu/uzi/pull/2543), supersedes #2536, #2537, #2465).**
   The api and controller build with Go 1.27.2 and golang.org/x/net 0.60.0 (controller golang.org/x/text 0.42.0), closing the HTTP/2, net/http, crypto/tls, mime/multipart and os advisories govulncheck reported as called against Go 1.27.1 and the controller's x/net 0.57.0 (x/net 0.59.0 and x/text 0.40.0 also cleared at module level). The embedded public-suffix list is unchanged; only its generated source stamp moves.
+
+- **The automatic CI-fix guard is hardened against CI-configuration changes (f6d4168a2).**
+  `CI_AUTOFIX_CONFIG_PATHS` now adds to a fixed set of protected paths instead of replacing it.
 
 ## [0.85.2] - 2026-10-05
 
