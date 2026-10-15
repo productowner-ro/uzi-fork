@@ -35,7 +35,7 @@ through `[0.52.0]`.)
 
 ### Security
 
-- **The automatic CI-fix guard is hardened against CI-configuration changes.**
+- **The automatic CI-fix guard is hardened against CI-configuration changes (f6d4168a2).**
   `CI_AUTOFIX_CONFIG_PATHS` now adds to a fixed set of protected paths instead of replacing it.
 
 ## [0.86.0] - 2026-10-06
