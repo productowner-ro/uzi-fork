@@ -29,6 +29,18 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Keep handoff recovery receipt checks independent of production retry spacing ([#2494](https://github.com/vtmocanu/uzi/issues/2494)).**
+  The Compose handoff fixture uses the existing stub-only recovery clock while checking custody receipts, then restores the worker's prior timing on success or failure. Receipt and cleanup proofs remain unchanged; production retry spacing is unchanged.
+
+- **Accept large terminal state acknowledgments ([#3030](https://github.com/vtmocanu/uzi/issues/3030)).**
+  Terminal reports use the existing six-MiB state-response budget instead of the smaller maintenance-envelope cap, preserving status and completed-publication receipt parsing when a run includes a large issue description or saved patch. Reads remain bounded by bytes and the cancellation deadline.
+
+- **Server-side cancellation shares the recovery maintenance deadline ([#3030](https://github.com/vtmocanu/uzi/issues/3030)).**
+  A worker observing an exact terminal cancellation starts the same ten-minute maintenance budget before aborting its flight, while preserving the claim fence and retaining unresolved local work.
+
+- **Keep recovery retries and immutable FINAL replay progressing (#3030).**
+  A held-publication request lost before delivery can retry its frozen pack through the existing at-most-once server marker. Saved FINAL requests still reach the receipt check after an API rollback, and valid archive coverage no longer inherits the optional redundancy proof's smaller head, commit-size or encoding limits.
+
 - **Recover abandoned plan-gate executions (#3001).**
   Missing-execution reconciliation also covers approval, input and follow-up gates and completes a previously queued owner cancel before requeue or exhaustion. Human plan revisions get up to three automatic provider-turn re-drives per accepted revision in a live flight, with 5/10/20-second backoff plus 0–20% jitter (30-second cap), after bounded inner retries. On exhaustion the original plan stays visible and feedback stays pending; an ordinary source-bound revise spends the normal revision allowance, while cancel and source-bound reject remain available at the cap. Approvals and follow-ups cannot restart the expired wait. Revised-plan publication atomically records the successful feedback and explicitly supersedes pending predecessors under a source-gate fence. Upgrade the API before workers for `plan_revision_retry_v1`; reclaim keeps existing Claude replay and Codex fresh-plan/re-send behavior, without durable retry accounting. The live expired gate remains busy and can defer an image roll; existing drain/shutdown policy is unchanged.
 
@@ -63,6 +75,9 @@ through `[0.52.0]`.)
   Planning and implementation prompts list available roles with their implementation write capabilities, while planning remains read-only. Skill tools list each role's granted skills, shell tools identify their interpreter, and delegation traces include a bounded, scrubbed assignment excerpt without changing milestone labels.
 
 ### Changed
+
+- **Eligible cancelled runs and earlier terminal generations can publish held work to a fetchable forge ref.**
+  Mutually negotiated held-publication V2 extends the existing original-custodian path while preserving V1 compatibility. Failed/cancelled runs try held publication before archive fallback; completed runs without an applicable receipt stay archive-first, allowing the held alternative only for a prerequisite-bearing thin archive or structured oversize/quota refusal on the same frozen record. Exact-generation reconciliation and immutable FINAL replay preserve lost-ACK recovery, and cancellation uses one 10-minute attempt budget before retaining protection. The existing cleanup boundary accepts possible loss from an undetected terminal late writer after immutable capture; no new post-release source retention across hosted teardown is provided. Held refs follow repository visibility and existing retention, and deleting a public ref cannot revoke fetched copies. See [run recovery](docs/run-recovery.md#publishing-terminal-held-work) (#3030).
 
 - **sqlc regeneration uses verified release binaries.**
   Local regeneration and the API drift check download and cache the pinned sqlc release instead of compiling it from source on a cold Go cache.
