@@ -44,7 +44,7 @@ import { PlanRejectedError } from "./executor.js";
 import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "./plan-revision-retry.js";
 import { checkPlan, type CheckedHumanGate, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
 import type { PlanCrossCheckStateRequest, PlanCrossCheckDiffRefusal } from "./client.js";
-import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, SafeBoundary } from "./harness.js";
+import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, GracefulShutdownCheckpoint, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
 import { cloneKeyOf } from "./attempt-path.js";
 import type { RunProcessReap } from "./run-procs.js";
@@ -1666,6 +1666,7 @@ interface ActiveRun {
   cancel: AbortController;
   steering: SteeringChannel;
   shuttingDown: boolean;
+  gracefulShutdownCheckpoint?: GracefulShutdownCheckpoint;
   retainedLocalCustody?: () => boolean;
 }
 
@@ -2534,6 +2535,7 @@ export class RunRunner {
    *  DURING the shutdown drain (a late claim) is aborted immediately rather than running
    *  to completion past the grace window. */
   private shuttingDownGlobal = false;
+  private shutdownDeadlineAt?: number;
   /** issue #1783: the live execution attempts on this worker (see run-quiescence.ts). */
   private readonly liveAttempts: LiveAttemptRegistry;
   /** issue #1783: the quiescence primitive (process reap + Docker teardown). */
@@ -3656,6 +3658,17 @@ export class RunRunner {
           const durability = (async (): Promise<ShutdownCheckpointOutcome> => {
             let publishOutcome: PublishOutcome | undefined;
             let permitSignal: AbortSignal | undefined;
+            if (executor.safety) {
+              const cause = flight.active!.gracefulShutdownCheckpoint!;
+              if (cause.stopSignal.aborted) {
+                flight.preserveRecoveryClone = true;
+                return "boundary_blocked";
+              }
+              if (Date.now() >= cause.deadlineAt) {
+                flight.preserveRecoveryClone = true;
+                return "timeout";
+              }
+            }
             // issue #1597 M2: a surviving tick process group gets its bounded chance to go first.
             await this.awaitTickSurvivorsGone(flight);
             try {
@@ -3668,15 +3681,23 @@ export class RunRunner {
                 executor,
                 {
                   boundary: "shutdown",
-                  deadlineMs: Math.min(this.codexBoundaryDeadlineMs, this.shutdownPublishTimeoutMs),
+                  deadlineMs: executor.safety
+                    ? Math.max(0, flight.active!.gracefulShutdownCheckpoint!.deadlineAt - Date.now())
+                    : Math.min(this.codexBoundaryDeadlineMs, this.shutdownPublishTimeoutMs),
+                  ...(executor.safety ? { gracefulShutdownCheckpoint: flight.active!.gracefulShutdownCheckpoint } : {}),
                 },
                 async (permit) => {
                   permitSignal = permit?.signal;
+                  const check = () => permit?.signal.throwIfAborted();
+                  check();
                   await this.git.commitWipMarker(worktreePath).catch(() => false);
                   // issue #1783 (auditor M1): re-prove after the marker's runner-clone git, before
                   // the credentialed overlay + publish (blocked → RunResidueBlockedError below).
+                  check();
                   await this.quiesceOrBlockSink(flight, executor, "shutdown", { processOnly: true });
+                  check();
                   const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog);
+                  check();
                   if (fetched.kind === "refused") return;
                   // PRD #1416 M3 (C6): bridge a divergent tracking tip BEFORE the shutdown publish so
                   // a resume adopts B, not the published tip. Best-effort — a shutdown checkpoint must
@@ -3684,7 +3705,9 @@ export class RunRunner {
                   if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown")).kind === "preservation_refused") return;
                   // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
                   // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
+                  check();
                   const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
+                  check();
                   publishOutcome = await this.publishCheckpointOutcome(
                     flight,
                     barePath,
@@ -9559,8 +9582,7 @@ export class RunRunner {
     this.activeRuns.set(runId, active);
     if (this.shuttingDownGlobal) {
       active.shuttingDown = true;
-      cancel.abort();
-      steering.abortLifecycle();
+      active.gracefulShutdownCheckpoint = steering.workerShutdown(this.shutdownDeadlineAt!);
     }
     runLog.info("run claimed", {
       repo: claim.repo.url,
@@ -12120,12 +12142,12 @@ export class RunRunner {
    * fetch-backs complete inside the container's termination grace.
    */
   shutdown(): void {
+    this.shutdownDeadlineAt ??= Date.now() + Math.min(this.codexBoundaryDeadlineMs, this.shutdownPublishTimeoutMs);
     this.shuttingDownGlobal = true;
     if (!this.shutdownSignal.signal.aborted) this.shutdownSignal.abort();
     for (const a of this.activeRuns.values()) {
       a.shuttingDown = true;
-      a.cancel.abort();
-      a.steering.abortLifecycle();
+      a.gracefulShutdownCheckpoint = a.steering.workerShutdown(this.shutdownDeadlineAt);
     }
   }
 
@@ -12188,8 +12210,9 @@ export class RunRunner {
     // handled by the caller like a blocked Codex boundary: nothing published or settled, the park
     // stands) and keeps the clone.
     const quiesceSink = flight !== undefined;
-    const deadlineAt = Date.now() + Math.max(0, req.deadlineMs);
-    await executor.closeAndSettlePlanSummary?.(req.deadlineMs);
+    const deadlineAt = Math.min(Date.now() + Math.max(0, req.deadlineMs),
+      req.gracefulShutdownCheckpoint?.deadlineAt ?? Infinity);
+    await executor.closeAndSettlePlanSummary?.(Math.max(0, deadlineAt - Date.now()));
     req = { ...req, deadlineMs: Math.max(0, deadlineAt - Date.now()) };
     const safety = executor.safety;
     if (safety) {
@@ -12491,8 +12514,9 @@ export class RunRunner {
     req: BoundaryRequest,
     action: (permit?: BoundaryPermit) => Promise<void>,
   ): Promise<void> {
-    const deadlineAt = Date.now() + Math.max(0, req.deadlineMs);
-    await executor.closeAndSettlePlanSummary?.(req.deadlineMs);
+    const deadlineAt = Math.min(Date.now() + Math.max(0, req.deadlineMs),
+      req.gracefulShutdownCheckpoint?.deadlineAt ?? Infinity);
+    await executor.closeAndSettlePlanSummary?.(Math.max(0, deadlineAt - Date.now()));
     req = { ...req, deadlineMs: Math.max(0, deadlineAt - Date.now()) };
     const safety = executor.safety;
     if (safety) {
