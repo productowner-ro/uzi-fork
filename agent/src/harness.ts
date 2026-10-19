@@ -321,6 +321,8 @@ export interface HarnessAgent {
 }
 
 export interface RunTurnRequest {
+  /** Worker has materialized and bound the current claim evidence reader. */
+  ciEvidencePrepared?: boolean;
   /** Worker-derived eligibility for owner-decision requests, never a model declaration. */
   ownerDecisionRequested?: boolean;
   /** Worker-derived park admission; never supplied by the model. */

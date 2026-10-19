@@ -57,6 +57,7 @@ import { checkCheckpointStop, cleanCheckpointAdmission, CheckpointSoftDeadlineEr
 import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "../park-run.js";
 import { MaintenanceBudget } from "../maintenance-budget.js";
 import { chunkedTimeout } from "../chunked-timeout.js";
+import { CI_EVIDENCE_READ, readCIEvidence, ciEvidencePrompt } from "../ci-evidence-tools.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
@@ -1433,6 +1434,7 @@ function codeCrossCheckAccess(ctx: RunContext): CodeCrossCheckToolAccess | undef
 }
 
 export interface CodexToolHandlerDeps {
+  readonly ciEvidence?: import("../ci-evidence.js").PreparedCIEvidence;
   readonly claimGeneration?: number;
   readonly codeCrossCheck?: CodeCrossCheckToolAccess;
   readonly client: WorkerClient;
@@ -1469,6 +1471,12 @@ export interface CodexToolHandlerDeps {
 export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<string, ToolHandler> {
   const { client, runId, log, emit, skills } = deps;
   const map = new Map<string, ToolHandler>();
+  if (deps.ciEvidence) map.set(CI_EVIDENCE_READ, async args => {
+    const reply = await readCIEvidence(deps.ciEvidence!, args);
+    if (reply.isError) throw new Error("CI evidence read denied or unavailable");
+    // The reply adapters stringify objects; preserve the already bounded text.
+    return reply.content[0]!.text;
+  });
   if (deps.codeCrossCheck) map.set(CODE_DISPOSITIONS_TOOL, async args => {
     await reportCodeDispositions(deps.codeCrossCheck!, args);
     return { content: [{ type: "text", text: "Code cross-check dispositions recorded." }] };
@@ -2653,6 +2661,7 @@ export class CodexExecutor implements Executor {
         await fs.mkdir(this.provisionHomeDir, { recursive: true });
         await prepareCodexRunHome(this.homeRoot);
       }
+      ctx.ciEvidence = await ctx.prepareCIEvidence?.();
       // Provision the run's tool packages ONCE (PRD #18; SHARED across every epoch — the forge/
       // memory budget counters a per-epoch rebuild would reset). A tier-1 failure throws
       // REASON_PROVISION_FAILED, which this try's finally then cleans up after. Injected via
@@ -2719,6 +2728,7 @@ export class CodexExecutor implements Executor {
         log: this.log,
         emit: (msg) => ctx.emit(msg),
         skills: ctx.skills ?? [],
+        ciEvidence: ctx.ciEvidence,
         codeCrossCheck: codeCrossCheckAccess(ctx),
       });
 
@@ -4883,7 +4893,8 @@ export class CodexExecutor implements Executor {
     // Lead wiring must carry this worker-owned access into root-thread registration and the broker.
     // Presence is consent: runner only supplies the gate/hooks for strictly opted-in publishing runs.
     const request: RunTurnRequest = {
-      prompt,
+      ciEvidencePrepared: !!ctx.ciEvidence,
+      prompt: prompt + ciEvidencePrompt(ctx.ciEvidence),
       systemPrompt,
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
