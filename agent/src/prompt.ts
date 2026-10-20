@@ -495,6 +495,29 @@ export const CLAUDE_LONG_COMMAND_APPEND = [
 ].join("\n");
 
 /**
+ * Issue #2471: the shell-tool guidance for a guard-bound Claude flight, where `Bash` is
+ * routed to the supervised in-process command tool. It replaces
+ * {@link CLAUDE_LONG_COMMAND_APPEND} (grants.ts shapeGuardedGrants swaps it in every
+ * subagent definition) and that buildLeadSystemPrompt uses for a guard-bound lead.
+ */
+export const CLAUDE_GUARDED_COMMAND_APPEND = [
+  "On this run the Bash tool runs each command under a supervisor with a stated deadline.",
+  "Commands run in the foreground only: `run_in_background` is refused, and there is no",
+  "long-running mode or automatic extension. The default deadline is 2 minutes (120000 ms) and",
+  "the maximum is 60 minutes (3600000 ms). At the deadline the command and every descendant are",
+  "stopped and drained. Pass an explicit `timeout` for a long required check such as a full test",
+  "suite or a gate. A required check that cannot finish within 60 minutes must be reported as a",
+  "blocker; never skip it, weaken it, or claim it passed.",
+  "Every call starts at the repository root, so use `cd dir && command` to work elsewhere.",
+  "Inline output is capped at 30000 characters with a preview; the full output goes to a spill",
+  "file capped at 64 MiB, and output beyond that is truncated, so the spill is bounded and not a",
+  "promise of full output. At most 8 commands run at once and further calls are refused: wait for",
+  "one to finish. The Monitor tool is unavailable. If required work needs a role that is",
+  "unavailable on this run, do not substitute another role: a subagent reports it to the lead, and",
+  "the lead raises it with the owner via ask_user.",
+].join("\n");
+
+/**
  * Issue #1660: the worker-owned safety block appended LAST to every subagent prompt
  * (toDefinition in agents.ts, renderSubagentPrompt in codex/render.ts), on both the
  * template and the repo roster, so no role body can omit it. A validator subagent that
@@ -602,6 +625,10 @@ export interface LeadSystemPromptOptions {
   /** The harness running this lead. Explicit "claude" and "codex" select their
    *  command-lifetime guidance; absent appends neither recipe. */
   harness?: "claude" | "codex";
+  /** Issue #2471: the lead runs on a memory-guard-bound Claude flight, where Bash is the
+   *  supervised foreground command tool. Replaces the native long-command recipe, and lists the
+   *  roles withheld from this run. Ignored for any other harness. */
+  guardedCommand?: { unavailable: readonly { name: string; reason: string }[] };
 }
 
 // isMrReworkKind reports whether the run kind is the PRD #700 mr_rework kind (the
@@ -645,7 +672,15 @@ export function buildLeadSystemPrompt(
   // untrusted-repo fence (repoInstructions is pushed last).
   parts.push(LEAD_GATE_SEQUENCING_APPEND);
   parts.push(LEAD_FAST_CHECK_APPEND);
-  if (opts.harness === "claude") parts.push(CLAUDE_LONG_COMMAND_APPEND);
+  if (opts.harness === "claude") {
+    parts.push(opts.guardedCommand ? CLAUDE_GUARDED_COMMAND_APPEND : CLAUDE_LONG_COMMAND_APPEND);
+    if (opts.guardedCommand && opts.guardedCommand.unavailable.length > 0) {
+      parts.push([
+        "Subagent roles withheld from this run (do not dispatch them):",
+        ...opts.guardedCommand.unavailable.map((role) => `- ${role.name}: unavailable on this run: ${role.reason}`),
+      ].join("\n"));
+    }
+  }
   if (opts.harness === "codex") parts.push(CODEX_LONG_COMMAND_APPEND, CODEX_LEAD_DISPATCH_APPEND);
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
   // PRD #700 M4: the mr_rework run-lifecycle note. Gated on the kind so an issue/
