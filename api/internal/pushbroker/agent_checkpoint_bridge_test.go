@@ -28,6 +28,7 @@ type bridgePublish struct {
 	tip     string
 	skipped string
 	err     string
+	result  pushbroker.Result
 }
 
 // errBridgeSuperseded stands in for the api's slot refusal (workersvc "superseded"), a 200 skip the
@@ -176,7 +177,7 @@ func runBridgeFixture(t *testing.T, root, node string, cfg map[string]any, summa
 }
 
 // TestAgentCheckpointChainBridge is the issue #2733 binding bridge. It runs the REAL agent
-// (agent/test/fixtures/checkpoint-chain-bridge.ts: a real RunRunner + GitCache driving a GitHub
+// (agent/test/fixtures/checkpoint-selective-chain-bridge.ts: a real RunRunner + GitCache driving a GitHub
 // forge claim through a workflow-overlay checkpoint O and then a raw tick or iteration checkpoint
 // N) against the REAL pushbroker.Publish, over the real HTTP route and WorkerClient.publishCheckpoint.
 // The broker keeps its depth-1 fetch and pack boundaries; no commit shape is built on the Go side,
@@ -186,8 +187,9 @@ func runBridgeFixture(t *testing.T, root, node string, cfg map[string]any, summa
 // acknowledgement lost after it landed.
 //
 // The stale-base family (issue #3242) runs the same real agent through a turn whose tip never moves
-// while origin's default branch advances, then publishes. Its broker fetches over real smart HTTP
-// (git http-backend), so the depth-1 base fetch is the one every forge serves.
+// while origin's default branch advances, then publishes via checkpoint-chain-bridge.ts.
+// Its broker fetches over real smart HTTP (git http-backend), so the depth-1 base fetch is the one
+// every forge serves.
 //
 // Gated by UZI_CHECKPOINT_CHAIN_BRIDGE=1 (task test:checkpoint-chain-bridge): it needs Node and the
 // installed agent dependencies, so the default `go test ./...` skips it. Once the gate is set a
@@ -412,14 +414,104 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 	f.pushMain()
 	branch := fmt.Sprintf("agent/issue-%d", iid)
 	ref := "refs/uzi-checkpoints/" + branch
+	// The origin branch pins the old floor; default gains then deletes a bounded historical blob.
+	run(t, "", "git", "-C", f.work, "push", "origin", "HEAD:refs/heads/"+branch)
+	f.commit("historical.txt", "historical default content\n", "historical default blob")
+	historicalBlob := strings.TrimSpace(run(t, "", "git", "-C", f.work, "rev-parse", "HEAD:historical.txt"))
+	run(t, "", "git", "-C", f.work, "rm", "historical.txt")
+	run(t, "", "git", "-C", f.work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "remove historical default blob")
+	f.pushMain()
 
-	srv := newBridgeServer(t, ref, lostAck, func(ctx context.Context, tip string, pack []byte) error {
-		_, err := pushbroker.Publish(ctx, pushbroker.Options{
+	ctx, cancel := context.WithTimeout(context.Background(), 110*time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	var seen []bridgePublish
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/api/worker/runs/") || !strings.HasSuffix(r.URL.Path, "/publish") {
+			http.NotFound(w, r)
+			return
+		}
+		tip := r.Header.Get("X-Uzi-Checkpoint-Tip")
+		pack, err := checkpointBridgePack(r.Body)
+		if err != nil {
+			cancel() // Join the child through cmd.Run before reporting the bounded-read failure.
+			http.Error(w, "read pack", http.StatusBadRequest)
+			return
+		}
+		// Match production's typed refusal tokens; service ownership/slot retry stays outside this bridge.
+		result, err := pushbroker.Publish(r.Context(), pushbroker.Options{
 			CloneURL: f.cloneURL(), Branch: branch, DefaultBranch: "main", DeclaredTip: tip, Pack: pack,
+			CIConfigGuard: true, CIConfigPaths: []string{".github/workflows/**"},
 		})
-		return err
-	})
+		rec := bridgePublish{tip: tip, result: result}
+		resp := map[string]any{"published": true, "ref": ref}
+		switch {
+		case err == nil:
+		case checkpointBridgeRefusal(err) != "":
+			rec.skipped = checkpointBridgeRefusal(err)
+		default:
+			rec.err = err.Error()
+			http.Error(w, "publish failed", http.StatusInternalServerError)
+			mu.Lock()
+			seen = append(seen, rec)
+			mu.Unlock()
+			return
+		}
+		if rec.skipped != "" {
+			resp = map[string]any{"published": false, "ref": ref, "skipped": rec.skipped}
+		}
+		mu.Lock()
+		seen = append(seen, rec)
+		first := len(seen) == 1
+		mu.Unlock()
+		if lostAck && first {
+			// The overlay landed in origin; the agent never sees the acknowledgement.
+			http.Error(w, "ack lost", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
 
+	scratch, err := os.MkdirTemp(filepath.Join(root, ".uzi/scratch"), "chain-bridge-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("chain evidence=%s", scratch)
+	cfg, err := json.Marshal(map[string]any{
+		"url": srv.URL, "token": "tkn-bridge-123456", "origin": f.bare, "iid": iid,
+		"boundary": boundary, "scratch": scratch, "defaultBranch": "main", "historicalBlob": historicalBlob,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(ctx, node, "--import", "tsx", "test/fixtures/checkpoint-selective-chain-bridge.ts")
+	cmd.Dir = filepath.Join(root, "agent")
+	cmd.WaitDelay = 10 * time.Second
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "NODE_TEST_CONTEXT=") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "UZI_CHAIN_BRIDGE_FIXTURE="+string(cfg))
+	stdout := &checkpointBridgeOutput{cancel: cancel}
+	stderr := &checkpointBridgeOutput{cancel: cancel}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	runErr := cmd.Run()
+	if stdout.overflow || stderr.overflow {
+		t.Fatal("fixture output exceeded one MiB; child cancelled and joined")
+	}
+
+	mu.Lock()
+	publishes := append([]bridgePublish(nil), seen...)
+	mu.Unlock()
+	describe := func() string {
+		return fmt.Sprintf("publishes=%+v\nstdout:\n%s\nstderr:\n%s", publishes, stdout.String(), stderr.String())
+	}
+	if runErr != nil {
+		t.Fatalf("agent fixture failed: %v\n%s", runErr, describe())
+	}
 	var summary struct {
 		Overlay     string   `json:"overlay"`
 		OverlayRef  string   `json:"overlayRef"`
@@ -431,16 +523,16 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 			HTTPStatus int  `json:"httpStatus"`
 		} `json:"results"`
 	}
-	out, runErr := runBridgeFixture(t, root, node, map[string]any{
-		"url": srv.srv.URL, "token": "tkn-bridge-123456", "origin": f.bare, "iid": iid,
-		"boundary": boundary, "scratch": t.TempDir(),
-	}, &summary)
-	publishes := srv.publishes()
-	describe := func() string { return fmt.Sprintf("publishes=%+v\n%s", publishes, out) }
-	if runErr != nil {
-		t.Fatalf("agent fixture failed: %v\n%s", runErr, describe())
+	found := false
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		if rest, ok := strings.CutPrefix(line, "BRIDGE_SUMMARY "); ok {
+			if err := json.Unmarshal([]byte(rest), &summary); err != nil {
+				t.Fatalf("bad summary %q: %v", rest, err)
+			}
+			found = true
+		}
 	}
-	if summary.Overlay == "" || summary.RawTip == "" {
+	if !found || summary.Overlay == "" || summary.RawTip == "" {
 		t.Fatalf("fixture summary incomplete: %+v\n%s", summary, describe())
 	}
 
@@ -451,6 +543,13 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 	subject := strings.TrimSpace(run(t, "", "git", "-C", f.bare, "log", "-1", "--format=%s", summary.Overlay))
 	if !strings.HasPrefix(subject, "ckpt(overlay):") {
 		t.Fatalf("overlay subject = %q, want a ckpt(overlay): commit", subject)
+	}
+	// The fixture advances default with the same run file before changing workflows:
+	// the real overlay wrapper must therefore have exactly default's complete tree.
+	overlayTree := strings.TrimSpace(run(t, "", "git", "-C", f.bare, "rev-parse", summary.Overlay+"^{tree}"))
+	defaultTree := strings.TrimSpace(run(t, "", "git", "-C", f.bare, "rev-parse", "refs/heads/main^{tree}"))
+	if overlayTree != defaultTree {
+		t.Fatalf("overlay tree %s differs from default tree %s", overlayTree, defaultTree)
 	}
 
 	// A lost acknowledgement is an HTTP 500 the agent retries once with the SAME overlay tip, so
@@ -487,7 +586,15 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 		}
 	}
 
-	for _, p := range publishes {
+	for i, p := range publishes {
+		want := pushbroker.PublishAdvanced
+		already := lostAck && i == 1
+		if already {
+			want = pushbroker.PublishUnclassified
+		}
+		if p.result.Disposition != want || p.result.AlreadyCurrent != already {
+			t.Fatalf("publish %d result=%+v want disposition=%v alreadyCurrent=%t", i, p.result, want, already)
+		}
 		if p.skipped != "" || p.err != "" {
 			t.Fatalf("a publish was not accepted (tip %s skipped=%q err=%q)\n%s", p.tip, p.skipped, p.err, describe())
 		}
