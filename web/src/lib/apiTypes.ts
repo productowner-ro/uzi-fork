@@ -843,7 +843,9 @@ export interface LatestRun {
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
-  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused".
+  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused", and
+  // the issue #3181 token-switch holds ('credential_switch_settling' / 'credential_switch_unsettled')
+  // so they read "settling: token switch" / "held: token switch".
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
@@ -3508,8 +3510,16 @@ export interface Run {
    *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
    *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
    *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
-   *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel), and
-   *  'base_attestation_missing' for a --require-base run that adopted retained work no
+   *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
+   *  Issue #3181: 'credential_switch_settling' when an owner token switch on a retained-recovery
+   *  run could not prove the run's processes stopped and the worker is still finishing its own
+   *  operations for the run (the server refuses Resume and another token switch with a 409 while
+   *  that worker is live and finishing, and lifts the fence when it is lost, goes stale or
+   *  re-registers, with this value unchanged; Cancel always works), and
+   *  'credential_switch_unsettled' once the worker acknowledged it finished. That acknowledgement
+   *  does not prove the processes stopped: held for the owner, work and custody kept on that
+   *  worker; Resume requeues on the newly chosen token.
+   *  Issue #3194: 'base_attestation_missing' for a --require-base run that adopted retained work no
    *  checkpoint attests to the planned base (issue #3194; the agent was not started, nothing
    *  automatic leaves the hold, Resume and extend are refused; recover or start a successor).
    *  Render an unrecognised value honestly.

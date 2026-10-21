@@ -1072,6 +1072,13 @@ export class Worker {
         void this.sweepPendingFinalizes(signal).catch((err) => {
           this.log.warn("outbox finalize sweep failed", { error: errMessage(err) });
         });
+        // issue #3181: re-deliver a credential-switch hold-settled acknowledgement that failed at the
+        // end of its flight. Fire-and-forget and single-flight inside the runner.
+        if (typeof this.runner.retryPendingHoldSettled === "function") {
+          void this.runner.retryPendingHoldSettled().catch((err) => {
+            this.log.warn("credential switch hold acknowledgement retry failed", { error: errMessage(err) });
+          });
+        }
         // Issue #1995: re-drive a journaled recovery bundle whose upload failed while this worker
         // stayed alive (it was retried only at the next boot before). Fire-and-forget like the
         // drain above: a pass uploads bundles and must never delay the next heartbeat. The

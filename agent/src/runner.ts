@@ -18,9 +18,9 @@ import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON } from "./protocol.js";
-import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE } from "./client.js";
+import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
-import { MaintenanceBudget } from "./maintenance-budget.js";
+import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import type { CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
@@ -61,7 +61,7 @@ import type { PlanCrossCheckStateRequest, PlanCrossCheckDiffRefusal } from "./cl
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, GracefulShutdownCheckpoint, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
 import { cloneKeyOf } from "./attempt-path.js";
-import type { RunProcessReap } from "./run-procs.js";
+import type { LeftReason, RunProcessReap } from "./run-procs.js";
 import {
   LiveAttemptRegistry,
   describeProcesses,
@@ -1130,8 +1130,10 @@ function classifyRetainedDiscoveryError(error: unknown, deadlineElapsed: boolean
 }
 
 class CredentialSwitchRetainedStop extends Error {
-  constructor() {
-    super("credential switch unconfirmed; retaining work and stopping the flight");
+  /** issue #3181: `held` is a server-confirmed switch hold (the run is paused), not an unconfirmed stop. */
+  constructor(readonly held = false) {
+    super(held ? "credential switch held; retaining work and stopping the flight"
+      : "credential switch unconfirmed; retaining work and stopping the flight");
     this.name = "CredentialSwitchRetainedStop";
   }
 }
@@ -1197,6 +1199,9 @@ class RunningAckTerminalError extends Error {
  *  `worker_residue_blocked`. Defined in git.ts, where CloneResidueBlockedError is thrown. */
 export { REASON_WORKER_RESIDUE_BLOCKED };
 
+/** issue #3181: heartbeat ticks a hold-settled acknowledgement is retried before it is dropped. */
+const PENDING_HOLD_SETTLED_MAX_ATTEMPTS = 720;
+
 /** Most pids a HOME-attributed reap verdict names in its detail (the detail reaches failure_reason). */
 const ATTRIBUTED_REAP_DETAIL_PIDS = 5;
 
@@ -1205,12 +1210,23 @@ const ATTRIBUTED_REAP_DETAIL_PIDS = 5;
 function attributedReapCause(reap: RunProcessReap | { failure: string }): { state: "survivors" | "unverified"; detail: string } | undefined {
   if ("failure" in reap) return { state: "unverified", detail: `run HOME-attributed reap failed: ${reap.failure}` };
   if (reap.left.length > 0) {
-    const shown = reap.left.slice(0, ATTRIBUTED_REAP_DETAIL_PIDS).join(",");
+    const reasons = reap.leftReasons;
+    const shown = reap.left
+      .slice(0, ATTRIBUTED_REAP_DETAIL_PIDS)
+      .map((pid) => (reasons?.[pid] ? `${pid}(${reasons[pid]})` : String(pid)))
+      .join(",");
     const more = reap.left.length > ATTRIBUTED_REAP_DETAIL_PIDS ? `,+${reap.left.length - ATTRIBUTED_REAP_DETAIL_PIDS} more` : "";
     return { state: "survivors", detail: `run HOME-attributed reap left ${reap.left.length} process(es): pids ${shown}${more}` };
   }
   if (!reap.complete) return { state: "unverified", detail: "run HOME-attributed reap incomplete" };
   return undefined;
+}
+
+/** issue #3181: the fixed owner-feed phrase for a quiescence proof that named survivors: only the
+ *  m1 left-reason classes (never a pid, path or free text), or `survivors` when none is named. */
+function survivorClasses(classes: readonly LeftReason[] | undefined): string {
+  const named = (["worker_child", "unreadable", "restarted", "kill_failed"] as const).filter((c) => classes?.includes(c));
+  return named.length > 0 ? `survivors: ${named.join(", ")}` : "survivors";
 }
 
 /**
@@ -1242,6 +1258,13 @@ async function reapThenMayDropCaches(executor: Executor, runLog: Logger): Promis
  * processes and gains the cause in its detail. The reap's killed pids join `killed` either way.
  */
 function foldAttributedReap(outcome: QuiesceRunOutcome, reap: RunProcessReap | { failure: string }): QuiesceRunOutcome {
+  const folded = foldAttributedReapVerdict(outcome, reap);
+  if ("failure" in reap || reap.left.length === 0) return folded;
+  const classes = [...new Set(reap.left.map((pid) => reap.leftReasons?.[pid]).filter((c): c is LeftReason => c !== undefined))];
+  return classes.length > 0 ? { ...folded, leftClasses: classes } : folded;
+}
+
+function foldAttributedReapVerdict(outcome: QuiesceRunOutcome, reap: RunProcessReap | { failure: string }): QuiesceRunOutcome {
   const killed = "failure" in reap ? [] : reap.killed;
   const cause = attributedReapCause(reap);
   const prior = outcome.process;
@@ -1970,6 +1993,12 @@ interface RunFlight {
   effectiveAttemptPaths?: boolean;
   retainedEpisode?: boolean;
   retainedEpisodeCustody?: boolean;
+  /** issue #3181: a retained credential switch could not prove this flight's run processes stopped.
+   *  `held`: the server confirmed the switch hold, so the finally joins this executor's owned
+   *  operations and then acknowledges the hold settled. `hold_pending`: a report may have applied
+   *  without local confirmation, so the same post-join acknowledgement is owed (a server no-op if
+   *  no hold applied). `unproven`: no hold report is outstanding; join without acknowledging. */
+  retainedSwitchSettlement?: "held" | "hold_pending" | "unproven";
   completedRetainedSuccessor?: RecoveryJournalEntry;
   retainedLocalCustody?: boolean;
   /** Retries spent by discoverRetained on confirmed operational errors; in-memory, per claim. */
@@ -2439,6 +2468,13 @@ export interface RunnerOptions {
    *  executor is Codex-selected (`executor.safety`); a Claude/stub run ignores it. The finalize
    *  boundary uses its own deadline (`codexFinalizeBoundaryDeadlineMs`, issue #1900). */
   codexBoundaryDeadlineMs?: number;
+  /** issue #3181: the allowance (ms) a retained successor's credential switch spends proving its run
+   *  processes stopped before it reports. Defaults to `codexBoundaryDeadlineMs`; a test shortens it. */
+  retainedSwitchSettlementMs?: number;
+  /** issue #3181: the evidence-verification allowance of a retained credential switch, started after
+   *  settlement returns. Defaults to `codexBoundaryDeadlineMs`; a test shortens it without also
+   *  bounding the unrelated recovery discovery that `codexBoundaryDeadlineMs` governs. */
+  retainedSwitchVerificationMs?: number;
   /** Issue #1900 (test-only): overrides CODEX_FINALIZE_BOUNDARY_DEADLINE_MS, the finite deadline
    *  of the Codex finalize boundary. A 0/negative value falls back to the default. */
   codexFinalizeBoundaryDeadlineMs?: number;
@@ -2634,6 +2670,10 @@ export class RunRunner {
   private readonly completionHoldReconcileTimeoutMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
+  /** issue #3181: see RunnerOptions.retainedSwitchSettlementMs. */
+  private readonly retainedSwitchSettlementMs: number;
+  /** issue #3181: see RunnerOptions.retainedSwitchVerificationMs. */
+  private readonly retainedSwitchVerificationMs: number;
   private readonly codexFinalizeBoundaryDeadlineMs: number;
   /** PRD #267: injectable clock (defaults to Date.now), so the time-gate is testable.
    *  Also feeds the PRD #88 answer-deadline math (askUser), so that budget is testable
@@ -2874,6 +2914,14 @@ export class RunRunner {
       opts.codexBoundaryDeadlineMs && opts.codexBoundaryDeadlineMs > 0
         ? opts.codexBoundaryDeadlineMs
         : 30_000;
+    this.retainedSwitchSettlementMs =
+      opts.retainedSwitchSettlementMs && opts.retainedSwitchSettlementMs > 0
+        ? opts.retainedSwitchSettlementMs
+        : this.codexBoundaryDeadlineMs;
+    this.retainedSwitchVerificationMs =
+      opts.retainedSwitchVerificationMs && opts.retainedSwitchVerificationMs > 0
+        ? opts.retainedSwitchVerificationMs
+        : this.codexBoundaryDeadlineMs;
     this.codexFinalizeBoundaryDeadlineMs =
       opts.codexFinalizeBoundaryDeadlineMs && opts.codexFinalizeBoundaryDeadlineMs > 0
         ? opts.codexFinalizeBoundaryDeadlineMs
@@ -4507,7 +4555,13 @@ export class RunRunner {
         // (enterCredentialSwitch left them SET) so the clone + HOME survive: report NO terminal state
         // (a `failed` would fight a claim that may already have moved on) and leave the run
         // NON-TERMINAL so the sweeper requeues it and a reclaim resumes the retained work.
-        runLog.info("credential switch unconfirmed; retaining work and leaving the run non-terminal for requeue", {
+        if (err.held) {
+          // issue #3181: the retained successor could not prove its run processes stopped, and the
+          // server confirmed the hold: the run is paused with its work and custody kept here.
+          runLog.info("credential switch held; run processes unproven, work and custody kept for an owner Resume or Cancel", {
+            run_id: flight.runId,
+          });
+        } else runLog.info("credential switch unconfirmed; retaining work and leaving the run non-terminal for requeue", {
           run_id: flight.runId,
         });
         await batcher.close().catch(() => undefined);
@@ -4523,7 +4577,11 @@ export class RunRunner {
         // and (on release) reported credential_switch, so NEITHER branch reports a terminal state.
         if (flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
             flight.completedRetainedSuccessor) {
-          await this.enterRetainedCredentialSwitch(claim, flight, runLog);
+          if (await this.enterRetainedCredentialSwitch(claim, flight, runLog) === "held") {
+            runLog.info("credential switch held; run processes unproven, work and custody kept for an owner Resume or Cancel", {
+              run_id: flight.runId,
+            });
+          }
           await batcher.close().catch(() => undefined);
           return;
         }
@@ -4759,6 +4817,11 @@ export class RunRunner {
       // must not stay abortable — shutdown() iterating a stale entry would abort a
       // controller nobody is watching, and the map would leak an entry per run.
       this.activeRuns.delete(runId);
+      // issue #3181: a flight whose retained credential switch could not prove its run processes
+      // stopped joins the operations its executor still owns BEFORE the snapshot entry and the
+      // execution tail release (the successor claim must not start next to them), and a confirmed
+      // or possibly applied hold is then acknowledged settled. Ordinary flights never take this step.
+      if (flight.retainedSwitchSettlement) await this.joinRetainedSwitchOperations(flight, runLog);
       // PRD #1390 M2a: drop the active-run snapshot entry. Reaching this finally means the
       // run reached a terminal report OR parked-and-returned for a requeue — either way it is
       // no longer executing on this worker, so it must stop being listed in the snapshot. A
@@ -9712,6 +9775,9 @@ export class RunRunner {
           if (
             body.status !== "credential_switch" &&
             body.status !== "credential_switch_failed" &&
+            // issue #3181: the hold report is a switch outcome too; a switch tripped by a refused
+            // approve would otherwise abort its own hold with the switch signal.
+            body.status !== "credential_switch_held" &&
             steering.approveRefusedBySwitchPending()
           )
             throw new CredentialSwitchSignal();
@@ -12175,6 +12241,7 @@ export class RunRunner {
       attemptCredentialSwitch: async () => {
         const outcome = await this.runGatedSink(flight, async () => {
           const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
+          if (outcome === "retained_held") throw new CredentialSwitchRetainedStop(true);
           if (outcome === "retained_stop") {
             // The switch could not be confirmed (BLOCKING-2/3 rework). enterCredentialSwitch RETAINED
             // all work (the preserve flags stay set); STOP the flight NON-TERMINAL by throwing to
@@ -18457,12 +18524,11 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     runLog: Logger,
-  ): Promise<"released" | "gave_up" | "retained_stop"> {
+  ): Promise<"released" | "gave_up" | "retained_stop" | "retained_held"> {
     // In-place callers must also stop when this flight still carries retained authority.
     if (flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
         flight.completedRetainedSuccessor) {
-      await this.enterRetainedCredentialSwitch(claim, flight, runLog);
-      return "retained_stop";
+      return (await this.enterRetainedCredentialSwitch(claim, flight, runLog)) === "held" ? "retained_held" : "retained_stop";
     }
     // The generation this switch targets (equals flight.claimGeneration by construction — the
     // steering channel trips only on a generation match). Logged for provenance; the release
@@ -19252,16 +19318,22 @@ export class RunRunner {
   }
 
   /** One bounded, credential-free verification pass over EXISTING evidence. Every outcome
-   * stops this flight; neither an ACK nor a verification failure grants cleanup authority. */
-  private async enterRetainedCredentialSwitch(claim: ClaimResponse, flight: RunFlight, runLog: Logger): Promise<void> {
+   * stops this flight; neither an ACK nor a verification failure grants cleanup authority.
+   *
+   * issue #3181: the pass is preceded by a settlement phase that proves this flight's own run
+   * processes stopped. Only a settled flight verifies and reports `credential_switch`; one that
+   * cannot be proven settled reports a hold instead (`credential_switch_held`) and keeps its work and
+   * custody, so a successor claim never starts next to a survivor. Returns what the server
+   * confirmed: `released`, `held`, or `stopped` (nothing confirmed; the run stays non-terminal). */
+  private async enterRetainedCredentialSwitch(claim: ClaimResponse, flight: RunFlight, runLog: Logger): Promise<"released" | "stopped" | "held"> {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.retainedLocalCustody = true;
     flight.retainedEpisodeCustody = true;
     flight.keepGuardedInventoryOpen = true;
     const generation = flight.steering.pendingCredentialSwitch();
-    const deadline = Date.now() + this.codexBoundaryDeadlineMs;
     const lifecycle = AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
+    let disposition: "released" | "stopped" | "held" = "stopped";
     const identity = () => {
       this.retainedTerminalGuard(flight);
       for (const signal of this.retainedLifecycleSignals(flight)) {
@@ -19273,6 +19345,10 @@ export class RunRunner {
     };
     try {
       identity();
+      const settlement = await this.settleRetainedSwitch(flight, identity);
+      // The verification allowance starts only after settlement returns, so a long settlement
+      // cannot starve the evidence checks (or the reverse).
+      const deadline = Date.now() + this.retainedSwitchVerificationMs;
       await this.git.withRecoveryOperation(lifecycle, deadline, async signal => {
         const guard = () => {
           identity();
@@ -19289,6 +19365,10 @@ export class RunRunner {
         };
         // A GET failure or lost ownership cannot authorize even a stamp-clear report.
         await check();
+        if (!settlement.settled) {
+          disposition = await this.holdRetainedSwitch(flight, runLog, signal, guard, settlement.detail, settlement.survivors);
+          return;
+        }
         let verified = false;
         let finalProof: (() => Promise<void>) | undefined;
         try {
@@ -19373,6 +19453,7 @@ export class RunRunner {
         const ack = await flight.reportState({ status }, signal);
         guard();
         const confirmed = verified ? ack.credentialSwitchReleased === true : ack.applied === true;
+        if (verified && confirmed) disposition = "released";
         runLog.info("retained credential switch stopped; all local work and custody retained", {
           run_id: flight.runId, generation, status, confirmed,
         });
@@ -19382,6 +19463,216 @@ export class RunRunner {
         run_id: flight.runId, generation, error: errMessage(error),
       });
     }
+    return disposition;
+  }
+
+  /**
+   * issue #3181: wait for the operations this flight's executor still owns (no kill, no abort, no
+   * new work), then acknowledge a confirmed or possibly applied hold settled. A worker shutdown
+   * stops the wait and the acknowledgement: the process exit ends those operations and the server
+   * lifts the hold on the stale heartbeat. Never throws.
+   */
+  private async joinRetainedSwitchOperations(flight: RunFlight, runLog: Logger): Promise<void> {
+    try {
+      const joining = flight.executor.joinOwnedOperations?.();
+      if (joining) {
+        const shutdown = this.shutdownSignal.signal;
+        let onAbort: (() => void) | undefined;
+        const interrupted = await Promise.race([
+          joining.then(() => false, () => false),
+          new Promise<boolean>((resolve) => {
+            if (shutdown.aborted) resolve(true);
+            else { onAbort = () => resolve(true); shutdown.addEventListener("abort", onAbort, { once: true }); }
+          }),
+        ]);
+        if (onAbort) shutdown.removeEventListener("abort", onAbort);
+        if (interrupted) {
+          runLog.warn("retained credential switch join interrupted by shutdown; hold left for the server to lift", { run_id: flight.runId });
+          return;
+        }
+      }
+      if ((flight.retainedSwitchSettlement !== "held" && flight.retainedSwitchSettlement !== "hold_pending") ||
+          flight.claimGeneration === undefined) return;
+      const outcome = await this.sendHoldSettled(flight.runId, flight.claimGeneration);
+      if (outcome === "unknown") {
+        this.pendingHoldSettled.set(`${flight.runId}:${flight.claimGeneration}`, { runId: flight.runId, generation: flight.claimGeneration, attempts: 1 });
+        runLog.warn("credential switch hold settled acknowledgement undelivered; retrying on heartbeat", { run_id: flight.runId });
+      }
+    } catch (error) {
+      runLog.warn("retained credential switch join failed", { run_id: flight.runId, error: errMessage(error) });
+    }
+  }
+
+  /** issue #3181: one delivery of the hold-settled acknowledgement. `done` is an applied or
+   *  definitively refused report (nothing to retry); `unknown` is a transport or server failure. */
+  private async sendHoldSettled(runId: string, generation: number): Promise<"done" | "unknown"> {
+    try {
+      const ack = await this.client.reportState(runId, { status: "credential_switch_hold_settled", claim_generation: generation }, this.shutdownSignal.signal);
+      if (ack.credentialSwitchHoldSettled === true || ack.applied === false) return "done";
+      return "unknown";
+    } catch (error) {
+      if (error instanceof RequestError && error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429) return "done";
+      return "unknown";
+    }
+  }
+
+  /** issue #3181: acknowledgements that could not be delivered at the end of their flight, retried by
+   *  the worker's heartbeat until applied or refused, and dropped after a bounded number of ticks. */
+  private readonly pendingHoldSettled = new Map<string, { runId: string; generation: number; attempts: number }>();
+  private retryingHoldSettled = false;
+
+  /** Called by the worker's heartbeat loop on each successful tick. Single-flight; never throws. */
+  async retryPendingHoldSettled(): Promise<void> {
+    if (this.retryingHoldSettled || this.pendingHoldSettled.size === 0) return;
+    this.retryingHoldSettled = true;
+    try {
+      for (const [key, entry] of this.pendingHoldSettled) {
+        if (this.shutdownSignal.signal.aborted) return;
+        const outcome = await this.sendHoldSettled(entry.runId, entry.generation);
+        if (outcome === "done" || ++entry.attempts > PENDING_HOLD_SETTLED_MAX_ATTEMPTS) this.pendingHoldSettled.delete(key);
+      }
+    } finally { this.retryingHoldSettled = false; }
+  }
+
+  /**
+   * issue #3181: prove this flight's own run processes stopped, credential-free, under one
+   * MaintenanceBudget of `retainedSwitchSettlementMs`. Settled only when the executor's settle
+   * observed the run empty AND the own-mode quiescence proof is not blocked (its HOME-attributed
+   * reap included). Any other outcome, including the allowance running out, is unsettled: `detail`
+   * is the sanitized raw cause for the worker log only, `survivors` a fixed-vocabulary phrase that
+   * is safe for the owner feed (no pids, paths or error text). Lifecycle changes (`identity` throws)
+   * keep their precedence over a settlement verdict.
+   *
+   * An unsettled verdict marks the flight `unproven` BEFORE `identity` can throw, so executeClaim's
+   * finally joins the operations the executor still owns even when a cancel, fence or generation
+   * change cuts the hold report off: the successor claim never starts next to them.
+   *
+   * The default allowance (`codexBoundaryDeadlineMs`, 30s) is shorter than GUARDED_LANE_JOIN_MS
+   * (60s), so a guarded command that ignores its abort yields a hold rather than a settle
+   * (accepted: the owner resolves a hold, a premature settle would strand a survivor).
+   */
+  private async settleRetainedSwitch(
+    flight: RunFlight, identity: () => void,
+  ): Promise<{ settled: true } | { settled: false; detail: string; survivors: string }> {
+    const budget = new MaintenanceBudget(this.retainedSwitchSettlementMs);
+    // Set once settlement is proven, BEFORE the last lifecycle check: a lifecycle throw after that
+    // point propagates as the lifecycle change it is and never relabels a proven settlement unproven.
+    let proven = false;
+    const unsettled = (detail: string, survivors: string) => {
+      flight.retainedSwitchSettlement = "unproven";
+      return { settled: false as const, detail: sanitizeForLog(detail, 200), survivors };
+    };
+    try {
+      // Deliberate deviation: MaintenanceBudget.withoutAttempt is reserved for status transport and
+      // must never wrap FINAL or custody cleanup. Settlement is neither (it releases and drops no
+      // custody) and is bounded by its own allowance above. It runs outside any enclosing attempt
+      // scope because MaintenanceBudget.run would otherwise attach this allowance to that attempt
+      // and leave every later await of the flight under a spent budget.
+      return await MaintenanceBudget.withoutAttempt(() => MaintenanceBudget.run(budget, () => RetainedSwitchSettlement.run(async () => {
+        const settle = await this.settleForCredentialCapture(flight.executor, budget.remainingMs());
+        if (settle.kind !== "observed_empty") {
+          const verdict = unsettled(settle.errors.map((e) => e.message).join("; ") || "settle incomplete", "settle unconfirmed");
+          identity();
+          return verdict;
+        }
+        identity();
+        const proof = await this.quiesceRun(flight, flight.executor, {
+          mode: "own", site: "retained_credential_switch", propagateControl: true,
+        });
+        if (proof.blocked) {
+          const process = proof.outcome.process;
+          const detail = process?.detail ?? "run processes not quiescent";
+          const verdict = unsettled(detail, process?.state === "survivors" ? survivorClasses(proof.outcome.leftClasses) : "unverified");
+          identity();
+          return verdict;
+        }
+        proven = true;
+        identity();
+        return { settled: true as const };
+      })));
+    } catch (error) {
+      if (proven) throw error;
+      const verdict = unsettled(`settlement did not finish: ${errMessage(error)}`,
+        budget.remainingMs() <= 0 || budget.signal.aborted ? "deadline" : "unverified");
+      identity();
+      return verdict;
+    } finally { budget.dispose(); }
+  }
+
+  /**
+   * issue #3181: the retained switch could not be settled. Keep work and custody, tell the feed, and
+   * report `credential_switch_held` when the server supports it. Confirmed by a positive ACK or, when
+   * the report throws (one identical retry first), by an ownership read showing the run paused on a
+   * switch-settling hold at this generation. An unconfirmed or refused hold is a residual
+   * non-terminal stop. A possibly applied report still owes a post-join acknowledgement, even if
+   * guard's deadline or a transport failure prevents confirmation; only a definitive refusal clears
+   * that obligation. Neither the owner feed nor `parked` claims a hold without confirmation.
+   */
+  private async holdRetainedSwitch(
+    flight: RunFlight, runLog: Logger, signal: AbortSignal, guard: () => void, detail: string, survivors: string,
+  ): Promise<"held" | "stopped"> {
+    // The flight is already marked `unproven` by settleRetainedSwitch. The owner feed carries only
+    // the fixed `survivors` phrase; the sanitized raw `detail` stays in the worker log.
+    const generation = flight.claimGeneration;
+    // Best effort: the status line and its flush never decide the disposition.
+    const tell = async (text: string) => {
+      try {
+        flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });
+        await flight.batcher.close(signal);
+      } catch (error) {
+        runLog.warn("retained credential switch hold status line not delivered", { run_id: flight.runId, error: errMessage(error) });
+      }
+    };
+    const unconfirmed = async (reason: string): Promise<"stopped"> => {
+      runLog.warn("retained credential switch hold unconfirmed", { run_id: flight.runId, generation, reason, detail });
+      await tell(`credential switch: run processes could not be proven stopped (${survivors}); hold not confirmed, work and custody kept on this worker`);
+      return "stopped";
+    };
+    if (!this.client.hasFeature(CREDENTIAL_SWITCH_HOLD_FEATURE) || generation === undefined) {
+      return unconfirmed("hold unsupported by the api");
+    }
+    guard();
+    // Record the obligation BEFORE the report: it can apply server-side before its ACK is lost or
+    // guard's deadline expires. The existing join/heartbeat path settles it at this generation and
+    // registration, without claiming the run held or lifting the fence before owned operations join.
+    flight.retainedSwitchSettlement = "hold_pending";
+    let confirmed = false;
+    let refused = false;
+    for (let attempt = 0; attempt < 2 && !confirmed && !refused; attempt++) {
+      try {
+        const ack = await flight.reportState({ status: "credential_switch_held" }, signal);
+        refused = ack.applied === false;
+        if (refused) flight.retainedSwitchSettlement = "unproven";
+        guard();
+        if (ack.credentialSwitchHeld === true) confirmed = true;
+      } catch (error) {
+        guard();
+        runLog.warn("retained credential switch hold report failed", { run_id: flight.runId, attempt, error: errMessage(error) });
+      }
+    }
+    if (!confirmed && !refused) {
+      try {
+        const own = await withForgeRetry(() => this.getObservedRunOwnership(flight, signal), {
+          signal, log: runLog, schedule: [],
+        });
+        guard();
+        confirmed = own.status === "paused" && own.claim_generation === generation &&
+          (own.hold_reason === "credential_switch_settling" || own.hold_reason === "credential_switch_unsettled");
+      } catch (error) {
+        guard();
+        runLog.warn("retained credential switch hold ownership read failed", { run_id: flight.runId, error: errMessage(error) });
+      }
+    }
+    if (!confirmed) return unconfirmed(refused ? "hold refused" : "hold report unconfirmed");
+    flight.parked = true;
+    flight.retainedSwitchSettlement = "held";
+    runLog.info("retained credential switch held; run processes unproven, work and custody retained", {
+      run_id: flight.runId, generation, detail,
+    });
+    // Only now, with the server's confirmation in hand, does the owner feed say "held".
+    await tell(`credential switch held: run processes could not be proven stopped (${survivors}); ` +
+      "work and custody kept on this worker. Resume or Cancel");
+    return "held";
   }
 
   private retainedLifecycleSignal(flight: RunFlight): AbortSignal {
