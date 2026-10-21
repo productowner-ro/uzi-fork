@@ -63,9 +63,9 @@ go install github.com/go-task/task/v3/cmd/task@v3.54.0   # pinned, sumdb-verifie
 - Not everything is a target: a single-test invocation, `sqlc generate`, the compose stack and the e2e harness stay written out as commands in `.claude/rules/go.md` and `.claude/rules/stack.md`. The single-test forms, since a rule only loads once you read a file it covers:
 
 ```sh
-cd api && go test ./internal/forge -run TestName                                  # Go (controller: cd controller)
+cd api && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null go test ./internal/forge -run TestName   # Go (controller: cd controller)
 cd web && npx vitest run src/pages/Foo.test.tsx                                   # web
-cd agent && node --import tsx --test --test-timeout=120000 test/worker.test.ts    # agent: keep the timeout flag
+cd agent && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx --test --test-timeout=120000 test/worker.test.ts   # agent: keep the timeout flag
 ```
 
 ### Lint ratchet
