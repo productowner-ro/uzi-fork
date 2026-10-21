@@ -625,6 +625,7 @@ interface TurnResult {
    *  ScannedSignals.rejectedMilestones). Sent on the gate report in place of `milestones` so the
    *  server rejects it; never used as the worker's own breakdown. */
   rejectedMilestones?: Milestone[];
+  semanticSubmission?: import("./semantic-plan.js").SemanticSubmission;
   /** PRD #122 M2: the latest milestone progress the lead reported via report_progress
    *  during this turn (last-wins within the turn). The loop carries it into the NEXT
    *  iteration's `running` report. */
@@ -1738,6 +1739,7 @@ export class SdkExecutor implements Executor {
     const buildRunSignalServer = (codeCrossCheck?: NonNullable<Parameters<typeof buildSignalMcpServer>[0]>["codeCrossCheck"]): McpSdkServerConfigWithInstance =>
       buildSignalMcpServer({
         ownerDecisionRequested: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
+        semanticPlanning: ctx.semanticPlanning,
         prdDonePath: isIssueRun,
         // PRD #122 M1: milestones on submit_plan for issue runs only (Decision 13),
         // gated on the same isIssueRun discriminator as prd_done_path.
@@ -2375,6 +2377,7 @@ export class SdkExecutor implements Executor {
         // entries, so the server drops the candidate to NULL rather than reading "no milestones"
         // (or a narrowed list) as the completion contract.
         let gateMilestones: Milestone[] | undefined;
+        let semanticSubmission: import("./semantic-plan.js").SemanticSubmission | undefined;
         // Issue #1604 (D3): a resumed, unapproved claim with a persisted plan (resume_phase
         // "awaiting_approval", with or without its session, or "" with none) first reads the inputs
         // the owner sent before the claim was released, and acts on them BEFORE offering any plan:
@@ -2472,6 +2475,7 @@ export class SdkExecutor implements Executor {
           // approves the breakdown. It is REPLACED on each revision round (Decision 2).
           candidateMilestones = plan.milestones;
           gateMilestones = plan.rejectedMilestones ?? plan.milestones;
+          semanticSubmission = plan.semanticSubmission;
         }
 
         // --- Plan gate (+ revision loop, PRD #41) -----------------------------
@@ -2498,7 +2502,7 @@ export class SdkExecutor implements Executor {
         else {
           const onPlanPersisted = this.beginPlanSummary(ctx, prdInputP);
           const g0 = await this.runThroughSwitch(ctx, state, () =>
-            ctx.gatePlan!(approvedPlan, gateMilestones, onPlanPersisted),
+            ctx.gatePlan!(approvedPlan, gateMilestones, onPlanPersisted, undefined, semanticSubmission),
 
             ctx.continueExistingPlanGate, { reopenPlanSummary: true },
           );
@@ -2559,7 +2563,7 @@ export class SdkExecutor implements Executor {
               },
             });
             const gExhausted = await this.runThroughSwitch(ctx, state, () =>
-              ctx.gatePlan!(approvedPlan, gateMilestones, undefined, settles),
+              ctx.gatePlan!(approvedPlan, gateMilestones, undefined, settles, semanticSubmission),
               ctx.continueExistingPlanGate,
             );
             if ("released" in gExhausted) return { branch: ctx.branch, switchReleased: true };
@@ -2619,6 +2623,7 @@ export class SdkExecutor implements Executor {
           // Decision 2: the candidate is REPLACED across a revision round.
           candidateMilestones = turn.milestones;
           gateMilestones = turn.rejectedMilestones ?? turn.milestones;
+          semanticSubmission = turn.semanticSubmission;
           // PRD #362 M3c: a re-plan REGENERATES the plan summary (Decision 2), fired from
           // the gate's onPlanPersisted callback (after the re-report persists the NEW
           // plan_md) so its stale-write guard matches the new plan.
@@ -2629,6 +2634,7 @@ export class SdkExecutor implements Executor {
               gateMilestones,
               onPlanPersisted,
               settles,
+              semanticSubmission,
             ),
             ctx.continueExistingPlanGate, { reopenPlanSummary: true },
           );
@@ -4724,6 +4730,7 @@ export class SdkExecutor implements Executor {
       }
       if (beforeDispatch) prompt = beforeDispatch(prompt);
       const request: RunTurnRequest = {
+        semanticPlanning: ctx.semanticPlanning,
         ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
         prompt,
         // The neutral fields below are carried as-is; the placeholders

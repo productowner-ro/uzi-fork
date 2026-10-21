@@ -1102,6 +1102,10 @@ WITH claimant AS MATERIALIZED (
            OR 'cross_check_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
            OR 'cross_check_codex_lead_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+           OR 'cross_check_semantic_plan_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+           OR 'completion_semantic_publication_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -1356,6 +1360,10 @@ WITH claimant AS MATERIALIZED (
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
            OR 'cross_check_codex_lead_v1' = ANY(p.protocol_capabilities))
+      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+           OR 'cross_check_semantic_plan_v1' = ANY(p.protocol_capabilities))
+      AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+           OR 'completion_semantic_publication_v1' = ANY(p.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -2097,6 +2105,21 @@ UPDATE runs SET
                ELSE 0 END,
     updated_at       = now()
 WHERE runs.id = @id AND worker_id = @worker_id
+  -- Semantic freeze has no structural fallback when cross-check is disabled.
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR (COALESCE(runs.completion_contract, sqlc.narg('completion_contract')::jsonb)->>'profile' = 'semantic'
+           AND COALESCE(runs.completion_contract, sqlc.narg('completion_contract')::jsonb)
+               ->'semantic_presentation'->'candidate' =
+               (SELECT sp.candidate FROM semantic_planning sp WHERE sp.run_id = runs.id))
+       OR (runs.completion_contract IS NULL AND runs.plan_md IS NULL
+           AND runs.milestones_frozen IS NULL AND runs.milestones_candidate IS NULL
+           AND sqlc.narg('milestones_frozen')::jsonb IS NULL))
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR runs.status <> 'awaiting_approval'
+       OR EXISTS (SELECT 1 FROM run_user_inputs i WHERE i.run_id = runs.id
+           AND i.kind = 'approve_plan' AND i.gate_binding = 'bound'
+           AND i.gate_revision = runs.gate_revision AND i.applied_at IS NOT NULL
+           AND i.disposition IS DISTINCT FROM 'superseded'))
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- limit_wait is excluded EXPLICITLY, and note that the negative guard above does
   -- NOT cover it (PRD #35): a parked run is inside 'NOT IN (terminal)', so without
@@ -2342,9 +2365,12 @@ UPDATE runs SET
     -- auto_approve short-circuits the executor's preApproved path, skipping the gate
     -- with NO human in the loop, and the worker's ciFixHumanApproved initializer then
     -- reads that as approved. Clearing auto_approve here makes the resume re-gate.
-    -- Manual runs already carry auto_approve=false (no-op), and a normal autopilot run
-    -- never reaches this statement (it short-circuits in gatePlan and never parks), so
-    -- the ONLY run this newly affects is the forceGate ci_fix case — the intent.
+    -- Manual runs already carry auto_approve=false (no-op). An autopilot run parks here
+    -- only when something forces the human gate: the forceGate ci_fix case, an
+    -- auto-approved plan cross-check lead whose checker did not APPROVE (ADR-2149), and,
+    -- since PRD #1230 D3, a semantic-enrolled autopilot run whose server coverage projection is not
+    -- complete or which carries maintainer criteria: it parks here from `running` (the
+    -- semantic coverage park) and the cleared auto_approve makes any resume re-gate.
     auto_approve = false,
     -- Invalidate a published gate when any approval-bearing value changes. Compare
     -- the effective values written below, so an exact retry retains its snapshot.
@@ -2635,6 +2661,9 @@ UPDATE runs SET
     plan_source = 'agent',
     updated_at  = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id
+           AND sp.candidate->>'digest' = encode(sqlc.arg('candidate_digest')::bytea, 'hex')))
   AND runs.status IN ('claimed', 'running')
   AND runs.auto_approve = true
   AND runs.plan_source = 'agent'
@@ -8705,6 +8734,16 @@ WITH selected AS (
         updated_at       = now()
     WHERE runs.id = @run_id
       AND (runs.milestones_frozen IS NULL OR runs.milestones_candidate IS NOT DISTINCT FROM runs.milestones_frozen)
+      AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+           OR (runs.status = 'awaiting_approval'
+               AND sqlc.narg('expected_gate_revision')::bigint = runs.gate_revision
+               AND sqlc.narg('completion_contract')::jsonb->>'profile' = 'semantic'
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_presentation' =
+                   runs.gate_presented_payload->'semantic'
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_presentation'->'candidate' =
+                   (SELECT sp.candidate FROM semantic_planning sp WHERE sp.run_id = runs.id)
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_approval'->>'presentation_digest' =
+                   encode(runs.gate_payload_digest, 'hex')))
       -- PRD #1795 M2 (D5): a verdict sent against a revision the run no longer shows writes
       -- NOTHING — no selection, no milestone/contract/budget freeze, no input row.
       AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
@@ -9830,6 +9869,10 @@ WHERE run.id = @run_id
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
            OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = run.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
+           OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+      AND (run.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = run.id)
+           OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (run.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = run.id
@@ -10292,6 +10335,10 @@ WHERE r.status = 'queued'
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -10494,6 +10541,10 @@ WHERE r.status = 'queued'
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -10566,6 +10617,10 @@ WHERE r.status = 'queued'
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -11482,6 +11537,30 @@ SELECT count(*) FROM workers w WHERE w.user_id = @user_id
  AND NOT w.ephemeral AND NOT w.isolated_lane
  AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities)
  AND 'ci_artifacts_v1' = ANY(w.protocol_capabilities);
+
+-- name: GetRunSemanticHealth :one
+-- PRD #1230: the queued-reason inputs for a semantic-enrolled run. lead_enrolled marks a lead
+-- run with a semantic_planning row; plan_checker_enrolled marks a plan-stage cross-check child
+-- whose target run has one. The two counts are the owner's online, non-draining, non-ephemeral
+-- workers advertising the capability each ClaimRun clause requires, so the pill and the claim
+-- gate agree. The checker count does not repeat the cross_check_v1 conjunct, which every
+-- semantic-capable checker advertises; a worker with only the semantic token never claims.
+SELECT
+  EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = @run_id) AS lead_enrolled,
+  EXISTS (SELECT 1 FROM runs c
+            JOIN semantic_planning sp ON sp.run_id = c.target_run_id
+            JOIN cross_checks pc ON pc.checker_run_id = c.id AND pc.stage = 'plan'
+           WHERE c.id = @run_id AND c.kind = 'cross_check') AS plan_checker_enrolled,
+  (SELECT count(*) FROM workers w WHERE w.user_id = @user_id
+     AND w.status = 'online'
+     AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+     AND NOT w.ephemeral AND NOT w.isolated_lane
+     AND 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))::bigint AS publication_capable,
+  (SELECT count(*) FROM workers w WHERE w.user_id = @user_id
+     AND w.status = 'online'
+     AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+     AND NOT w.ephemeral AND NOT w.isolated_lane
+     AND 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))::bigint AS plan_checker_capable;
 
 -- name: SaveCIArtifactAdmission :one
 UPDATE runs SET ci_artifact_manifest = @manifest::jsonb, issue_description = @description

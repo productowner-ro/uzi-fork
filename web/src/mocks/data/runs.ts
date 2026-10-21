@@ -942,6 +942,32 @@ export const mockRuns: Run[] = [
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,
+    // PRD #1230 M4: unverified maintainer criteria published non-closing; every other mock run omits the field.
+    completion_pending: {
+      version: 1,
+      contract_revision: 1,
+      criteria: [{
+        criterion_id: "c7", milestone_id: "m2", kind: "maintainer",
+        text: "Release notes are approved by the maintainer.",
+        reason: "Only a maintainer can approve the wording.",
+        conditions: ["Release manager sign-off recorded"],
+        verification_steps: ["Read the published release notes"],
+        authorization_revision: 1, status: "unverified",
+      }],
+    },
+    // PRD #1230 D5: a detector's drift record (owner-only); every other mock run omits the field.
+    semantic_drift: {
+      observations: [{
+        phase: "publication", pushed_sha: "0123456789abcdef0123456789abcdef01234567",
+        observed_at: minsAgo(5),
+        issue: { source_id: "issue:18", frozen_hash: "a".repeat(64), observed_hash: "b".repeat(64), outcome: "changed" },
+        prds: [{ source_id: "prd:prds/11-run-view-ux.md", frozen_hash: "c".repeat(64), outcome: "unknown", reason: "missing",
+          ref: "0123456789abcdef0123456789abcdef01234567" }],
+        links_added: [], links_removed: [],
+      }],
+      dropped: 0,
+      contradiction: true,
+    },
     status: "completed",
     requeue_count: 0,
     iteration_count: 2,

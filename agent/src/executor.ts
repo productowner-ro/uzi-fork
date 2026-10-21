@@ -118,6 +118,7 @@ export type SecretRemediationDecision =
  * compatible. The runner populates them from the claim.
  */
 export interface RunContext {
+  semanticPlanning?: import("./semantic-plan.js").SemanticPlanning;
   /** Called after harness-specific home preparation, before any model invocation. */
   prepareCIEvidence?: () => Promise<import("./ci-evidence.js").PreparedCIEvidence>;
   ciEvidence?: import("./ci-evidence.js").PreparedCIEvidence;
@@ -410,6 +411,7 @@ export interface RunContext {
     milestones?: Milestone[],
     onPlanPersisted?: (planMd: string) => Promise<void>,
     settles?: number,
+    semanticSubmission?: import("./semantic-plan.js").SemanticSubmission,
   ): Promise<PlanVerdict>;
   /**
    * Issue #1604 (D3): a resumed, unapproved claim with a persisted plan calls this before it

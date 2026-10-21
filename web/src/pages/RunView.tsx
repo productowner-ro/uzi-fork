@@ -90,6 +90,8 @@ import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
 import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
 import { FullPlanPanel } from "./runView/FullPlanPanel";
+import { CompletionPending } from "./runView/CompletionPending";
+import { SemanticDrift } from "./runView/SemanticDrift";
 import { JudgePanel } from "./runView/JudgePanel";
 import { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
 import { DeliveredCard, hasDeliveredSection } from "./runView/DeliveredCard";
@@ -2565,6 +2567,8 @@ export function RunView() {
       />
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
+      <CompletionPending run={run} />
+      <SemanticDrift run={run} />
       {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
           The panel that would word it has unmounted, so the page says it instead. */}
       {revisionMismatch && run.status !== "awaiting_approval" && (
@@ -2582,9 +2586,11 @@ export function RunView() {
           busy={busy}
           canSteer={canSteer}
           revisionMismatch={revisionMismatch}
-          onApprove={(selection, overrideCapabilities, expectedGateRevision) =>
+          onApprove={(selection, overrideCapabilities, expectedGateRevision, semanticApproval) =>
             void gateAct(expectedGateRevision, () =>
-              submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
+              semanticApproval !== undefined
+                ? submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision, undefined, semanticApproval)
+                : submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
             )
           }
           onResetApprove={(selection, overrideCapabilities, expectedGateRevision, reset) =>

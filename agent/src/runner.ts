@@ -51,6 +51,12 @@ import type {
 import { PlanRejectedError } from "./executor.js";
 import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "./plan-revision-retry.js";
 import { checkPlan, type CheckedHumanGate, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
+import { captureSemanticSources, parseSemanticEnrollment } from "./semantic-plan.js";
+import { SemanticPlanningGate } from "./semantic-planning-gate.js";
+import { observePrdSources, hasDriftContradiction, type FrozenSource, type SemanticObservationRecord, type SemanticObservationRequest } from "./semantic-drift.js";
+import { expectedSemanticPark, type SemanticPark } from "./semantic-park.js";
+import { sameCompletionPending, type CompletionPending } from "./completion-pending.js";
+import type { BoundedCoverageTestTransport } from "./plan-contract-review.js";
 import type { PlanCrossCheckStateRequest, PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, GracefulShutdownCheckpoint, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
@@ -2021,7 +2027,7 @@ interface RunFlight {
   readonly reportState: (
     body: Parameters<WorkerClient["reportState"]>[1],
     signal?: AbortSignal,
-    checked?: boolean,
+    checked?: boolean | "semantic",
   ) => ReturnType<WorkerClient["reportState"]>;
   checkedStateBarrier?: Promise<void>;
   stateSenders?: Set<Promise<StateAck>>;
@@ -2224,6 +2230,9 @@ interface RunFlight {
   publishedRealTips?: string[];
   /** Exact candidate of the successful finalize push, retained for completion bookkeeping. */
   successfulPushedSha?: string;
+  /** PRD #1230 D5: the frozen sources of the latest compiled semantic candidate and where they were
+   *  captured, so a drift observation reads each PRD at the same commit. Detection input only. */
+  semanticDrift?: { barePath: string; headSha: string; sources: FrozenSource[] };
   inventoryGuarded?: boolean;
   /** Transient ambiguity guard; conveys neither durable evidence nor deletion authority. */
   completionSendAttempted?: boolean;
@@ -2369,6 +2378,8 @@ export interface RunnerOptions {
   recoveryLiveTiming?: Pick<RecoveryCoordinatorOptions, "liveBackoffBaseMs" | "liveBackoffCapMs">;
   /** Test-only timing overrides; production uses the approved bounded retry/poll policy. */
   planCrossCheckTiming?: PlanCrossCheckTiming;
+  /** Explicit bounded fixture transport only; never wired by worker runtime. */
+  semanticCoverageTestTransport?: BoundedCoverageTestTransport;
   /** Test-only teardown seams; production uses the pinned walk with one 120 s deadline. */
   teardownTestDeps?: TeardownTestDeps;
   queueTerminalRejectionReconciliation?: (runId: string, generation: number) => void;
@@ -2618,6 +2629,7 @@ export class RunRunner {
   /** issue #1597 M2: test-only seams (undefined in production). */
   private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
   private readonly planCrossCheckTiming: PlanCrossCheckTiming | undefined;
+  private readonly semanticCoverageTestTransport: BoundedCoverageTestTransport | undefined;
   private readonly recoveryRetryMs: number;
   private readonly completionHoldReconcileTimeoutMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
@@ -2847,6 +2859,7 @@ export class RunRunner {
     this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
     this.checkpointTestHooks = opts.checkpointTestHooks;
     this.planCrossCheckTiming = opts.planCrossCheckTiming;
+    this.semanticCoverageTestTransport = opts.semanticCoverageTestTransport;
     this.teardownTestDeps = opts.teardownTestDeps;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
@@ -6850,6 +6863,10 @@ export class RunRunner {
     let completionScope = claim.config?.completion_scope;
     let publicationAck: StateAck | undefined;
     let publicationProjection: StateAck["completionProjection"];
+    // PRD #1230 M4: the publication-start ACK's maintainer-pending projection (undefined is legacy).
+    // It is kept apart from publicationProjection.deferredIds: criterion identities are never merged
+    // into the legacy deferred-milestone set.
+    let publicationPending: CompletionPending | undefined;
     // Both capped-empty and MR completion use the same bounded client retry and hold paths.
     const requireCompletionPermit = async (head: string | null, branch: string): Promise<boolean> => {
       const contractRevision = publicationProjection?.revision ?? flight.latestContractRevision ?? claim.config?.contract_revision;
@@ -6915,6 +6932,18 @@ export class RunRunner {
           await holdOrFailInterlocked("completion permit scope differs from publication guard");
           return false;
         }
+      }
+      // PRD #1230 M4: the permit's maintainer-pending projection must equal the one the pre-push
+      // guard acted on (presence on one side only included). Without a publication ACK there was
+      // no guard, so a non-empty projection cannot be delivered non-closing and holds instead.
+      if (permit.permit?.completionPendingMalformed) {
+        await holdOrFailInterlocked("completion permit pending projection malformed");
+        return false;
+      }
+      if (publicationProjection ? !sameCompletionPending(publicationPending, permit.permit?.completionPending)
+        : (permit.permit?.completionPending?.criteria.length ?? 0) > 0) {
+        await holdOrFailInterlocked("completion permit pending projection differs from publication guard");
+        return false;
       }
       return true;
     };
@@ -7565,6 +7594,10 @@ export class RunRunner {
     const effectiveDeclared = result.nonClosing ?? claim.config?.non_closing;
     const issuePublication = resolveRunKind(claim.kind) === "issue" && typeof claim.issue_iid === "number";
     let closingGateIid = issuePublication && effectiveDeclared ? claim.issue_iid! : undefined;
+    // PRD #1230 M4: set only from the publication-start ACK's non-empty maintainer-pending
+    // projection. It widens the closing guard and the non-closing delivery decision; it is neither a
+    // lead declaration (effectiveDeclared) nor a member of the legacy deferred-milestone set.
+    let pendingNonClosing = false;
     const closingBarePath = barePath;
     const closingRepoPath = repoPathFromUrl(claim.repo.url);
     // publishedCommitMessages scans default-branch..tip, including already-pushed history.
@@ -7816,7 +7849,18 @@ export class RunRunner {
         return;
       }
       publicationProjection = publicationAck.completionProjection;
-      if (effectiveDeclared || result.scopeCapped || publicationProjection.deferredIds.length > 0)
+      // PRD #1230 M4: a malformed projection never degrades to legacy absence, and a non-empty one
+      // needs the negotiated semantic publication feature (an api that sends it advertises it).
+      // Both hold through the same zero-attempt admission path as an unconfirmed completion state.
+      if (publicationAck.completionPendingMalformed ||
+          ((publicationAck.completionPending?.criteria.length ?? 0) > 0 &&
+            !this.client.hasFeature("completion_semantic_publication_v1"))) {
+        await refusePrepush("unknown", publicationOriginalHead);
+        return;
+      }
+      publicationPending = publicationAck.completionPending;
+      pendingNonClosing = (publicationPending?.criteria.length ?? 0) > 0;
+      if (effectiveDeclared || result.scopeCapped || publicationProjection.deferredIds.length > 0 || pendingNonClosing)
         closingGateIid = claim.issue_iid!;
     }
 
@@ -8878,6 +8922,27 @@ export class RunRunner {
     const runKind = resolveRunKind(claim.kind);
     const declaration = runKind === "issue" ? (result.nonClosing ?? claim.config?.non_closing) : undefined;
     const effectiveNonClosing = declaration ? { reason: flight.redactText(declaration.reason) } : undefined;
+    // PRD #1230 M4: every server-sourced string is redacted BEFORE the renderer escapes it, so a
+    // registered secret cannot be split by inline escaping. The permit-verified projection only.
+    // PRD #1230 D5: one publication-phase drift observation of the exact pushed SHA, before any
+    // description is rendered. Detection only: it never throws and changes nothing about delivery.
+    const publicationDrift = claim.semantic_planning !== undefined
+      ? await this.observeSemanticDrift(flight,
+        { phase: "publication", pushed_sha: flight.successfulPushedSha ?? "" }, boundarySignal)
+      : undefined;
+    const driftForRender: SemanticObservationRecord | undefined = publicationDrift && hasDriftContradiction(publicationDrift) ? {
+      ...publicationDrift,
+      issue: redactDriftSource(publicationDrift.issue, redactText),
+      prds: publicationDrift.prds.map(x => redactDriftSource(x, redactText)),
+      links_added: publicationDrift.links_added.map(x => redactText(x)),
+      links_removed: publicationDrift.links_removed.map(x => redactText(x)),
+    } : undefined;
+    const pendingForRender: CompletionPending | undefined = publicationPending && publicationPending.criteria.length > 0
+      ? { ...publicationPending, criteria: publicationPending.criteria.map(c => ({
+        ...c, milestone_id: redactText(c.milestone_id), text: redactText(c.text), reason: redactText(c.reason),
+        criterion_id: redactText(c.criterion_id),
+        conditions: c.conditions.map(x => redactText(x)), verification_steps: c.verification_steps.map(x => redactText(x)),
+      })) } : undefined;
     const completionFor = (withCloses: boolean, opts?: MrDescriptionOptions): string =>
       mrCompletionBlock(
         claim,
@@ -8902,6 +8967,8 @@ export class RunRunner {
         opts,
         result.codeCrossCheckSummary,
         effectiveNonClosing,
+        pendingForRender,
+        driftForRender,
       );
     // D17: a refresh run (mr_rework, or a ci_fix adopting an existing branch rather than opening a
     // fresh ci-fix/pipeline-N one) refreshes only the region and never authors closing semantics.
@@ -8923,7 +8990,7 @@ export class RunRunner {
     // blocker arm (a delivery that must not close its issue) needs BOTH: a matching non-closing arm in
     // issueArm (setting this flag alone still renders `Closes #N`, and the publisher's scan skips uzi's
     // own completion block), and this flag set here rather than its own check at one of those sites.
-    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped || !!effectiveNonClosing;
+    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped || !!effectiveNonClosing || pendingNonClosing;
     const createCloses = renderCloses && !nonClosingDelivery;
     // H1: a forge response over its byte cap (ForgeResponseTooLarge) is a deterministic answer, not
     // a blip: classifyForgeError classifies it permanent, so it is never retried. Both the publisher
@@ -9502,9 +9569,17 @@ export class RunRunner {
       // id-less gate) with the presented requirements. The confirmed revision is seeded from the
       // claim, so a pending reject or revise bound to that gate acts before it is re-presented
       // (takeResumedGateEvent); a taken revise clears it and marks the run gated (a fresh id then).
+      // Worker claims carry no persisted semantic binding. Text equality cannot
+      // certify sources, criteria, coverage or generation, so refresh this gate.
+      if (claim.semantic_planning !== undefined) this.gatedRuns.add(runId);
       const resumeRevision = claim.resume_gate_revision;
+      // Queued owner revisions still target the persisted gate before refresh.
+      // gatePlan clears this revision before publishing the new presentation.
+      if (claim.semantic_planning !== undefined && typeof resumeRevision === "number" &&
+          Number.isSafeInteger(resumeRevision) && resumeRevision > 0)
+        steering.setGateRevision(resumeRevision);
       if (
-        !this.gatedRuns.has(runId) &&
+        claim.semantic_planning === undefined && !this.gatedRuns.has(runId) &&
         typeof resumeRevision === "number" && Number.isSafeInteger(resumeRevision) && resumeRevision > 0
       ) {
         const id = claim.resume_gate_presentation_id;
@@ -9673,8 +9748,9 @@ export class RunRunner {
         if (checked && stamped.claim_generation !== flight.claimGeneration)
           throw new Error("plan cross-check: state generation changed");
         const diskSeq = body.status !== undefined ? this.diskGovernor?.statusRequested(runId, body.status) : undefined;
-        const transport = () => checked
-          ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
+        const transport = () => checked === "semantic"
+          ? this.client.reportSemanticPlanGateState(runId, stamped, signal)
+          : checked ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
           : this.client.reportState(runId, stamped, signal);
         // Preservation expiry cannot prevent the honest terminal report. FINAL stays budgeted.
         const sending = body.status === "failed" || body.status === "completed"
@@ -11790,6 +11866,15 @@ export class RunRunner {
     let crossCheckSelected = false;
     let crossCheckRound = 1;
     let crossCheckDiscoveryDone = false;
+    // PRD #1230 M4 (D3/D4): the one-way, flight-scoped human-gate latch of a semantic run. Once
+    // coverage was not complete, a maintainer criterion exists, or the required checker did not
+    // APPROVE, this execution never auto-approves again, including a later (e.g. human-revised)
+    // candidate; no later complete report can clear it. It lives beside checkedHuman so it
+    // survives re-entry of the plan-gate closure.
+    let semanticHumanGate = false;
+    // The server accepts semantic_park only on the first awaiting_approval report of an
+    // auto_approve run (that report clears auto_approve), so later candidates never supply it.
+    let semanticParkOffered = false;
     let ownerHistoryGateNoted = false; // issue #3149: the forced-human-gate status line is emitted once per claim
     // Each strict operation freezes generation/session and the complete request before first send.
     const checkedReports = new WeakMap<StateRequest, PlanCrossCheckStateRequest>();
@@ -11847,7 +11932,11 @@ export class RunRunner {
       if (body.status === "running" && flight.workerMemory) flight.workerMemory.resumeReady = true;
       return reportState(body, ...args);
     };
+    const semanticPlanning = claim.semantic_planning === undefined ? undefined : parseSemanticEnrollment(claim.semantic_planning);
+    const semanticGate = semanticPlanning ? new SemanticPlanningGate(this.client, runId, flight.claimGeneration,
+      steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
     const ctx: RunContext = {
+      semanticPlanning,
       ...(claim.kind === "prompt" && claim.config?.ci_config_guard === true && claim.ci_repair != null ? {
         prepareCIEvidence: async () => {
           if (!flight.runHome) throw new Error("CI evidence requires a prepared run home");
@@ -12131,13 +12220,37 @@ export class RunRunner {
         if (!(cause instanceof TransientRecoveryError) || !cause.providerOrigin || !revisionRecovery) throw cause;
         await revisionRecovery.retry(cause);
       },
-      gatePlan: async (planMd, milestones, onPlanPersisted, settles) => {
+      gatePlan: async (planMd, milestones, onPlanPersisted, settles, semanticSubmission) => {
         if (flight.workerMemory) flight.workerMemory.revisionContext = undefined;
         // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
         // short-circuit — it parks for human review even on an auto-triggered run. We
         // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
         // unchanged. Non-ci_fix and code-plan ci_fix runs keep today's behavior exactly.
         const forceGate = claim.kind === "ci_fix" && isCIConfigPlan(planMd);
+        // Compile before checker selection from bare exact-base reads and the frozen issue.
+        // The lead proposal never supplies capture authority.
+        let semanticCompiled: Awaited<ReturnType<SemanticPlanningGate["compile"]>> | undefined;
+        let semanticSources: Awaited<ReturnType<typeof captureSemanticSources>> | undefined;
+        let semanticDiff: Awaited<ReturnType<RunRunner["captureCheckedPlanningDiff"]>> | undefined;
+        if (semanticGate) {
+          if (!barePath) throw new Error("semantic candidate: bare source unavailable");
+          semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
+          if ("refusal" in semanticDiff) throw new Error(`semantic candidate: planning diff unavailable (${semanticDiff.refusal}: ${semanticDiff.diagnostic})`);
+          semanticSources = await captureSemanticSources(this.git, {
+            barePath, repo: claim.repo.id, headSha: runnerClone.baseCommit,
+            issue: { id: "issue:" + claim.issue_iid, bytes: Buffer.from(claim.issue_description) },
+            planBytes: Buffer.from(planMd), timeoutMs: 3000, signal: steering.lifecycleSignal(),
+          });
+          semanticCompiled = await semanticGate.compile({
+            plan_md: planMd, milestones: milestones ?? [],
+            required_capabilities: toolchainDetection?.required_capabilities ?? [],
+            required_tools: toolchainDetection?.required_tools ?? [],
+            size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
+            planning_diff: semanticDiff.diff,
+          }, semanticSubmission, semanticSources.sources);
+          flight.semanticDrift = { barePath, headSha: runnerClone.baseCommit,
+            sources: semanticCompiled.candidate.sources.map(({ id, kind, hash, completeness }) => ({ id, kind, hash, completeness })) };
+        }
         // Issue #3149: a resume whose earlier owner follow-ups could not be restored needs a human
         // approval, even on autopilot (no cross-check, no auto-approve), for the whole claim.
         if (ownerHistoryIncomplete && !ownerHistoryGateNoted) {
@@ -12208,7 +12321,7 @@ export class RunRunner {
               checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
               checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
             } else {
-              const captured = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
+              const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {
                 crossCheckReason = `plan cross-check: planning diff refused (${captured.refusal}: ${captured.diagnostic})`;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
@@ -12216,7 +12329,10 @@ export class RunRunner {
                 checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
               } else {
                 const decision = await checkPlan({ client: this.client, runId, generation: flight.claimGeneration,
-                  candidate: { plan_md: planMd, milestones: milestones ?? [],
+                  candidate: {
+                    ...(semanticCompiled ? { candidate_identity_version: "semantic_v1" as const,
+                      semantic_candidate: semanticCompiled.candidate } : {}),
+                    plan_md: planMd, milestones: milestones ?? [],
                     required_capabilities: toolchainDetection?.required_capabilities ?? [],
                     required_tools: toolchainDetection?.required_tools ?? [],
                     size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
@@ -12262,7 +12378,31 @@ export class RunRunner {
           checkedHuman.phase = "publishingrevised";
           checkedHuman.continueWait = undefined;
         }
-        const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate && !ownerHistoryIncomplete &&
+        // Automatic checker REVISE returns above consume no coverage admission.
+        // M3/M4 own rendering, exact freeze and the server approval park; M2 supplies evidence.
+        let semanticPark: SemanticPark | undefined;
+        if (semanticGate && semanticCompiled && semanticSources) {
+          // The SERVER's coverage authority decides; the review result is display evidence only.
+          const { review: coverage, outcome } = await semanticGate.reviewForGate(semanticCompiled, planMd, semanticSources.sources);
+          batcher.emit({ kind: "status", agent: "worker", payload: { event: "semantic_plan_coverage", ...coverage,
+            server_outcome: outcome } });
+          const maintainers = semanticCompiled.candidate.criteria.filter(c => c.kind === "maintainer").length;
+          const checkerMissing = claim.plan_cross_check_required === true && checkedApproval === undefined;
+          if (outcome !== "complete" || maintainers > 0 || checkerMissing) semanticHumanGate = true;
+          if (!semanticParkOffered) {
+            semanticParkOffered = true;
+            // Only an auto_approve report supplies it; a complete, maintainer-free candidate gated
+            // by the checker alone supplies none (the existing cross-check reason applies).
+            if (claim.auto_approve === true) semanticPark = expectedSemanticPark(outcome, maintainers);
+          }
+          if (semanticHumanGate && checkedApproval) {
+            // The checker verdict stays historical evidence only: it grants no approval here, and
+            // the state barrier it held must not outlive the decision to take the human gate.
+            checkedApproval = undefined;
+            releaseStateBarrier?.();
+          }
+        }
+        const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate && !semanticHumanGate && !ownerHistoryIncomplete &&
           (!checkedHuman || checkedApproval !== undefined);
         // Issue #1604 (D3): a resumed claim with an unapproved persisted plan reports no
         // awaiting_approval before the inputs sent before the release are read (the replayed
@@ -12271,13 +12411,25 @@ export class RunRunner {
         // delivered (an SDK claim already awaited it in takeResumedGateEvent).
         if (claim.plan_approved !== true && !!claim.plan_md?.trim() && !effectiveAutoApprove)
           await this.awaitResumedDelivery(runId, steering, batcher, runLog, checkedHuman ? steering.lifecycleSignal() : cancel.signal);
+        const semanticReports = new WeakMap<StateRequest, PlanCrossCheckStateRequest>();
+        const reportSemanticState = (body: StateRequest): Promise<StateAck> => {
+          let frozen = semanticReports.get(body);
+          if (!frozen) {
+            frozen = JSON.parse(JSON.stringify({ ...body,
+              candidate_digest: semanticCompiled!.candidate.digest, claim_generation: flight.claimGeneration,
+              ...(flight.observedSessionId ? { session_id: flight.observedSessionId } : {}),
+            })) as PlanCrossCheckStateRequest;
+            semanticReports.set(body, frozen);
+          }
+          return flight.reportState(frozen, steering.lifecycleSignal(), "semantic");
+        };
         const verdict = await this.gatePlan(
           runId,
           planMd,
           milestones,
           batcher,
           steering,
-          checkedHuman || checkedApproval ? reportCheckedState : reportState,
+          semanticCompiled ? reportSemanticState : checkedHuman || checkedApproval ? reportCheckedState : reportState,
           runLog,
           effectiveAutoApprove,
           crossCheckReason,
@@ -12316,6 +12468,12 @@ export class RunRunner {
           } : undefined,
           (candidate) => this.prepareGateCheckpoint(claim, flight, steering.lifecycleSignal(), candidate),
           revisionRecovery,
+          semanticPark,
+          semanticCompiled ? async (ack) => {
+            if (ack.applied !== true || ack.status !== "awaiting_approval" || !Number.isSafeInteger(ack.gateRevision) || (ack.gateRevision ?? 0) <= 0) return;
+            await this.observeSemanticDrift(flight, { phase: "presentation",
+              candidate_digest: semanticCompiled!.candidate.digest, gate_revision: ack.gateRevision! }, steering.lifecycleSignal());
+          } : undefined,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
@@ -19629,6 +19787,48 @@ export class RunRunner {
     }
   }
 
+  /**
+   * PRD #1230 D5: one source drift observation, detection only. Reads each frozen PRD source at the
+   * exact commit (the capture commit for a presentation, the pushed SHA for a publication) from the
+   * bare, posts the hashes, and returns the server's stored record. Every failure (a missing capture,
+   * a read error, a network error, a 4xx or a 409 fence) is logged and emitted as a status event and
+   * resolves undefined: an observation never blocks, fails, holds or changes the run.
+   */
+  private async observeSemanticDrift(
+    flight: RunFlight,
+    target: { phase: "presentation"; candidate_digest: string; gate_revision: number } | { phase: "publication"; pushed_sha: string },
+    signal?: AbortSignal,
+  ): Promise<SemanticObservationRecord | undefined> {
+    const note = (text: string): void => {
+      flight.runLog.warn("semantic drift observation failed", { phase: target.phase, detail: flight.redactText(text) });
+      flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: `source drift observation (${target.phase}) not recorded: ${flight.redactText(text)}` } });
+    };
+    try {
+      const owned = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(10_000)]);
+      let captured = flight.semanticDrift;
+      // A resumed, already-approved run never ran gatePlan in this process, so it holds no frozen
+      // candidate. At publication the server's coverage status names the frozen PRD sources instead.
+      if (!captured && target.phase === "publication") {
+        const status = await this.client.semanticCoverageStatus(flight.runId, flight.claimGeneration, owned);
+        if (status.prd_sources === undefined) return void note("coverage status carries no frozen PRD sources");
+        if (!flight.barePath) return void note("no bare repository to read the sources from");
+        captured = { barePath: flight.barePath, headSha: "", sources: status.prd_sources };
+      }
+      const sha = target.phase === "presentation" ? captured?.headSha : target.pushed_sha;
+      if (!captured) return void note("no frozen semantic candidate in this process");
+      if (sha === undefined || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) return void note("no exact commit to read the sources at");
+      const prd_sources = await observePrdSources(this.git, { barePath: captured.barePath, sha, sources: captured.sources, timeoutMs: 5000, signal: owned });
+      const request: SemanticObservationRequest = { ...target, prd_sources };
+      const record = await this.client.postSemanticObservation(flight.runId, flight.claimGeneration, request, owned);
+      flight.batcher.emit({ kind: "status", agent: "worker", payload: { event: "semantic_source_drift", phase: record.phase,
+        contradiction: hasDriftContradiction(record) } });
+      return record;
+    } catch (error) {
+      note(errMessage(error));
+      return undefined;
+    }
+  }
+
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.
    *  For an autopilot run, the plan is still recorded but the gate resolves with an
    *  approve verdict immediately — no awaiting_approval report, no /inputs wait. It
@@ -19737,6 +19937,8 @@ export class RunRunner {
     retainCheckedStorage?: (resume: () => Promise<PlanVerdict>) => void,
     prepareCheckpoint?: (candidate: Milestone[] | undefined) => Promise<StateRequest["gate_checkpoint_witness"]>,
     revisionRecovery?: PlanRevisionRecovery,
+    semanticPark?: SemanticPark,
+    onSemanticPresented?: (ack: StateAck) => Promise<void>,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -19910,6 +20112,7 @@ export class RunRunner {
     const request: StateRequest = {
       ...checkedFields,
       ...(witness ? { gate_checkpoint_witness: witness } : {}),
+      ...(semanticPark !== undefined ? { semantic_park: semanticPark } : {}),
       status: "awaiting_approval",
       plan_md: planMd,
       ...presentation,
@@ -19981,6 +20184,14 @@ export class RunRunner {
       gate_revision: ack.gateRevision ?? null,
     });
 
+    // PRD #1230 D5: record the source drift of the presentation just accepted. Detection only: it is
+    // not awaited, so the git reads and the POST (bounded by observeSemanticDrift's own 10 s budget and
+    // the lifecycle signal) never delay the verdict wait, and its own catch keeps a failure from the gate.
+    if (onSemanticPresented) {
+      void Promise.resolve().then(() => onSemanticPresented(ack)).catch(error => {
+        runLog.warn("semantic drift presentation hook failed", { run_id: runId, error: errMessage(error) });
+      });
+    }
     // Human gates start advisory work only after a positive storage acknowledgement, and do
     // not await it: the verdict wait must not be delayed by the summary model or its POST.
     if (onPlanPersisted && ack.applied === true && ack.status === "awaiting_approval") {
@@ -20692,6 +20903,10 @@ export function mrCompletionBlock(
   opts?: MrDescriptionOptions,
   codeCrossCheckSummary?: import("./code-cross-check-gate.js").CodeCrossCheckSummary,
   nonClosing?: ExecutorResult["nonClosing"],
+  // PRD #1230 M4: the strictly decoded, caller-redacted maintainer-pending projection.
+  completionPending?: CompletionPending,
+  // PRD #1230 D5: the redacted publication drift observation; rendered only on a contradiction.
+  semanticDrift?: SemanticObservationRecord,
 ): string {
   // PRD #983 M4b / PRD #1798 D14: a kind's one-line completion sentence lives in
   // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
@@ -20710,6 +20925,8 @@ export function mrCompletionBlock(
     completionScope,
     scopeCapped,
     nonClosing: resolveRunKind(claim.kind) === "issue" ? nonClosing : undefined,
+    completionPending: resolveRunKind(claim.kind) === "issue" ? completionPending : undefined,
+    semanticDrift: resolveRunKind(claim.kind) === "issue" ? semanticDrift : undefined,
     repoAgents: agentSelection?.source === "repo",
     gatesUnverified,
     gatesDiscoveryTruncated,
@@ -20717,6 +20934,10 @@ export function mrCompletionBlock(
     banner: opts?.banner,
     staleness: opts?.staleness,
   });
+}
+
+function redactDriftSource(x: SemanticObservationRecord["issue"], redact: (text: string) => string): SemanticObservationRecord["issue"] {
+  return { ...x, source_id: redact(x.source_id) };
 }
 
 /** Feed text for an autopilot run's resolved default selection (PRD #37 Decision
