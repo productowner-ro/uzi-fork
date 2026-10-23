@@ -303,6 +303,8 @@ tasks:
       # blocks of .github/actions/**/action.yml, the one class lint:shell and
       # lint:actions both miss. Same fail-open/REQUIRED contract, same UZI_LINT_ACTIONS_REQUIRED.
       - task: lint:actions:embedded
+      - task: test:worker-toolchain
+      - task: check:worker-toolchain
       # Hermetic fake-tool regression suite for the golangci-lint downloader and
       # build-Go guard: no network and no real release binary. It protects the
       # archive-cache trust boundary and the go/toolchain compatibility seam.
@@ -1088,7 +1090,7 @@ tasks:
       - bash ./scripts/uxlab-build.test.sh
 
   test:renovate-go-toolchain:
-    desc: hermetic extraction and grouping contract for Go-toolchain Renovate updates
+    desc: hermetic Go-toolchain grouping and worker Go flake extraction contract
     cmds:
       - node ./scripts/renovate-go-toolchain.test.mjs
 
@@ -1262,6 +1264,16 @@ tasks:
     desc: hermetic devbox workflow token isolation, validated lock transfer and proposal behavior
     cmds:
       - ./scripts/devbox-update.test.sh
+
+  check:worker-toolchain:
+    desc: worker package lock keys and resolved Go satisfy module go and toolchain requirements (offline)
+    cmds:
+      - python3 -B scripts/check-worker-toolchain.py
+
+  test:worker-toolchain:
+    desc: offline regression tests for worker lock drift and baked Go assertions
+    cmds:
+      - python3 -B scripts/check-worker-toolchain.test.py
 
   test:govulncheck-toolchain:
     desc: hermetic govulncheck module toolchain, host-native install, analysis environment and exit contract (fake go)
