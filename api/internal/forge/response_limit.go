@@ -92,10 +92,45 @@ func (*ResponseTooLargeError) Unwrap() error { return ErrResponseTooLarge }
 // folds it into an empty ErrorResponse. One state is created per marked call and
 // never shared between calls.
 type responseLimitState struct {
-	overflow    atomic.Bool
-	ceiling     int64
-	issueTarget bool
-	failure     atomic.Pointer[ResponseTooLargeError]
+	overflow               atomic.Bool
+	ceiling                int64
+	issueTarget            bool
+	failure                atomic.Pointer[ResponseTooLargeError]
+	unsupportedEncoding    atomic.Bool
+	continuationValidation bool
+}
+
+// GetIssueBounded validates a continuation issue using the direct-issue ceiling
+// (2 MiB success, at most 4 KiB error). Share the state with the issue driver so
+// SDK-discarded read errors retain their safe response provenance. Ordinary issue
+// reads keep each driver's existing policy.
+func GetIssueBounded(ctx context.Context, f Forge, projectID, iid int64) (Issue, error) {
+	state := newResponseLimitState(issueResponseBytes)
+	state.continuationValidation = true
+	ctx = context.WithValue(ctx, ciRepairJSONKey{}, false)
+	issue, err := f.GetIssue(withResponseLimit(ctx, state), projectID, iid)
+	if state.overflow.Load() {
+		return Issue{}, state.err()
+	}
+	if state.unsupportedEncoding.Load() {
+		return Issue{}, &bodyReadError{category: "unsupported content encoding"}
+	}
+	if err != nil {
+		return Issue{}, err
+	}
+	return issue, nil
+}
+
+// Reuse only a continuation validator's fresh state. Other callers keep the
+// driver's independent issue policy, including when they carry another limit.
+// Invoke after repository lookup so its response is not attributed to the issue.
+func issueResponseState(ctx context.Context) *responseLimitState {
+	state := responseLimitFrom(ctx)
+	if state == nil || !state.continuationValidation {
+		state = newResponseLimitState(issueResponseBytes)
+	}
+	state.issueTarget = true
+	return state
 }
 
 // recordOverflow publishes safe response facts before the overflow flag.
@@ -294,6 +329,7 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 		return resp, err
 	}
 	if declaresContentEncoding(resp.Header) {
+		state.unsupportedEncoding.Store(true)
 		// Forced compression: the wire bytes are not the content. Read nothing; keep
 		// the status so classification survives, but never hand a body on.
 		_ = resp.Body.Close()

@@ -74,14 +74,17 @@ func (g *github) GetIssue(ctx context.Context, projectID, issueIID int64) (Issue
 	if err != nil {
 		return Issue{}, g.wrapErr("get issue", err)
 	}
-	state := newResponseLimitState(issueResponseBytes)
-	state.issueTarget = true
-	i, _, err := g.client.Issues.Get(withResponseLimit(ctx, state), slug.owner, slug.repo, num)
+	state := issueResponseState(ctx)
+	i, resp, err := g.client.Issues.Get(withResponseLimit(ctx, state), slug.owner, slug.repo, num)
 	if state.overflow.Load() {
 		return Issue{}, g.wrapErr("get issue", state.err())
 	}
 	if err != nil {
-		return Issue{}, g.wrapErr("get issue", err)
+		wrapped := g.wrapErr("get issue", err)
+		if resp != nil && resp.Response != nil {
+			return Issue{}, issueReadError(resp.StatusCode, wrapped)
+		}
+		return Issue{}, wrapped
 	}
 	return toGitHubIssue(i), nil
 }
@@ -236,14 +239,15 @@ func toGitHubIssue(i *gh.Issue) Issue {
 	// `null`, which ships as JSON null to every consumer (same reason the other
 	// drivers normalize it).
 	issue := Issue{
-		IID:         int64(i.GetNumber()),
-		Title:       i.GetTitle(),
-		State:       githubIssueState(i.GetState()),
-		Labels:      []string{},
-		Description: i.GetBody(),
-		WebURL:      i.GetHTMLURL(),
-		UpdatedAt:   i.GetUpdatedAt().Time,
-		Assignees:   []int64{},
+		IsPullRequest: i.PullRequestLinks != nil,
+		IID:           int64(i.GetNumber()),
+		Title:         i.GetTitle(),
+		State:         githubIssueState(i.GetState()),
+		Labels:        []string{},
+		Description:   i.GetBody(),
+		WebURL:        i.GetHTMLURL(),
+		UpdatedAt:     i.GetUpdatedAt().Time,
+		Assignees:     []int64{},
 	}
 	for _, l := range i.Labels {
 		if l != nil {

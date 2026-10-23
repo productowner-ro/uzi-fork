@@ -1085,6 +1085,7 @@ type Run struct {
 	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
 	CheckpointAttestedSource    pgtype.Text        `json:"checkpoint_attested_source"`
 	SourcePublicationIntent     []byte             `json:"source_publication_intent"`
+	ContinuedIssueIid           pgtype.Int8        `json:"continued_issue_iid"`
 }
 
 type RunCompletionAttempt struct {

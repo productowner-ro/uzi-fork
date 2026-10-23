@@ -366,14 +366,17 @@ func (g *gitLab) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 }
 
 func (g *gitLab) GetIssue(ctx context.Context, projectID, issueIID int64) (Issue, error) {
-	state := newResponseLimitState(issueResponseBytes)
-	state.issueTarget = true
-	i, _, err := g.client.Issues.GetIssue(projectID, issueIID, gitlab.WithContext(withResponseLimit(ctx, state)))
+	state := issueResponseState(ctx)
+	i, resp, err := g.client.Issues.GetIssue(projectID, issueIID, gitlab.WithContext(withResponseLimit(ctx, state)))
 	if state.overflow.Load() {
 		return Issue{}, g.wrapErr("get issue", state.err())
 	}
 	if err != nil {
-		return Issue{}, g.wrapErr("get issue", err)
+		wrapped := g.wrapErr("get issue", err)
+		if resp != nil {
+			return Issue{}, issueReadError(resp.StatusCode, wrapped)
+		}
+		return Issue{}, wrapped
 	}
 	return toIssue(i), nil
 }
