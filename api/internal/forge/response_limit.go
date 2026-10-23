@@ -27,7 +27,62 @@ var ErrResponseTooLarge = errors.New("forge response body exceeds size limit")
 // ResponseTooLargeError carries no remote content: its text is fixed and trusted,
 // so the redactor passes it through. Treat it as "no evidence", never as a
 // partial answer.
-type ResponseTooLargeError struct{}
+type ResponseTooLargeError struct {
+	Provenance ResponseProvenance
+	Outcome    ErrorClass
+}
+
+// ResponseProvenance describes only local response facts, never remote content.
+// Its zero value means that no response provenance is known.
+type ResponseProvenance uint8
+
+const (
+	ResponseUnknown ResponseProvenance = iota
+	ResponseSuccess
+	ResponseIssueSuccess
+	ResponseError
+)
+
+// Class returns only a recognized outcome, including for external test fakes.
+func (e *ResponseTooLargeError) Class() ErrorClass {
+	if e != nil {
+		switch e.Outcome {
+		case ErrorClassTimeout, ErrorClassAuth, ErrorClassServerError, ErrorClassRateLimited:
+			return e.Outcome
+		}
+	}
+	return ErrorClassOther
+}
+
+func (e *ResponseTooLargeError) safeCopy() *ResponseTooLargeError {
+	out := &ResponseTooLargeError{Outcome: e.Class()}
+	if e != nil {
+		switch e.Provenance {
+		case ResponseSuccess, ResponseIssueSuccess, ResponseError:
+			out.Provenance = e.Provenance
+		}
+	}
+	return out
+}
+
+// mrOverflowError preserves the MR methods' overflow class while retaining only
+// safe response provenance. Ordinary errors keep their existing classification.
+func mrOverflowError(err error) error {
+	var large *ResponseTooLargeError
+	if !errors.As(err, &large) {
+		return err
+	}
+	out := large.safeCopy()
+	out.Outcome = ErrorClassOther
+	return out
+}
+
+// IsIssueResponseTooLarge requires affirmative provenance from a successful
+// direct issue response. Bare sentinels and unknown responses are not permanent.
+func IsIssueResponseTooLarge(err error) bool {
+	var large *ResponseTooLargeError
+	return errors.As(err, &large) && large != nil && large.Provenance == ResponseIssueSuccess
+}
 
 func (*ResponseTooLargeError) Error() string { return ErrResponseTooLarge.Error() }
 func (*ResponseTooLargeError) Unwrap() error { return ErrResponseTooLarge }
@@ -36,7 +91,47 @@ func (*ResponseTooLargeError) Unwrap() error { return ErrResponseTooLarge }
 // (streaming) path, where the SDK ignores the read error (the deferred drain) or
 // folds it into an empty ErrorResponse. One state is created per marked call and
 // never shared between calls.
-type responseLimitState struct{ overflow atomic.Bool }
+type responseLimitState struct {
+	overflow    atomic.Bool
+	ceiling     int64
+	issueTarget bool
+	failure     atomic.Pointer[ResponseTooLargeError]
+}
+
+// recordOverflow publishes safe response facts before the overflow flag.
+func (s *responseLimitState) recordOverflow(status int) *ResponseTooLargeError {
+	provenance := ResponseError
+	if statusSDKSuccess(status) {
+		provenance = ResponseSuccess
+		if s.issueTarget {
+			provenance = ResponseIssueSuccess
+		}
+	}
+	e := &ResponseTooLargeError{Provenance: provenance, Outcome: classifyError(nil, status)}
+	s.failure.Store(e)
+	s.overflow.Store(true)
+	return s.err()
+}
+
+// err is the shared reconstruction point for SDK paths that discard read errors.
+func (s *responseLimitState) err() *ResponseTooLargeError {
+	return s.failure.Load().safeCopy()
+}
+
+// issueResponseBytes is eight times 256 KiB: sixfold JSON expansion plus
+// metadata headroom. It is also twice the 1 MiB API cap.
+const issueResponseBytes int64 = 2 << 20
+
+// objectResponseBytes follows ancestryBodyLimit and artifactPageBytes (1 MiB).
+const objectResponseBytes int64 = 1 << 20
+
+// commentPageResponseBytes is a per-page policy: 100 comments of 64 KiB plus
+// metadata. It does not promise that every escaped page fits.
+const commentPageResponseBytes int64 = 8 << 20
+
+func newResponseLimitState(ceiling int64) *responseLimitState {
+	return &responseLimitState{ceiling: ceiling}
+}
 
 type responseLimitKey struct{}
 
@@ -73,11 +168,12 @@ type lazyCappedBody struct {
 	rc        io.ReadCloser
 	remaining int64
 	state     *responseLimitState
+	status    int
 }
 
 func (b *lazyCappedBody) Read(p []byte) (int, error) {
 	if b.remaining < 0 {
-		return 0, &ResponseTooLargeError{}
+		return 0, b.state.err()
 	}
 	if int64(len(p)) > b.remaining+1 {
 		p = p[:b.remaining+1]
@@ -85,8 +181,7 @@ func (b *lazyCappedBody) Read(p []byte) (int, error) {
 	n, err := b.rc.Read(p)
 	b.remaining -= int64(n)
 	if b.remaining < 0 {
-		b.state.overflow.Store(true)
-		return n + int(b.remaining), &ResponseTooLargeError{}
+		return n + int(b.remaining), b.state.recordOverflow(b.status)
 	}
 	return n, err
 }
@@ -175,9 +270,9 @@ func declaresContentEncoding(h http.Header) bool {
 // responseLimitTransport bounds response bodies of requests marked with
 // withResponseLimit, before the SDK decodes or classifies them:
 //   - bodies of SDK success statuses and of statuses the SDK retries on status
-//     alone are read eagerly (32 MiB / 4 KiB). An overflow is a transport error
-//     with no response, which the SDK does not retry.
-//   - every other body is streamed through a lazy 4 KiB+1 window so the SDK and
+//     alone are read eagerly (the call ceiling / at most 4 KiB). An overflow is
+//     a transport error with no response, which the SDK does not retry.
+//   - every other body is streamed through a lazy min(ceiling, 4 KiB)+1 window so the SDK and
 //     net/http read it exactly when they would without a limit.
 //
 // Every counted byte is a transfer-decoded wire body byte: the request carries
@@ -208,30 +303,32 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 		setBuffered(resp, nil)
 		return resp, nil
 	}
+	limit := state.ceiling
+	if limit == 0 {
+		limit = gitLabMaxResponseBytes
+	}
 	switch code := resp.StatusCode; {
 	case statusSDKSuccess(code):
-		data, err := readBoundedBody(resp.Body, gitLabMaxResponseBytes)
+		data, err := readBoundedBody(resp.Body, limit)
 		if err != nil {
 			var tooLarge *ResponseTooLargeError
 			if errors.As(err, &tooLarge) {
-				state.overflow.Store(true)
-				return nil, err
+				return nil, state.recordOverflow(code)
 			}
 			return nil, newBodyReadError(err)
 		}
 		setBuffered(resp, data)
 	case statusRetriedBySDK(code):
-		data, err := readBoundedBody(resp.Body, min(gitLabMaxResponseBytes, gitLabMaxErrorResponseBytes))
+		data, err := readBoundedBody(resp.Body, min(limit, gitLabMaxErrorResponseBytes))
 		if err != nil {
 			var tooLarge *ResponseTooLargeError
 			if errors.As(err, &tooLarge) {
-				state.overflow.Store(true)
-				return nil, err
+				return nil, state.recordOverflow(code)
 			}
 		}
 		setBuffered(resp, data)
 	default:
-		resp.Body = &lazyCappedBody{rc: resp.Body, remaining: min(gitLabMaxResponseBytes, gitLabMaxErrorResponseBytes), state: state}
+		resp.Body = &lazyCappedBody{rc: resp.Body, remaining: min(limit, gitLabMaxErrorResponseBytes), state: state, status: code}
 	}
 	return resp, nil
 }
