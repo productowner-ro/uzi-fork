@@ -2,9 +2,9 @@
 
 **Issue:** [#1232](https://github.com/vtmocanu/uzi/issues/1232)
 **Parent epic:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Status:** Planned; requires merged #1226, #1227, #1228, #1230, #1231 and #1233. #1229 remains not planned, not an outstanding implementation dependency.
+**Status:** Re-scoped 2026-10-23 to structural assurance and epic close-out (see the issue): semantic enrollment, audit, blocker and context-generation dependencies are removed. The body below predates that and must be rewritten and reviewed before dispatch.
 **Priority:** Normal (current issue taxonomy).
-**Execution:** Keep `Planned` without `uzi`. Add `uzi` only after #1233 merges and main CI is green.
+**Execution:** Keep `Planned` without `uzi`. Superseded 2026-10-23: do not dispatch until the structural rewrite of this PRD is reviewed.
 
 This child owns no new completion contract or storage policy. It integrates merged children, proves default-on semantic rollout/rollback and closes the epic only after actual prerequisites are met. Structural default-on shipped in #1626/#1627; semantic default-on belongs to #1231, not a second flip here. No implementation or validation may modify `.github/workflows/**`.
 
