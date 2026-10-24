@@ -13,6 +13,12 @@ This file itself is exempt from the frontmatter contract below and from
 
 Repo contributors: see [Coordinated Codex runtime upgrades](./dev-conventions.md#coordinated-codex-runtime-upgrades).
 
+## Deployment
+
+- [Deploy on a single VPS](./vps-deployment.md): signed release images, host Caddy, admin bootstrap, workers and backup/restore checks.
+- [Installation](./installation.md): local development with Compose.
+- [Configuration](./configuration.md): environment and service settings.
+
 ## Adding a page
 
 1. Create `docs/<slug>.md`. The slug is the filename; it becomes the route

@@ -259,7 +259,7 @@ uzi is not a finished product. It has just enough built to show where it is head
 
 Full docs live in [docs/](docs/), and the same golden-path pages are browsable in-app under **Docs**.
 
-**Getting started:** [Getting started](docs/getting-started.md) · [Installation (dev)](docs/installation.md) · [Configuration](docs/configuration.md) · [Anthropic token](docs/anthropic-token.md) · [Worker setup](docs/worker-setup.md) · bot setup for [GitLab](docs/gitlab-bot-setup.md) / [GitHub](docs/github-bot-setup.md) / [Forgejo](docs/forgejo-bot-setup.md)
+**Getting started:** [Getting started](docs/getting-started.md) · [Installation (dev)](docs/installation.md) · [Deploy on a single VPS](docs/vps-deployment.md) · [Configuration](docs/configuration.md) · [Anthropic token](docs/anthropic-token.md) · [Worker setup](docs/worker-setup.md) · bot setup for [GitLab](docs/gitlab-bot-setup.md) / [GitHub](docs/github-bot-setup.md) / [Forgejo](docs/forgejo-bot-setup.md)
 
 **Using uzi:** [Board](docs/board.md) · [CLI](docs/cli.md) · [Autopilot](docs/autopilot.md) · [Chat](docs/chat.md) · [Slack](docs/slack.md) · [Handoff](docs/handoff.md) · [Judge](docs/judge.md) · [Findings](docs/findings.md) · [Scheduling](docs/scheduling.md) · [Memory](docs/memory.md) · [Agent templates](docs/agent-templates.md)
 
