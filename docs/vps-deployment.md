@@ -8,7 +8,7 @@ audience: operator
 
 You can run uzi alongside the services already on your VPS, using your existing reverse proxy and backup routine. In this tutorial, we will publish uzi at `https://your_domain` and bring a worker online without exposing the API or database directly.
 
-The stack has four roles: `db` stores application data in PostgreSQL; `api` handles authentication, configuration, and work coordination; `web` serves the interface and proxies API requests; and `agent` runs work against your repositories. Docker Compose keeps their network, persistent volumes, and startup dependencies together while letting you start the worker separately. We will use the dedicated [server Compose file](../deploy/compose/compose.yml) and signed images from your selected release. This file uses the base-agent template and excludes the optional Docker-in-Docker (DinD) services; see [Worker setup](./worker-setup.md) for other worker options.
+The stack has four roles: `db` stores application data in PostgreSQL; `api` handles authentication, configuration, and work coordination; `web` serves the interface and proxies API requests; and `agent` runs work against your repositories. Docker Compose keeps their network, persistent volumes, and startup dependencies together while letting you start the worker separately. This repository's VPS recipe adapts the dedicated [server Compose file](../deploy/compose/compose.yml) and existing [environment initializer](../scripts/init-env.sh), originally written for local Compose, to a layout downloaded from a release tag. We will use signed images from that same release. The server Compose file uses the base-agent template and excludes the optional Docker-in-Docker (DinD) services; see [Worker setup](./worker-setup.md) for other worker options.
 
 ## Prerequisites
 
@@ -24,7 +24,7 @@ Before you begin, check that you have:
 
 ## Step 1 - Download the release configuration and verify images
 
-We will keep the release configuration in a stable directory so Compose continues to find the same project and volumes on later visits.
+We will keep the tagged release files in a stable directory, with the initializer under `scripts/` and `.env.example` in its parent, so the existing initializer works with this layout and Compose continues to find the same project and volumes on later visits.
 
 Create `/opt/uzi` for this deployment; choose another stable path if your server uses a different service layout:
 
@@ -44,7 +44,7 @@ Enter the deployment directory and run the remaining Compose commands from here:
 cd /opt/uzi
 ```
 
-Choose a release at [GitHub Releases](https://github.com/vtmocanu/uzi/releases) **that contains `deploy/compose/compose.yml`**. Older releases, including `0.85.2`, do not contain this file. Set the shell variable below to your chosen release number **without the leading `v`**, replacing the placeholder before running it:
+Choose a release at [GitHub Releases](https://github.com/vtmocanu/uzi/releases) **that contains `deploy/compose/compose.yml`**. Set the shell variable below to your chosen release number **without the leading `v`**, replacing the placeholder before running it:
 
 ```sh
 UZI_VERSION='<release-number-without-v>'
