@@ -36,18 +36,6 @@ The release + deploy runbook for uzi (PRD #52). Three deploy topologies:
   via **ArgoCD**, GitOps, the way the rest of the platform deploys. This file is about
   that path: cutting a release and getting it live.
 
-The original paths cover laptop source builds and Kubernetes servers; the dedicated
-server file fills the single-VPS path without requiring Kubernetes. Deployment
-precedents include Immich's [release-attached Compose file](https://github.com/immich-app/immich/releases/latest/download/docker-compose.yml)
-and [installation guide](https://immich.app/docs/install/docker-compose),
-[Supabase's main-repository `docker/docker-compose.yml`](https://github.com/supabase/supabase/tree/master/docker),
-and [Plausible's separate `community-edition` repository](https://github.com/plausible/community-edition)
-with `compose.yml` tagged per release. uzi follows the Supabase shape: keep the
-server file in the main repository, versioned with the code, with a parity guard
-against the source-build stack and no release-workflow change. The VPS procedure
-downloads files from release tags, replacing the VPS guide's clone-and-override
-procedure with three file downloads.
-
 The chart is `chart/` (an umbrella chart: web + api + the CloudNativePG `cluster`
 subchart). Per-cluster values live in the private GitOps repo, not this repo:
 `argo-apps:apps/uzi/values/dev-cluster.yaml`. The in-repo `values/` holds
