@@ -108,6 +108,14 @@ Answer each with cited source (module, version, file, function) and, where testa
    - "No client" means no state-changing request: create, start, restart, exec, archive, unpause, volume create or build. List and justify the read-only probes, including M0's own inventory queries.
 5. **Postures.** Answer every question above for both the rootless and the rootful hosted wiring. A posture not covered is unsupported and defers.
 6. **Eligibility estimate.** Record read-only inventory counts per container state (counts only; no pod, namespace or node names), sampled by the lead on hosted workers before dispatch. Estimate how often a realistic idle worker would pass the eligibility check.
+   - **Lead's sample (2026-10-24, read-only, 11 hosted Docker-lane workers, Engine 29.8.0 images):**
+     - running containers: 0 on 10 of 11 (one worker was busy, with 2 running);
+     - exited containers: present on 7 of 11 (1, 2, 2, 5, 5, 6 and 27 per worker), none on 4;
+     - containers with a restart policy other than `no`: 0 on all 11;
+     - volumes: 0 to 122 per worker, of which 0 with a non-local driver or non-empty `Options`;
+     - attempt dirs under `/data/runner`: 0 to 22 per worker.
+
+     At that instant, the candidate predicate (no running, restarting or paused containers, and only local volumes without options) passes on 10 of 11 workers. Adding "restart policy `no` for every container" also passes 10 of 11. A "zero containers in any state" rule would pass only 4 of 11.
 7. **Cadence.** Compare how often an evidenced epoch occurs (rollouts, DinD maintenance recycles) with the fill rate recorded in #3329.
    - Note what is lost: a plain pod delete or an eviction can leave the old pod still terminating when the successor starts, so the one-shot is consumed and that epoch defers.
    - Answer whether an idle worker under pressure can request its own pod recycle through the existing server-fenced maintenance, to create an epoch on demand.
