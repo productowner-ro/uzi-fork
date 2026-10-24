@@ -6,9 +6,9 @@ audience: operator
 
 # Run uzi on a VPS with Docker Compose
 
-You can run uzi alongside the services already on your VPS, using your existing reverse proxy and backup routine. In this tutorial, we will publish uzi at `https://their-domain` and bring a worker online without exposing the API or database directly.
+You can run uzi alongside the services already on your VPS, using your existing reverse proxy and backup routine. In this tutorial, we will publish uzi at `https://your_domain` and bring a worker online without exposing the API or database directly.
 
-The stack has four roles: `db` stores application data in PostgreSQL; `api` handles authentication, configuration, and work coordination; `web` serves the interface and proxies API requests; and `agent` runs work against your repositories. Docker Compose keeps their network, persistent volumes, and startup dependencies together while letting you start the worker separately. We will use the source configuration and signed images from release **v0.85.2**, rather than build application images on the VPS.
+The stack has four roles: `db` stores application data in PostgreSQL; `api` handles authentication, configuration, and work coordination; `web` serves the interface and proxies API requests; and `agent` runs work against your repositories. Docker Compose keeps their network, persistent volumes, and startup dependencies together while letting you start the worker separately. We will use the source configuration and signed images from your selected release, rather than build application images on the VPS.
 
 ## Prerequisites
 
@@ -16,13 +16,13 @@ Before you begin, check that you have:
 
 - A Debian or Ubuntu VPS with a sudo-capable account and an existing firewall policy allowing your reverse proxy's HTTP/HTTPS traffic. See [Initial Server Setup with Ubuntu](https://www.digitalocean.com/community/tutorials/initial-server-setup-with-ubuntu) if you need to prepare these first.
 - Docker Engine and **Docker Compose 2.24.4 or newer**. See Docker's [Ubuntu installation guide](https://docs.docker.com/engine/install/ubuntu/) and [Compose plugin installation guide](https://docs.docker.com/compose/install/linux/). This tutorial uses the [Compose reset and override tags](https://docs.docker.com/reference/compose-file/merge/).
-- A domain whose A record points to your VPS. Follow the [DigitalOcean DNS record guide](https://docs.digitalocean.com/products/networking/dns/how-to/manage-records/) with your DNS provider, and replace `their-domain` throughout this tutorial.
+- A domain whose A record points to your VPS. Follow the [DigitalOcean DNS record guide](https://docs.digitalocean.com/products/networking/dns/how-to/manage-records/) with your DNS provider, and replace `your_domain` throughout this tutorial.
 - An existing TLS reverse proxy serving other applications. We include Caddy and nginx routing examples below; if you need to set one up first, see [How To Host a Website with Caddy on Ubuntu](https://www.digitalocean.com/community/tutorials/how-to-host-a-website-with-caddy-on-ubuntu-22-04).
 - Spare capacity for uzi in addition to your existing services. The worker alone defaults to **2 CPUs and 4 GiB RAM**; allow additional memory, CPU, and persistent disk for PostgreSQL, the API, web, repositories, and tool caches. See [worker sizing](./worker-setup.md#resource-stats-and-sizing).
-- `curl`, `tar`, and `openssl`, plus a current `cosign` installed using the [cosign installation guide](https://docs.sigstore.dev/cosign/system_config/installation/). See [Container signing](./container-signing.md) for the supported verifier guidance.
+- Git and `openssl`, plus a current `cosign` installed using the [cosign installation guide](https://docs.sigstore.dev/cosign/system_config/installation/). See [Container signing](./container-signing.md) for the supported verifier guidance.
 - An existing way to protect credentials and copy backups off the VPS.
 
-## Step 1 - Download the release and verify its images
+## Step 1 - Clone the repository and verify release images
 
 We will keep the release configuration in a stable directory so Compose continues to find the same project and volumes on later visits.
 
@@ -38,16 +38,10 @@ Give your current account ownership of this new directory so you can maintain it
 sudo chown "$USER":"$(id -gn)" /opt/uzi
 ```
 
-Download the upstream source archive for the release we will deploy:
+Clone the upstream repository into that directory:
 
 ```sh
-curl -fL https://github.com/vtmocanu/uzi/archive/refs/tags/v0.85.2.tar.gz -o /opt/uzi/v0.85.2.tar.gz
-```
-
-Extract the archive into that directory, removing the archive's enclosing directory component:
-
-```sh
-tar -xzf /opt/uzi/v0.85.2.tar.gz -C /opt/uzi --strip-components=1
+git clone https://github.com/vtmocanu/uzi.git /opt/uzi
 ```
 
 Enter the deployment directory and run the remaining Compose commands from here:
@@ -56,63 +50,63 @@ Enter the deployment directory and run the remaining Compose commands from here:
 cd /opt/uzi
 ```
 
-Verify the API image against the upstream release workflow identity and GitHub Actions issuer. Stop if verification fails:
+Initialize the deployment environment using the same helper as the [installation guide](./installation.md#configure):
 
 ```sh
-cosign verify --certificate-identity 'https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v0.85.2' --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' ghcr.io/vtmocanu/uzi/api:0.85.2
+./scripts/init-env.sh
+```
+
+The initializer creates a new `.env` with mode `0600`, starting from `.env.example`, and generates `JWT_SECRET`, `UZI_SECRET_KEY`, and `POSTGRES_PASSWORD` without displaying their values. It leaves an existing `.env` untouched and fails if that file lacks a required secret. Stop if initialization fails; do not continue to edit the file or start services.
+
+Choose the latest release at [GitHub Releases](https://github.com/vtmocanu/uzi/releases). Edit `.env` to add one unquoted assignment for your selected version; this value is illustrative. The image tag has no leading `v`:
+
+```dotenv
+UZI_VERSION=0.85.2
+```
+
+Read just that assignment into your shell; do not source `.env`, which contains secrets:
+
+```sh
+UZI_VERSION=$(sed -n 's/^UZI_VERSION=//p' .env)
+```
+
+Check out the matching release configuration:
+
+```sh
+git checkout "v${UZI_VERSION}"
+```
+
+Stop if checkout fails. Verify the API image against the upstream release workflow identity and GitHub Actions issuer. Stop if verification fails:
+
+```sh
+cosign verify --certificate-identity "https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v${UZI_VERSION}" --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' "ghcr.io/vtmocanu/uzi/api:${UZI_VERSION}"
 ```
 
 Verify the matching web image with the same identity:
 
 ```sh
-cosign verify --certificate-identity 'https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v0.85.2' --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' ghcr.io/vtmocanu/uzi/web:0.85.2
+cosign verify --certificate-identity "https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v${UZI_VERSION}" --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' "ghcr.io/vtmocanu/uzi/web:${UZI_VERSION}"
 ```
 
 Verify the base-template worker image as well:
 
 ```sh
-cosign verify --certificate-identity 'https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v0.85.2' --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' ghcr.io/vtmocanu/uzi/agent-base:0.85.2
+cosign verify --certificate-identity "https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v${UZI_VERSION}" --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' "ghcr.io/vtmocanu/uzi/agent-base:${UZI_VERSION}"
 ```
 
-These commands verify registry images, not the source archive; see [Container signing](./container-signing.md) for the signing boundary and digest-based verification. Keep this directory name stable: changing it changes Compose's default project name and can make existing named volumes appear to be missing. Do not extract another release over this deployment's configuration during an upgrade.
+These commands verify registry images, not the cloned source; see [Container signing](./container-signing.md) for the signing boundary and digest-based verification. Keep this directory name stable: changing it changes Compose's default project name and can make existing named volumes appear to be missing. Preserve this deployment's `.env` and override files during an upgrade.
 
-You now have the v0.85.2 configuration in a stable directory and have verified its three application images.
+You now have your selected release's configuration in a stable directory and have verified its three application images.
 
 ## Step 2 - Configure secrets and choose an admin bootstrap
 
 We will configure the public origin and choose how to create the first administrator before the API starts.
 
-For a fresh installation, create `.env` from the release's `.env.example` in a directory you control. The `.env` path must be absent:
-
-```sh
-(umask 077; set -C; cat .env.example > .env)
-```
-
-The new file has owner-only access from creation. Noclobber (`set -C`) refuses to overwrite an existing regular file; it does not protect against arbitrary nonregular paths. This command does not repair permissions on an existing file. If the command fails for any reason, stop before editing `.env` or starting services.
-
-Generate a session signing key and paste its output into `JWT_SECRET` in `.env`:
-
-```sh
-openssl rand -hex 64
-```
-
-Generate the encryption master key and paste its output into `UZI_SECRET_KEY`:
-
-```sh
-openssl rand -base64 32
-```
-
-Generate the database password and paste its output into `POSTGRES_PASSWORD`:
-
-```sh
-openssl rand -hex 24
-```
-
-Edit `.env` using your usual editor. Keep the generated values and the default `POSTGRES_USER=uzi` and `POSTGRES_DB=uzi`. Set the following entries, replacing the domain, seed email, and seed password. Choose a unique seed password of at least 12 characters; single-quote it in `.env` if it contains characters Compose might interpolate:
+Edit the `.env` initialized in Step 1 using your usual editor. Retain the generated secrets, your selected `UZI_VERSION`, and the default `POSTGRES_USER=uzi` and `POSTGRES_DB=uzi`. Set the following entries, replacing the domain, seed email, and seed password. Choose a unique seed password of at least 12 characters; single-quote it in `.env` if it contains characters Compose might interpolate:
 
 ```dotenv
-FRONTEND_ORIGIN=https://their-domain
-UZI_PUBLIC_BASE_URL=https://their-domain
+FRONTEND_ORIGIN=https://your_domain
+UZI_PUBLIC_BASE_URL=https://your_domain
 TRUSTED_PROXIES=
 UZI_REGISTRATION_ENABLED=false
 UZI_SEED_EMAIL=you@example.com
@@ -133,21 +127,21 @@ Your installation now has persistent secrets, a matching HTTPS origin and public
 
 ## Step 3 - Select release images and start the application
 
-We will override the archive's local build definitions so the VPS runs the verified release images.
+We will override the release configuration's local build definitions so the VPS runs the verified release images.
 
-Create `compose.override.yml` in `/opt/uzi` with the following content. Keep the image versions together when choosing a different release. `!reset null` removes each inherited build definition; Compose 2.24.4 or newer also supports the optional `!override` port replacement below:
+Create `compose.override.yml` in `/opt/uzi` with the following content. Compose reads `UZI_VERSION` from `.env` so the three application images use the selected release. `!reset null` removes each inherited build definition; Compose 2.24.4 or newer also supports the optional `!override` port replacement below:
 
 ```yaml
 services:
   api:
     build: !reset null
-    image: ghcr.io/vtmocanu/uzi/api:0.85.2
+    image: ghcr.io/vtmocanu/uzi/api:${UZI_VERSION}
   web:
     build: !reset null
-    image: ghcr.io/vtmocanu/uzi/web:0.85.2
+    image: ghcr.io/vtmocanu/uzi/web:${UZI_VERSION}
   agent:
     build: !reset null
-    image: ghcr.io/vtmocanu/uzi/agent-base:0.85.2
+    image: ghcr.io/vtmocanu/uzi/agent-base:${UZI_VERSION}
 ```
 
 The base file publishes web at `127.0.0.1:8080`. If that port is occupied, incorporate this replacement into the **existing `web` stanza** in your override, retaining its build reset and image. Do not add a second `web` key. Then use port `18080` in both proxy examples in Step 4:
@@ -155,7 +149,7 @@ The base file publishes web at `127.0.0.1:8080`. If that port is occupied, incor
 ```yaml
   web:
     build: !reset null
-    image: ghcr.io/vtmocanu/uzi/web:0.85.2
+    image: ghcr.io/vtmocanu/uzi/web:${UZI_VERSION}
     ports: !override ["127.0.0.1:18080:8080"]
 ```
 
@@ -165,7 +159,7 @@ Render the merged configuration, including the worker profile, **before pulling 
 docker compose -f docker-compose.yml -f compose.override.yml --profile agent config
 ```
 
-Check that `api`, `web`, and `agent` have no `build` entries and use the three `0.85.2` images above; `web` publishes only your selected loopback port; `api` and `db` have no published ports; and `agent` retains its `agent` profile. Confirm `pgdata` mounts at `/var/lib/postgresql/data`, `agentdata` at `/data`, `agentnix` at `/nix`, and `worker_token` feeds `/run/secrets/worker_token` with `UZI_WORKER_TOKEN_FILE` pointing there. Stop and correct the files if these checks fail. The token source is intentionally empty at this stage.
+Check that `api`, `web`, and `agent` have no `build` entries and use the three images above with your selected version; `web` publishes only your selected loopback port; `api` and `db` have no published ports; and `agent` retains its `agent` profile. Confirm `pgdata` mounts at `/var/lib/postgresql/data`, `agentdata` at `/data`, `agentnix` at `/nix`, and `worker_token` feeds `/run/secrets/worker_token` with `UZI_WORKER_TOKEN_FILE` pointing there. Stop and correct the files if these checks fail. The token source is intentionally empty at this stage.
 
 Pull the database and three application images without activating the worker:
 
@@ -195,16 +189,11 @@ We will route the public domain to web so the browser uses one HTTPS origin for 
 
 Choose the example for your existing proxy. These examples assume the proxy runs on the VPS host. For a containerized proxy, `127.0.0.1` refers to that proxy container, not the host: adapt its network and web upstream for your topology while keeping the API and database unpublished.
 
-For **Caddy**, add this site block to your existing `/etc/caddy/Caddyfile`. Replace `their-domain`, and change `8080` to `18080` if you selected the alternate port. Caddy preserves Host for this HTTP upstream and handles WebSocket upgrades; the explicit `/api/ws` handler documents that route:
+For **Caddy**, add this site block to your existing `/etc/caddy/Caddyfile`. Replace `your_domain`, and change `8080` to `18080` if you selected the alternate port. Caddy preserves Host for this HTTP upstream and automatically handles WebSocket upgrades:
 
 ```caddyfile
-their-domain {
-    handle /api/ws {
-        reverse_proxy 127.0.0.1:8080
-    }
-    handle {
-        reverse_proxy 127.0.0.1:8080
-    }
+your_domain {
+    reverse_proxy 127.0.0.1:8080
 }
 ```
 
@@ -220,7 +209,7 @@ If validation succeeds, reload your existing Caddy service:
 sudo systemctl reload caddy
 ```
 
-For **nginx**, adapt the following locations inside your existing TLS `server` block for `their-domain`. Keep your working certificate settings, and replace the upstream port if needed. Host and the WebSocket upgrade headers must reach web; the exact `/api/ws` location keeps its connection open for live updates. Set upload limits and timeouts for your workload using the existing packaged web configuration as a reference:
+For **nginx**, adapt the following locations inside your existing TLS `server` block for `your_domain`. Keep your working certificate settings, and replace the upstream port if needed. Host and the WebSocket upgrade headers must reach web; the exact `/api/ws` location keeps its connection open for live updates. Set upload limits and timeouts for your workload using the existing packaged web configuration as a reference:
 
 ```nginx
 location = /api/ws {
@@ -266,7 +255,7 @@ Your existing proxy now serves the uzi interface and `/api/ws` through HTTPS, wi
 
 We will verify administrator access over the public HTTPS origin before issuing a worker token.
 
-Open `https://their-domain`. For the recommended seeded bootstrap, sign in using the seed email and password and confirm that you can open the admin settings. Registration remains disabled. Changing the seed password in `.env` does not overwrite a password already stored in the database.
+Open `https://your_domain`. For the recommended seeded bootstrap, sign in using the seed email and password and confirm that you can open the admin settings. Registration remains disabled. Changing the seed password in `.env` does not overwrite a password already stored in the database.
 
 For the alternative bootstrap, register your account while access remains restricted, confirm that it is admin, and immediately edit `.env` to set `UZI_REGISTRATION_ENABLED=false`. Recreate the API so it reads that change:
 
@@ -320,19 +309,11 @@ Return to **Settings → Workers** and wait for the worker to appear online. If 
 
 Your base-template worker is now online and registered to your account.
 
-## Step 7 - Back up the database and rehearse a restore
+## Step 7 - Back up the database and configuration
 
-We will preserve application data together with its encryption key and prove that a backup can be restored away from the live database.
+We will preserve application data together with its encryption key. You can use your existing PostgreSQL-aware backup tool or the optional backup container below.
 
-You can use your existing PostgreSQL-aware backup tool. For a manual custom-format dump with the default `uzi` role and database, run the following command from `/opt/uzi`, in a directory you control. The output path must be absent on every run; choose another absent filename if `uzi-backup.dump` already exists:
-
-```sh
-(umask 077; set -C; docker compose -f docker-compose.yml -f compose.override.yml exec -T db pg_dump -U uzi -d uzi -Fc > uzi-backup.dump)
-```
-
-The newly created dump has owner-only access from creation. Noclobber (`set -C`) protects an existing regular file from overwrite; it does not protect against arbitrary nonregular paths. If the command fails, it can leave an incomplete dump that is not suitable for backup. Inspect and remove only the newly created failed output before retrying, or choose a new absent path. Preserve any existing file that noclobber refused to overwrite. If you choose another filename, use that filename in the manual restore command below too.
-
-Protect this dump with your existing backup controls. Back up `.env` above all, including **the original `UZI_SECRET_KEY`**, along with `compose.override.yml` and your release version record. A database dump without its encryption key cannot recover the encrypted tokens. Preserve the worker volumes if you need its local repositories and caches; a database dump does not include them. Copy backups and protected configuration off-host using your existing routine.
+Back up `.env` above all, including **the original `UZI_SECRET_KEY`**, along with `compose.override.yml` and your release version record. A database dump without its encryption key cannot recover the encrypted tokens. Preserve the worker volumes if you need its local repositories and caches; a database dump does not include them. Copy backups and protected configuration off-host using your existing routine.
 
 If you want a dedicated backup container, add the following `db-backup` service **under the same `services` mapping in `compose.override.yml`**; retain the three application overrides. This optional example uses [nfrastack/db-backup 5.0.5](https://nfrastack.com/db-backup/container), PostgreSQL settings, a first backup five minutes after startup, and a daily interval. Change the schedule and host directory to suit your routine. `/opt/uzi/backups` must be writable by its documented backup uid, `10000`; protect the directory and its archives. The service uses the default Compose network to reach `db`:
 
@@ -386,64 +367,11 @@ Run its built-in `backup-now` helper to test a backup immediately rather than wa
 docker compose -f docker-compose.yml -f compose.override.yml exec db-backup backup-now
 ```
 
-Inspect the backup logs and select a completed archive under `/opt/uzi/backups`. This tool uses its own PostgreSQL SQL/COPY export, with **Zstandard compression by default**, rather than the `pg_dump -Fc` archive shown earlier. Restore its archives with its own restore command; use PostgreSQL's `pg_restore` for the manual custom-format dump. See the upstream [backup recipes](https://nfrastack.com/db-backup/recipes/backup) and [restore recipes](https://nfrastack.com/db-backup/recipes/restore) for supported options and archive selection. The auto-generated configuration lives at `/config/db-backup.yml`; mounting an existing config there changes how environment-based configuration is applied, so this example leaves that path unmounted.
+Inspect the backup logs and confirm that a completed archive exists under `/opt/uzi/backups`. See the upstream [backup recipes](https://nfrastack.com/db-backup/recipes/backup) for supported options and archive selection. The auto-generated configuration lives at `/config/db-backup.yml`; mounting an existing config there changes how environment-based configuration is applied, so this example leaves that path unmounted.
 
-For a disposable restore target, add this `restore-db` service under the **same override's `services` mapping**. It has no published port, uses a separate database and anonymous data volume, and starts only when requested. It reuses the database password from `.env`; no application service points to it:
+Follow the upstream [restore recipe](https://nfrastack.com/db-backup/recipes/restore) to rehearse recovery in an isolated environment away from the live database. Verify application recovery with the preserved encryption key before relying on your recovery procedure; this tutorial does not perform a restore rehearsal.
 
-```yaml
-  restore-db:
-    image: postgres:17
-    profiles: ["restore"]
-    environment:
-      POSTGRES_USER: uzi
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      POSTGRES_DB: uzi_restore
-    volumes:
-      - /var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U uzi -d uzi_restore"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-```
-
-Render the expanded configuration privately, confirming that `restore-db` is separate from `db` and mounts no live database volume:
-
-```sh
-docker compose -f docker-compose.yml -f compose.override.yml --profile agent --profile restore config
-```
-
-Pull the disposable PostgreSQL image:
-
-```sh
-docker compose -f docker-compose.yml -f compose.override.yml --profile restore pull restore-db
-```
-
-Start the target and wait for its health check to pass:
-
-```sh
-docker compose -f docker-compose.yml -f compose.override.yml --profile restore up -d --no-build --wait restore-db
-```
-
-For a backup-container archive, replace `/backup/selected-archive.sql.zst` with the actual selected archive's path inside the backup container. `env://DB01_PASS` reads the password already configured in that container; the disposable target uses the same password. Explicit target flags override filename inference and direct the restore to **`restore-db:5432/uzi_restore`**, not live `db`:
-
-```sh
-docker compose -f docker-compose.yml -f compose.override.yml exec db-backup /app/dbb --config /config/db-backup.yml restore --file /backup/selected-archive.sql.zst --type postgres --host restore-db --port 5432 --user uzi --pass env://DB01_PASS --name uzi_restore
-```
-
-Alternatively, restore the manual `pg_dump -Fc` archive into that same disposable target using `pg_restore`, with errors stopping the restore:
-
-```sh
-docker compose -f docker-compose.yml -f compose.override.yml --profile restore exec -T restore-db pg_restore -U uzi -d uzi_restore --exit-on-error < uzi-backup.dump
-```
-
-Use a fresh, empty target for each rehearsal; do not run both restore methods into the same populated database. Inspect restored data and verify application recovery with the preserved encryption key in an isolated environment before relying on your recovery procedure. Do not point the live API at this rehearsal database. When finished, remove just the disposable service container and its anonymous volume:
-
-```sh
-docker compose -f docker-compose.yml -f compose.override.yml --profile restore rm -s -f -v restore-db
-```
-
-You now have a database backup, protected configuration copied off-host, and a restore rehearsal that leaves the live database untouched.
+You now have a database backup and protected configuration to copy off-host using your existing routine.
 
 ## Conclusion
 
@@ -451,16 +379,12 @@ You have uzi behind your existing HTTPS proxy and a worker ready to accept work.
 
 ## Reference
 
-The release configuration above is pinned to v0.85.2. Current-branch evidence below explains the implementation boundaries; it does not imply that later branch changes are present in those release images.
+Current-branch evidence below explains the implementation boundaries. Compare it with your chosen release; later branch changes may not be present in its configuration or images.
 
 | Scope | File and line evidence | What to check |
 |---|---|---|
-| Release v0.85.2 | [docker-compose.yml:29](https://github.com/vtmocanu/uzi/blob/v0.85.2/docker-compose.yml#L29), [253](https://github.com/vtmocanu/uzi/blob/v0.85.2/docker-compose.yml#L253), [303](https://github.com/vtmocanu/uzi/blob/v0.85.2/docker-compose.yml#L303) | Inherited API, web, and agent build definitions removed by the override. |
-| Release v0.85.2 | [docker-compose.yml:257](https://github.com/vtmocanu/uzi/blob/v0.85.2/docker-compose.yml#L257), [308](https://github.com/vtmocanu/uzi/blob/v0.85.2/docker-compose.yml#L308), [345](https://github.com/vtmocanu/uzi/blob/v0.85.2/docker-compose.yml#L345), [355](https://github.com/vtmocanu/uzi/blob/v0.85.2/docker-compose.yml#L355), [584](https://github.com/vtmocanu/uzi/blob/v0.85.2/docker-compose.yml#L584) | Loopback publication, worker profile and limits, token file, and environment-backed secret. |
-| Current branch | [docker-compose.yml:29](../docker-compose.yml#L29), [256](../docker-compose.yml#L256), [306](../docker-compose.yml#L306), [260](../docker-compose.yml#L260), [311](../docker-compose.yml#L311), [348](../docker-compose.yml#L348), [358](../docker-compose.yml#L358), [597](../docker-compose.yml#L597) | Corresponding build, port, profile, sizing, and secret wiring. |
+| Current branch | [scripts/init-env.sh:35](../scripts/init-env.sh#L35), [57](../scripts/init-env.sh#L57), [61](../scripts/init-env.sh#L61), [104](../scripts/init-env.sh#L104) | Existing-file guard, secret generation, private file creation, and final write. |
+| Current branch | [docker-compose.yml:29](../docker-compose.yml#L29), [256](../docker-compose.yml#L256), [306](../docker-compose.yml#L306), [260](../docker-compose.yml#L260), [311](../docker-compose.yml#L311), [348](../docker-compose.yml#L348), [358](../docker-compose.yml#L358), [597](../docker-compose.yml#L597) | Inherited build definitions, port, profile, sizing, and secret wiring. |
 | Current branch | [docker-compose.yml:36](../docker-compose.yml#L36), [124](../docker-compose.yml#L124), [177](../docker-compose.yml#L177), [.env.example:11](../.env.example#L11) | Origin, public URL, empty trusted proxies, and encryption-key loss warning. |
 | Current branch | [api/cmd/server/main.go:1982](../api/cmd/server/main.go#L1982), [api/internal/handler/auth.go:96](../api/internal/handler/auth.go#L96), [188](../api/internal/handler/auth.go#L188), [api/internal/config/config.go:1464](../api/internal/config/config.go#L1464) | Create-only seed, registration closure, first-user admin assignment, and Secure-cookie derivation. |
 | Current branch | [api/internal/middleware/ratelimit.go:229](../api/internal/middleware/ratelimit.go#L229), [239](../api/internal/middleware/ratelimit.go#L239), [web/nginx.conf:36](../web/nginx.conf#L36), [45](../web/nginx.conf#L45), [61](../web/nginx.conf#L61), [77](../web/nginx.conf#L77), [107](../web/nginx.conf#L107) | Direct-peer trust boundary, rightmost non-trusted hop, WebSocket route, and packaged forwarding-header overwrites. |
-| Compose implementation | [compose v2.24.4 pkg/compose/secrets.go:52](https://github.com/docker/compose/blob/v2.24.4/pkg/compose/secrets.go#L52), [compose-go v2.4.4 loader/environment.go:81](https://github.com/compose-spec/compose-go/blob/v2.4.4/loader/environment.go#L81) | A defined empty environment secret differs from an absent variable; inspect your merged configuration before startup. |
-| Backup container 5.0.5 | [container/rootfs/usr/local/bin/backup-now:43](https://github.com/nfrastack/db-backup/blob/5.0.5/container/rootfs/usr/local/bin/backup-now#L43), [container/rootfs/container/defaults/10-dbbackup:7](https://github.com/nfrastack/db-backup/blob/5.0.5/container/rootfs/container/defaults/10-dbbackup#L7), [container/rootfs/container/functions/10-dbbackup:36](https://github.com/nfrastack/db-backup/blob/5.0.5/container/rootfs/container/functions/10-dbbackup#L36), [94](https://github.com/nfrastack/db-backup/blob/5.0.5/container/rootfs/container/functions/10-dbbackup#L94) | Built-in immediate backup, generated config path, existing-config handling, and compression fallback. |
-| Backup implementation | [5.0.5 src/internal/database/engine/postgres/postgres.go:147](https://github.com/nfrastack/db-backup/blob/5.0.5/src/internal/database/engine/postgres/postgres.go#L147), [src/cmd/dbb/restore.go:65](https://github.com/nfrastack/db-backup/blob/5.0.5/src/cmd/dbb/restore.go#L65) | Pinned native PostgreSQL exporter, explicit restore target flags, and environment-sourced password support. |
