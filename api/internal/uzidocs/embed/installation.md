@@ -6,10 +6,11 @@ audience: operator
 
 # Installation
 
-For an existing VPS with Docker, a TLS reverse proxy, and other services, follow
+For an existing VPS with Docker, a TLS reverse proxy, and other services, use the
+[server Compose file](../deploy/compose/compose.yml) with
 [Run uzi on a VPS with Docker Compose](./vps-deployment.md). It covers signed release
-images, HTTPS, administrator bootstrap, worker registration, and backups. The steps
-below are the local source-build path.
+images, HTTPS, administrator bootstrap, worker registration, and backups. Choose a
+release containing that server file. The steps below are the local source-build path.
 
 ## Prerequisites
 
