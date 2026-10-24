@@ -82,17 +82,13 @@ You now have the v0.85.2 configuration in a stable directory and have verified i
 
 We will configure the public origin and choose how to create the first administrator before the API starts.
 
-Copy the release's `.env.example` to a new `.env` file; do this for a fresh deployment, since it replaces an existing destination:
+For a fresh installation, create `.env` from the release's `.env.example` in a directory you control. The `.env` path must be absent:
 
 ```sh
-cp .env.example .env
+(umask 077; set -C; cat .env.example > .env)
 ```
 
-Restrict access to the file before filling in credentials:
-
-```sh
-chmod 600 .env
-```
+The new file has owner-only access from creation. Noclobber (`set -C`) refuses to overwrite an existing regular file; it does not protect against arbitrary nonregular paths. This command does not repair permissions on an existing file. If the command fails for any reason, stop before editing `.env` or starting services.
 
 Generate a session signing key and paste its output into `JWT_SECRET` in `.env`:
 
@@ -328,11 +324,13 @@ Your base-template worker is now online and registered to your account.
 
 We will preserve application data together with its encryption key and prove that a backup can be restored away from the live database.
 
-You can use your existing PostgreSQL-aware backup tool. For a manual custom-format dump with the default `uzi` role and database, run the following command from `/opt/uzi`; select a fresh output filename each time so you do not overwrite an earlier backup:
+You can use your existing PostgreSQL-aware backup tool. For a manual custom-format dump with the default `uzi` role and database, run the following command from `/opt/uzi`, in a directory you control. The output path must be absent on every run; choose another absent filename if `uzi-backup.dump` already exists:
 
 ```sh
-docker compose -f docker-compose.yml -f compose.override.yml exec -T db pg_dump -U uzi -d uzi -Fc > uzi-backup.dump
+(umask 077; set -C; docker compose -f docker-compose.yml -f compose.override.yml exec -T db pg_dump -U uzi -d uzi -Fc > uzi-backup.dump)
 ```
+
+The newly created dump has owner-only access from creation. Noclobber (`set -C`) protects an existing regular file from overwrite; it does not protect against arbitrary nonregular paths. If the command fails, it can leave an incomplete dump that is not suitable for backup. Inspect and remove only the newly created failed output before retrying, or choose a new absent path. Preserve any existing file that noclobber refused to overwrite. If you choose another filename, use that filename in the manual restore command below too.
 
 Protect this dump with your existing backup controls. Back up `.env` above all, including **the original `UZI_SECRET_KEY`**, along with `compose.override.yml` and your release version record. A database dump without its encryption key cannot recover the encrypted tokens. Preserve the worker volumes if you need its local repositories and caches; a database dump does not include them. Copy backups and protected configuration off-host using your existing routine.
 
