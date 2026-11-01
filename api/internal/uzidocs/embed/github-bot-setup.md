@@ -148,6 +148,7 @@ Status field. On the Project itself, open its **⋯ menu → Manage access**
 step](./github-project-sync.md#the-adopt-flow-step-by-step).
 
 ## 5. Connect the bot in uzi
+The startup seed entries `UZI_SEED_FORGE_*` connect GitLab only (`api/internal/seed/seed.go`), so connect a GitHub bot on this page.
 
 1. Log in and open **Settings → Forge**.
 2. Pick a base URL and forge type (only the operator-configured allowlist is
