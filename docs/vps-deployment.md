@@ -10,17 +10,19 @@ You can run uzi alongside the services already on your VPS, using your existing 
 
 The stack has four roles: `db` stores application data in PostgreSQL; `api` handles authentication, configuration, and work coordination; `web` serves the interface and proxies API requests; and `agent` runs work against your repositories. Docker Compose keeps their network, persistent volumes, and startup dependencies together while letting you start the worker separately. This repository's VPS recipe adapts the dedicated [server Compose file](../deploy/compose/compose.yaml) and existing [environment initializer](../scripts/init-env.sh), originally written for local Compose, to a layout downloaded from a release tag. We will use signed images from that same release. The server Compose file uses the base-agent template and excludes the optional Docker-in-Docker (DinD) services; see [Worker setup](./worker-setup.md) for other worker options.
 
+Once the prerequisites are ready, expect about 15 minutes of work. We timed that on a new 4 vCPU, 8 GB server, from the first command to a worker online. Most of it is the image download in Step 3.
+
 ## Prerequisites
 
 Before you begin, check that you have:
 
 - A Debian or Ubuntu VPS with a sudo-capable account and an existing firewall policy allowing your reverse proxy's HTTP/HTTPS traffic. See [Initial Server Setup with Ubuntu](https://www.digitalocean.com/community/tutorials/initial-server-setup-with-ubuntu) if you need to prepare these first.
-- Docker Engine and the **Docker Compose v2 plugin**. See Docker's [Ubuntu installation guide](https://docs.docker.com/engine/install/ubuntu/) and [Compose plugin installation guide](https://docs.docker.com/compose/install/linux/).
+- Docker Engine and the **Docker Compose v2 plugin**. See Docker's [Ubuntu installation guide](https://docs.docker.com/engine/install/ubuntu/) and [Compose plugin installation guide](https://docs.docker.com/compose/install/linux/). The commands below run `docker` without `sudo`, so add your account to the `docker` group by following Docker's [post-installation steps](https://docs.docker.com/engine/install/linux-postinstall/), then log in again.
 - A domain whose A record points to your VPS. Follow the [DigitalOcean DNS record guide](https://docs.digitalocean.com/products/networking/dns/how-to/manage-records/) with your DNS provider, and replace `your_domain` throughout this tutorial.
-- An existing TLS reverse proxy serving other applications. We include Caddy and nginx routing examples below; if you need to set one up first, see [How To Host a Website with Caddy on Ubuntu](https://www.digitalocean.com/community/tutorials/how-to-host-a-website-with-caddy-on-ubuntu-22-04).
-- Spare capacity for uzi in addition to your existing services. The worker alone defaults to **2 CPUs and 4 GiB RAM**; allow additional memory, CPU, and persistent disk for PostgreSQL, the API, web, repositories, and tool caches. See [worker sizing](./worker-setup.md#resource-stats-and-sizing).
-- `curl`, Bash, and `openssl`, plus a current `cosign` installed using the [cosign installation guide](https://docs.sigstore.dev/cosign/system_config/installation/). See [Container signing](./container-signing.md) for the supported verifier guidance.
-- An existing way to protect credentials and copy backups off the VPS.
+- A TLS reverse proxy. We include Caddy and nginx routing examples below. If this server has no proxy yet, install [Caddy](https://caddyserver.com/docs/install#debian-ubuntu-raspbian), which obtains certificates by itself.
+- Spare capacity for uzi in addition to your existing services. The worker alone defaults to **2 CPUs and 4 GiB RAM**. On its own, the stack ran on 4 vCPUs and 8 GB of RAM. It used 20 GB of disk after install: the images take about 11 GB and the volumes about 6 GB. Allow more disk for repositories and tool caches. See [worker sizing](./worker-setup.md#resource-stats-and-sizing).
+- `curl`, Bash, and `openssl`, plus a current `cosign` installed using the [cosign installation guide](https://docs.sigstore.dev/cosign/system_config/installation/). Ubuntu's `apt` does not carry `cosign`, so use the guide's `.deb` package and check its checksum. See [Container signing](./container-signing.md) for the supported verifier guidance.
+- A backup routine that copies your dumps and `.env` off the VPS. You choose the method. We recommend [restic](https://restic.net/).
 
 ## Step 1 - Download the release configuration and verify images
 
@@ -102,7 +104,7 @@ You now have your selected release's configuration in a stable directory and hav
 
 We will configure the public origin and choose how to create the first administrator before the API starts.
 
-Edit the `.env` initialized in Step 1 using your usual editor. Retain the generated secrets, your selected `UZI_VERSION`, and the default `POSTGRES_USER=uzi` and `POSTGRES_DB=uzi`. Set the following entries, replacing the domain, seed email, and seed password. Choose a unique seed password of at least 12 characters; single-quote it in `.env` if it contains characters Compose might interpolate:
+Edit the `.env` initialized in Step 1 using your usual editor. Retain the generated secrets, your selected `UZI_VERSION`, and the default `POSTGRES_USER=uzi` and `POSTGRES_DB=uzi`. The initializer already wrote each entry below into `.env`, so change them in place and do not paste the block at the end. Set them, replacing the domain, seed email, seed password, and forge URL. Choose a unique seed password of at least 12 characters; single-quote it in `.env` if it contains characters Compose might interpolate. `FORGE_ALLOWED_BASE_URLS` lists the forges you can connect later, and the initializer leaves a placeholder there, so name your own forge:
 
 ```dotenv
 FRONTEND_ORIGIN=https://your_domain
@@ -113,6 +115,7 @@ UZI_SEED_EMAIL=you@example.com
 UZI_SEED_PASSWORD='replace-with-a-unique-admin-password'
 UZI_SEED_NAME=Administrator
 UZI_WORKER_TOKEN=
+FORGE_ALLOWED_BASE_URLS=https://github.com
 ```
 
 The recommended bootstrap creates a seeded admin with public registration disabled. Its trade-off is that the seed password remains in `.env` and the API container environment. The startup seed is **create-only**: it creates the configured email if absent and does not reset an existing account's password or permissions. This is a fresh-install procedure, not an admin recovery method.
@@ -145,7 +148,7 @@ docker compose -f compose.yaml --profile agent config
 
 Check that `api`, `web`, and `agent` use the three verified images with your selected version; `web` publishes only your selected loopback port; `api` and `db` have no published ports; and `agent` retains its `agent` profile. Confirm `pgdata` mounts at `/var/lib/postgresql/data`, `agentdata` at `/data`, `agentnix` at `/nix`, and `worker_token` feeds `/run/secrets/worker_token` with `UZI_WORKER_TOKEN_FILE` pointing there. Stop and correct the configuration if these checks fail. The token source is intentionally empty at this stage.
 
-Pull the database and three application images without activating the worker:
+Pull the database and three application images without activating the worker. The worker image alone is about 10 GB:
 
 ```sh
 docker compose -f compose.yaml --profile agent pull db api web agent
@@ -173,7 +176,7 @@ We will route the public domain to web so the browser uses one HTTPS origin for 
 
 Choose the example for your existing proxy. These examples assume the proxy runs on the VPS host. For a containerized proxy, `127.0.0.1` refers to that proxy container, not the host: adapt its network and web upstream for your topology while keeping the API and database unpublished.
 
-For **Caddy**, add this site block to your existing `/etc/caddy/Caddyfile`. Replace `your_domain`, and change `8080` to `18080` if you selected the alternate port. Caddy preserves Host for this HTTP upstream and automatically handles WebSocket upgrades:
+For **Caddy**, add this site block to your existing `/etc/caddy/Caddyfile`. A new Caddy install has a default `:80` block, and you can keep it. Replace `your_domain`, and change `8080` to `18080` if you selected the alternate port. Caddy preserves Host for this HTTP upstream and automatically handles WebSocket upgrades:
 
 ```caddyfile
 your_domain {
@@ -255,7 +258,7 @@ You now have a working administrator session over HTTPS with registration closed
 
 We will issue a join token for your account and deliver it through the release's existing Compose secret wiring.
 
-Open **Settings → Workers → Add a worker → Register your own worker**. Select the base template and copy the token, which is shown once. Edit the existing `UZI_WORKER_TOKEN=` entry in `.env` to contain that value, keeping the file private. This entry is the **source for the Compose secret**, not an environment variable to add to the agent container.
+Open **Settings → Workers → Add a worker → Register your own worker**. Give the worker a name, which is what the Workers page shows. Select the base template, select **Generate join token**, and copy the token, which is shown once. Edit the existing `UZI_WORKER_TOKEN=` entry in `.env` to contain that value, keeping the file private. This entry is the **source for the Compose secret**, not an environment variable to add to the agent container.
 
 The following excerpt is **already present in `compose.yaml`**; inspect it rather than adding duplicate definitions. It connects the `.env` source to the file the worker reads:
 
@@ -295,7 +298,7 @@ Your base-template worker is now online and registered to your account.
 
 ## Step 7 - Back up the database and configuration
 
-We will preserve application data together with its encryption key. You can use your existing PostgreSQL-aware backup tool or the optional backup container below.
+We will preserve application data together with its encryption key. Use your own backup routine with `pg_dump` from the `db` container, or the optional backup container below. The optional container writes to this server only, so it still needs your routine to copy its archives off-host.
 
 Back up `.env` above all, including **the original `UZI_SECRET_KEY`**, along with your locally edited `compose.yaml`, `.env.example`, `scripts/init-env.sh`, and your release version record. A database dump without its encryption key cannot recover the encrypted tokens. Preserve the worker volumes if you need its local repositories and caches; a database dump does not include them. Copy backups and protected configuration off-host using your existing routine.
 
@@ -383,6 +386,8 @@ Confirm service health, administrator login, and worker connectivity. Keep the s
 ## Conclusion
 
 You have uzi behind your existing HTTPS proxy and a worker ready to accept work. Next, connect your forge using the [GitLab](./gitlab-bot-setup.md), [GitHub](./github-bot-setup.md), or [Forgejo](./forgejo-bot-setup.md) guide. Add [Claude credentials](./anthropic-token.md) or [Codex credentials](./codex-credentials.md), then review [Worker setup](./worker-setup.md) to run a worker on another host or explore further worker options before running your first issue.
+
+This base worker has no Docker. A run can stop at the plan gate with "the plan requires capabilities the assigned worker cannot satisfy: docker", even when the plan names no Docker step. If the plan can proceed without Docker, approve it with `uzi run approve <run-id> --override-capabilities` or **Run without docker** in the web interface.
 
 ## Reference
 
