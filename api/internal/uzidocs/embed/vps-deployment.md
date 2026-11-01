@@ -10,7 +10,7 @@ You can run uzi alongside the services already on your VPS, using your existing 
 
 The stack has four roles: `db` stores application data in PostgreSQL; `api` handles authentication, configuration, and work coordination; `web` serves the interface and proxies API requests; and `agent` runs work against your repositories. Docker Compose keeps their network, persistent volumes, and startup dependencies together while letting you start the worker separately. This repository's VPS recipe adapts the dedicated [server Compose file](../deploy/compose/compose.yaml) and existing [environment initializer](../scripts/init-env.sh), originally written for local Compose, to a layout downloaded from a release tag. We will use signed images from that same release. The server Compose file uses the base-agent template and excludes the optional Docker-in-Docker (DinD) services; see [Worker setup](./worker-setup.md) for other worker options.
 
-Once the prerequisites are ready, expect about 15 minutes of work. We timed that on a new 4 vCPU, 8 GB server, from the first command to a worker online. Most of it is the image download in Step 3.
+Once the prerequisites are ready, allow about 15 minutes by hand. A script of these steps took about 3 minutes on a new 4 vCPU, 8 GB server, from the first command to the Codex sign-in in Step 7. The image download in Step 3 took about 2 of those minutes.
 
 ## Prerequisites
 
@@ -20,8 +20,8 @@ Before you begin, check that you have:
 - Docker Engine and the **Docker Compose v2 plugin**. See Docker's [Ubuntu installation guide](https://docs.docker.com/engine/install/ubuntu/) and [Compose plugin installation guide](https://docs.docker.com/compose/install/linux/). The commands below run `docker` without `sudo`, so add your account to the `docker` group by following Docker's [post-installation steps](https://docs.docker.com/engine/install/linux-postinstall/), then log in again.
 - A domain whose A record points to your VPS. Follow the [DigitalOcean DNS record guide](https://docs.digitalocean.com/products/networking/dns/how-to/manage-records/) with your DNS provider, and replace `your_domain` throughout this tutorial.
 - A TLS reverse proxy. We include Caddy and nginx routing examples below. If this server has no proxy yet, install [Caddy](https://caddyserver.com/docs/install#debian-ubuntu-raspbian), which obtains certificates by itself.
-- Spare capacity for uzi in addition to your existing services. The worker alone defaults to **2 CPUs and 4 GiB RAM**. On its own, the stack ran on 4 vCPUs and 8 GB of RAM. It used 20 GB of disk after install: the images take about 11 GB and the volumes about 6 GB. Allow more disk for repositories and tool caches. See [worker sizing](./worker-setup.md#resource-stats-and-sizing).
-- `curl`, Bash, and `openssl`, plus a current `cosign` installed using the [cosign installation guide](https://docs.sigstore.dev/cosign/system_config/installation/). Ubuntu's `apt` does not carry `cosign`, so use the guide's `.deb` package and check its checksum. See [Container signing](./container-signing.md) for the supported verifier guidance.
+- Spare capacity for uzi in addition to your existing services. The worker alone defaults to **2 CPUs and 4 GiB RAM**. On its own, the stack ran on 4 vCPUs and 8 GB of RAM. It used 20 GB of disk after install: the images take about 11 GB and the volumes about 6 GB. Allow more disk for repositories and tool caches. See [worker sizing](./worker-setup.md#resource-stats-and-sizing). If your provider has no server of this size, choose by your needs. An agent that helps with this install asks you about those needs first.
+- `curl`, Bash, `openssl`, and `jq`, plus a current `cosign` installed using the [cosign installation guide](https://docs.sigstore.dev/cosign/system_config/installation/). Ubuntu's `apt` does not carry `cosign`, so use the guide's `.deb` package and check its checksum. See [Container signing](./container-signing.md) for the supported verifier guidance.
 - A backup routine that copies your dumps and `.env` off the VPS. You choose the method. We recommend [restic](https://restic.net/).
 
 ## Step 1 - Download the release configuration and verify images
@@ -252,13 +252,34 @@ docker compose -f compose.yaml up -d --no-build --force-recreate api
 
 Confirm that registration is disabled and your account can still sign in before opening access more widely. In your browser's developer tools, inspect the `uzi_auth` cookie and confirm that it has `Secure` and `HttpOnly` set. **`FRONTEND_ORIGIN` controls the Secure flag** through its HTTPS scheme. `UZI_PUBLIC_BASE_URL` should match your public URL, but does not control that flag. If the cookie is not Secure, correct `FRONTEND_ORIGIN`, recreate the API with the command above, and sign in again.
 
+The next steps use the API, so you can run them from a terminal or a script. Right after a Caddy reload, the first HTTPS call can fail with a TLS error while Caddy gets its certificate. Wait a few seconds and try again. Sign in from the shell. The `api` function sends the session cookie and the CSRF header that each session call needs:
+
+```sh
+URL=https://your_domain
+read -rs UZI_PASSWORD
+jq -n --arg email your_seed_email --arg password "$UZI_PASSWORD" '{email:$email,password:$password}' \
+  | curl -fsS -c uzi-cookies -H "Origin: $URL" -H 'Content-Type: application/json' --data @- -o /dev/null "$URL/api/auth/login"
+CSRF=$(awk '$6=="uzi_csrf"{print $7}' uzi-cookies)
+api() { curl -fsS -b uzi-cookies -H "Origin: $URL" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' "$@"; }
+```
+
+The file `uzi-cookies` holds your session. Delete it when you finish Step 7.
+
 You now have a working administrator session over HTTPS with registration closed and the session cookie marked Secure.
 
 ## Step 6 - Register and start your worker
 
 We will issue a join token for your account and deliver it through the release's existing Compose secret wiring.
 
-Open **Settings → Workers → Add a worker → Register your own worker**. Give the worker a name, which is what the Workers page shows. Select the base template, select **Generate join token**, and copy the token, which is shown once. Edit the existing `UZI_WORKER_TOKEN=` entry in `.env` to contain that value, keeping the file private. This entry is the **source for the Compose secret**, not an environment variable to add to the agent container.
+Create the worker and print its join token, which uzi shows once. The name is what the Workers page shows:
+
+```sh
+api -d '{"name":"your_worker","template":"base"}' "$URL/api/workers" | jq -r .token
+```
+
+If you prefer the web interface, use **Settings → Workers → Add a worker → Register your own worker**.
+
+Edit the existing `UZI_WORKER_TOKEN=` entry in `.env` to contain that value, keeping the file private. This entry is the **source for the Compose secret**, not an environment variable to add to the agent container.
 
 The following excerpt is **already present in `compose.yaml`**; inspect it rather than adding duplicate definitions. It connects the `.env` source to the file the worker reads:
 
@@ -292,11 +313,56 @@ Inspect the worker container's status:
 docker compose -f compose.yaml --profile agent ps
 ```
 
-Return to **Settings → Workers** and wait for the worker to appear online. If it remains offline, check the issued token, secret source, and API connectivity before assigning work. See [Worker setup](./worker-setup.md) for troubleshooting and further worker options.
+Wait for the worker to report online, which took about a minute in our test:
+
+```sh
+api "$URL/api/workers" | jq -r '.workers[] | [.name, .status] | @tsv'
+```
+
+You can also watch **Settings → Workers**. If it remains offline, check the issued token, secret source, and API connectivity before assigning work. See [Worker setup](./worker-setup.md) for troubleshooting and further worker options.
 
 Your base-template worker is now online and registered to your account.
 
-## Step 7 - Back up the database and configuration
+## Step 7 - Connect your forge, your repository, and a model login
+
+We will connect GitHub, enable one repository, create its board, and store a Codex login. For GitLab or Forgejo, follow the [GitLab](./gitlab-bot-setup.md) or [Forgejo](./forgejo-bot-setup.md) guide, and then read the board as shown below.
+
+First create the bot account and its token with the [GitHub](./github-bot-setup.md) guide, and add the bot to your repository. Then connect it and run the privilege check, which should print `ok`:
+
+```sh
+read -rs BOT_TOKEN
+CONNECTION=$(jq -n --arg token "$BOT_TOKEN" '{base_url:"https://github.com",forge_type:"github",token:$token}' \
+  | api --data @- "$URL/api/forge/connections" | jq -r .connection.id)
+api -X POST "$URL/api/forge/connections/$CONNECTION/privilege-check" | jq -r .report.status
+```
+
+Send `forge_type` each time, because the API default is GitLab.
+
+Enable your repository, then read its board:
+
+```sh
+REPO=$(api "$URL/api/forge/connections/$CONNECTION/projects" \
+  | jq -r '.repos[] | select(.path_with_namespace=="your_org/your_repo") | .id')
+api -X PUT -d '{"enabled":true}' "$URL/api/repos/$REPO" > /dev/null
+api "$URL/api/repos/$REPO/board" | grep -q 'Human Review' && echo 'board ready'
+```
+
+**Do not skip the board read.** uzi creates the board columns on the first read, which the web page normally sends. With no columns, an issue stays on **In Progress** after its run opens a pull request, and `uzi run rework` answers "the merge request is not open".
+
+If you prefer the web interface, use **Settings → Forge** and then **Repos**. Opening the repository's board creates the columns.
+
+The sign-in to OpenAI needs a person. Follow [Codex credentials](./codex-credentials.md) to sign in with a login dedicated to uzi, then store it from the `auth.json` that the sign-in wrote. To use Claude instead, see [Anthropic token](./anthropic-token.md).
+
+```sh
+jq '{token: ({access_token:.tokens.access_token, refresh_token:.tokens.refresh_token} | tojson), label:"uzi-codex", default:true}' auth.json \
+  | api --data @- "$URL/api/me/secrets/codex_auth" > /dev/null
+```
+
+Delete `auth.json` and `uzi-cookies`.
+
+Your worker can now take an issue from this repository.
+
+## Step 8 - Back up the database and configuration
 
 We will preserve application data together with its encryption key. Use your own backup routine with `pg_dump` from the `db` container, or the optional backup container below. The optional container writes to this server only, so it still needs your routine to copy its archives off-host.
 
@@ -385,9 +451,11 @@ Confirm service health, administrator login, and worker connectivity. Keep the s
 
 ## Conclusion
 
-You have uzi behind your existing HTTPS proxy and a worker ready to accept work. Next, connect your forge using the [GitLab](./gitlab-bot-setup.md), [GitHub](./github-bot-setup.md), or [Forgejo](./forgejo-bot-setup.md) guide. Add [Claude credentials](./anthropic-token.md) or [Codex credentials](./codex-credentials.md), then review [Worker setup](./worker-setup.md) to run a worker on another host or explore further worker options before running your first issue.
+You have uzi behind your existing HTTPS proxy and a worker ready to take an issue from your repository. Review [Worker setup](./worker-setup.md) to run a worker on another host or explore further worker options.
 
 This base worker has no Docker. A run can stop at the plan gate with "the plan requires capabilities the assigned worker cannot satisfy: docker", even when the plan names no Docker step. If the plan can proceed without Docker, approve it with `uzi run approve <run-id> --override-capabilities` or **Run without docker** in the web interface.
+
+A run can also stop for your decision when a check fails for a reason outside its change. See [Completion holds](./run-completion-hold.md).
 
 ## Reference
 
