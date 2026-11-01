@@ -58,6 +58,9 @@
 
 import { randomUUID } from "node:crypto";
 import { renderCodexRun } from "./render.js";
+import { CATALOG_PROBE_LIMIT, parseCatalogEntry, type CodexCatalogEntry } from "./catalog-probe.js";
+
+export type { CodexCatalogEntry } from "./catalog-probe.js";
 import { CodexRateLimitObserver } from "./rate-limits.js";
 import { LimitReachedError } from "../limit.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
@@ -88,6 +91,8 @@ import {
   type ProjectionScrub,
 } from "./projection.js";
 
+import { evidencesModelProcessing } from "../harness.js";
+import { decodeObservedModel, mapObservedEffort } from "../runtime-observation.js";
 import type { Logger } from "../log.js";
 import type {
   BoundaryRequest,
@@ -104,6 +109,7 @@ import type {
   ProcessReap,
   RunHarness,
   RunTurnRequest,
+  RuntimeConfigObservation,
   SessionPresence,
   ToolDisposal,
   TurnSignals,
@@ -206,6 +212,7 @@ export interface CodexChildSink {
 }
 
 export interface CodexHarnessOptions {
+  readonly admissionReporter?: import("./admission-signal.js").CodexAdmissionReporter;
   readonly registry: ExecutionRegistry;
   readonly launchRoot: LaunchRootSeam;
   readonly broker: CodexCallbackBroker;
@@ -249,6 +256,14 @@ export interface CodexHarnessOptions {
   /** Issue #1583: the 12-hex-char namespace of this harness's projected tool ids. Generated from
    *  `crypto.randomBytes` when absent; injectable so a test can pin the ids. */
   readonly idNonce?: string;
+  /** PRD #3247 M2: opt-in, once-per-instance `model/list` probe. Runs after the root thread is
+   *  started/resumed and before the first `turn/start`; `onEntry` is called synchronously with the
+   *  matching catalog entry (and the model it was matched for), or `undefined` on any timeout/error/malformed/absent result. It is not called when the turn is
+   *  stopped or aborted during the probe, and it never throws into the turn. */
+  readonly catalogProbe?: {
+    readonly timeoutMs: number;
+    readonly onEntry: (entry: CodexCatalogEntry | undefined, model: string) => void;
+  };
 }
 
 // --- small pure helpers -------------------------------------------------------
@@ -511,6 +526,8 @@ function boundedJsonBytes(value: unknown, limit: number): number {
 export class CodexHarness implements RunHarness {
   readonly kind = "codex" as const;
 
+  private readonly admissionReporter?: import("./admission-signal.js").CodexAdmissionReporter;
+  private admissionAttempt?: import("./admission-signal.js").AdmissionAttempt;
   private readonly registry: ExecutionRegistry;
   private readonly launchRootSeam: LaunchRootSeam;
   // The active callback broker. NOT `readonly`: turns run strictly sequentially, so the
@@ -534,6 +551,8 @@ export class CodexHarness implements RunHarness {
   // Run-level provider root state (launched once, reused across turns; a reused
   // notifications() iterator is single-consumer so it is obtained exactly once).
   private transport?: CodexTransport;
+  /** The unwrapped transport, used only by the stop path that must outlive lifetime closure. */
+  private rawTransport?: CodexTransport;
   private notes?: AsyncIterableIterator<CodexNotification>;
   // At most one notifications().next() may be outstanding. If a turn aborts while
   // it is pending, the promise is retained and consumed by the next turn rather than
@@ -610,7 +629,59 @@ export class CodexHarness implements RunHarness {
   // PRD #1534: the classification captured from the active turn's final non-retrying
   // provider method:"error" frame, folded into the terminal at decode. Reset per turn.
   private pendingCodexError?: CodexErrorClassification;
+  private retryCodexError?: CodexErrorClassification;
+  private finalCodexErrorSeen = false;
+
+  /** Closed retry context for the active root turn; never terminal selection. */
+  get retryClassification(): Readonly<CodexErrorClassification> | undefined {
+    return this.retryCodexError;
+  }
+
+  private emitted(event: HarnessEvent): HarnessEvent {
+    if (evidencesModelProcessing(event)) this.retryCodexError = undefined;
+    return event;
+  }
   private rateLimits = new CodexRateLimitObserver();
+  private catalogProbe?: CodexHarnessOptions["catalogProbe"];
+
+  /** PRD #3247 M2: one bounded `model/list` call; the result (or undefined) goes to `onEntry`.
+   *  Consumed on first use so a recreated turn or a resume fallback never probes twice. */
+  private async runCatalogProbe(abort: Promise<"aborted">): Promise<void> {
+    const probe = this.catalogProbe;
+    if (!probe) return;
+    this.catalogProbe = undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let entry: CodexCatalogEntry | undefined;
+    // The exact model thread/start sends (currentModel is set in runTurn before this runs).
+    const model = this.currentModel ?? this.provider.model;
+    try {
+      // No transport signal/deadline: either deletes the pending entry, so a late reply would
+      // surface as an unmatched response id and the root loop would answer an id the server never
+      // sent. The pending entry stays and absorbs a late reply; the race below bounds the wait.
+      const call = this.requestOnTransport<unknown>(
+        "model/list",
+        { limit: CATALOG_PROBE_LIMIT, includeHidden: true },
+      );
+      const timeout = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), probe.timeoutMs);
+      });
+      // A late rejection after the timeout wins must not become an unhandled rejection.
+      call.catch(() => undefined);
+      const result = await Promise.race([call, timeout, abort]);
+      // A stop/abort ends the wait without a note; the caller's abort check then skips turn/start.
+      if (result === "aborted") return;
+      entry = parseCatalogEntry(result, model);
+    } catch {
+      entry = undefined;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    try {
+      probe.onEntry(entry, model);
+    } catch {
+      /* the note is advisory; a callback fault never reaches the turn */
+    }
+  }
   // Resolves the current turn's abort race (see runTurn). The owner-aborted signal
   // resolves it via the listener; requestStop()/close() resolve it directly so a turn
   // WEDGED in a pending broker callback (a never-settling model-selected effect) still
@@ -618,6 +689,7 @@ export class CodexHarness implements RunHarness {
   private stopTurn?: () => void;
 
   constructor(opts: CodexHarnessOptions) {
+    this.admissionReporter = opts.admissionReporter;
     this.nowMs = opts.nowMs ?? Date.now;
     this.registry = opts.registry;
     this.launchRootSeam = opts.launchRoot;
@@ -642,6 +714,7 @@ export class CodexHarness implements RunHarness {
     this.emitClaimInit = opts.emitClaimInit ?? true;
     this.scrubProjected = opts.scrubProjected ?? ((s: string): string => s);
     this.idNonce = opts.idNonce ?? newProjectionNonce();
+    this.catalogProbe = opts.catalogProbe;
   }
 
   inspectSession(id: string): Promise<SessionPresence> {
@@ -674,6 +747,7 @@ export class CodexHarness implements RunHarness {
 
   /** Route frames carrying `threadId` into `sink` instead of the root loop. */
   registerChildSink(threadId: string, sink: CodexChildSink): void {
+    this.registry.assertWorkAdmission();
     this.childSinks.set(threadId, sink);
   }
 
@@ -924,6 +998,10 @@ export class CodexHarness implements RunHarness {
    *  start/interrupt a child thread on the SAME app-server; the child's frames are
    *  demuxed back via {@link registerChildSink}. Rejects if the provider root is not
    *  launched (a child turn is only ever started from inside an active root turn). */
+  beginAdmissionAttempt(threadId: string): import("./admission-signal.js").AdmissionAttempt | undefined {
+    return this.admissionReporter?.begin(threadId);
+  }
+
   requestOnTransport<T = unknown>(
     method: string,
     params?: unknown,
@@ -942,7 +1020,23 @@ export class CodexHarness implements RunHarness {
         return Promise.reject(err);
       }
     }
-    return transport.request<T>(method, params, opts);
+    return this.registry.admitWork(() => transport.request<T>(method, params, opts));
+  }
+
+  /** `turn/interrupt` is a stop/cleanup request, not new work: it stays deliverable after the
+   *  executor lifetime closes (so an owner abort still cancels), is retained so a seal joins its
+   *  actual settlement, and a rejection is uncertainty that forbids a seal. */
+  interruptOnTransport(
+    params: { threadId: string; turnId: string },
+    opts?: { deadlineMs?: number },
+  ): Promise<unknown> {
+    const raw = this.rawTransport;
+    if (!raw) {
+      return Promise.reject(new CodexHarnessError({ category: "protocol", message: "codex provider root is not launched" }));
+    }
+    let pending: Promise<unknown>;
+    try { pending = raw.request("turn/interrupt", params, opts); } catch (error) { pending = Promise.reject(error); }
+    return this.registry.retainCleanup(pending);
   }
 
   /** Answer a child server→client tool-call on the shared transport. Best-effort: an
@@ -965,6 +1059,7 @@ export class CodexHarness implements RunHarness {
   }
 
   startTurn(request: RunTurnRequest): HarnessTurn {
+    this.registry.assertWorkAdmission();
     if (this.closed) {
       throw new CodexHarnessError({ category: "transport", message: "codex harness is closed" });
     }
@@ -983,6 +1078,8 @@ export class CodexHarness implements RunHarness {
     this.stopRequested = false;
     this.stopTurn = undefined;
     this.pendingCodexError = undefined;
+    this.retryCodexError = undefined;
+    this.finalCodexErrorSeen = false;
     this.rateLimits = new CodexRateLimitObserver();
     this.turnOrdinal += 1;
     this.projectionCounter = 0;
@@ -1025,11 +1122,9 @@ export class CodexHarness implements RunHarness {
     const threadId = this.threadId;
     const turnId = this.activeTurnId;
     if (transport && threadId !== undefined && turnId !== undefined) {
-      void transport
-        .request("turn/interrupt", { threadId, turnId })
-        .catch(() => {
-          /* interrupt is best-effort; the terminal/EOF path settles the turn */
-        });
+      this.interruptOnTransport({ threadId, turnId }).catch(() => {
+        /* interrupt is best-effort; the terminal/EOF path settles the turn */
+      });
     }
     // End the stream even when it is wedged in a pending broker callback. The sticky
     // stopRequested bit also covers the lazy-generator window before stopTurn exists.
@@ -1055,6 +1150,7 @@ export class CodexHarness implements RunHarness {
     let reject!: (error: unknown) => void;
     const completion = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
     this.closeCompletion = completion;
+    this.registry.retainCleanup(completion);
     void this.closeOwned().then(resolve, reject);
     return completion;
   }
@@ -1123,10 +1219,11 @@ export class CodexHarness implements RunHarness {
 
   /** Yield every queued projected event, including any queued while a yield was pending. */
   private *drainOutbox(): Generator<HarnessEvent> {
-    for (let ev = this.outbox.shift(); ev !== undefined; ev = this.outbox.shift()) yield ev.event;
+    for (let ev = this.outbox.shift(); ev !== undefined; ev = this.outbox.shift()) yield this.emitted(ev.event);
   }
 
   private async *runTurn(request: RunTurnRequest, rendered: RenderedCodexRun): AsyncGenerator<HarnessEvent> {
+    this.registry.assertWorkAdmission();
     this.currentModel = rendered.lead.model ?? this.provider.model;
     const ordinal = this.turnOrdinal;
     this.liveProjectionTurn = ordinal;
@@ -1192,17 +1289,25 @@ export class CodexHarness implements RunHarness {
         // known. The model is the immutable configured root model (currentModel); a resumed
         // thread baselines at its pre-resume cumulative rather than zero.
         this.accountant.registerThread(this.threadId, this.currentModel ?? this.provider.model, resumed);
+        this.runtimeConfigPending = true;
       }
+
+      // PRD #3247 M2: advisory catalog probe, before the abort check so a stop during it is honoured.
+      await this.runCatalogProbe(abortPromise);
 
       // 3. Stop before sending model work if cancellation arrived during thread setup.
       if (request.signal.aborted || this.stopRequested) {
         this.turnClosed = true;
         return;
       }
-      // The peer can accept and persist spend before the RPC reply arrives. Record the
-      // resumed attempt before awaiting startTurnRpc, including a rejected pending reply.
-      if (this.resumedRoot) attemptedResumedRoot = this.threadId;
-      this.activeTurnId = await this.startTurnRpc(transport, this.threadId, rendered, request.signal);
+      this.activeTurnId = await this.startTurnRpc(transport, this.threadId, rendered, request.signal, request.rootDispatch,
+        () => { if (this.resumedRoot) attemptedResumedRoot = this.threadId; });
+      // PRD #3244: report only once turn/start was accepted, so `codex_sent` never describes a turn
+      // that was cancelled or refused before dispatch.
+      if (this.runtimeConfigPending) {
+        this.runtimeConfigPending = false;
+        this.reportRuntimeConfig(request, rendered);
+      }
       if (request.signal.aborted || this.stopRequested) {
         // A stop during launch/thread/turn setup could not name a turn earlier. Now
         // that activeTurnId exists, issue the best-effort interrupt and end cleanly.
@@ -1216,7 +1321,7 @@ export class CodexHarness implements RunHarness {
       // pass emitClaimInit=false, and this latch prevents another marker on later turns in epoch 0.
       if (this.emitClaimInit && !this.claimInitEmitted) {
         this.claimInitEmitted = true;
-        yield { kind: "initialized", model: this.currentModel, sessionId: this.threadId };
+        yield this.emitted({ kind: "initialized", model: this.currentModel, sessionId: this.threadId });
       }
 
       // One reader, one serial effect mapping, one Bash-only Read observation, and a bounded FIFO. Readiness is stamped
@@ -1295,7 +1400,7 @@ export class CodexHarness implements RunHarness {
         const observationReady = observation?.ready ?? Infinity;
         const mappedReady = Math.min(effectReady, observationReady);
         if (outboxReady < readReady && outboxReady < mappedReady) {
-          yield this.outbox.shift()!.event;
+          yield this.emitted(this.outbox.shift()!.event);
           continue;
         }
         if (mappedReady < readReady) {
@@ -1336,13 +1441,13 @@ export class CodexHarness implements RunHarness {
             this.closeOpenDispatches(ordinal, DISPATCH_OPEN_AT_TURN_END);
             yield* this.drainOutbox();
             this.pendingChildUsage.clear();
-            yield mapped;
+            yield this.emitted(mapped);
             if (this.pendingToolCalls.size > 0)
               await Promise.race([Promise.allSettled(this.pendingToolCalls), abortPromise]);
             yield* this.drainOutbox();
             return;
           }
-          yield mapped;
+          yield this.emitted(mapped);
           continue;
         }
         if (readReady === Infinity) {
@@ -1403,7 +1508,7 @@ export class CodexHarness implements RunHarness {
             const sink = this.childSinks.get(childId);
             if (sink !== undefined) {
               sink.push(step.value);
-              yield { kind: "activity", sessionId: this.threadId };
+              yield this.emitted({ kind: "activity", sessionId: this.threadId });
               continue;
             }
           }
@@ -1442,7 +1547,7 @@ export class CodexHarness implements RunHarness {
           }
           continue;
         }
-        yield await this.mapNote(transport, step.value, request.signal);
+        yield this.emitted(await this.mapNote(transport, step.value, request.signal));
       }
     } finally {
       refuseDeferred();
@@ -1474,6 +1579,7 @@ export class CodexHarness implements RunHarness {
   }
 
   private async ensureRoot(signal?: AbortSignal): Promise<void> {
+    this.registry.assertWorkAdmission();
     if (this.transport) {
       // A prior startup may have failed after the root was registered. Re-enter the
       // pinned auth owner so its poison state remains the explicit failure, and never
@@ -1523,12 +1629,33 @@ export class CodexHarness implements RunHarness {
       }));
       throw new CodexHarnessError({ category: "protocol", message: "codex provider root failed registry admission" });
     }
-    this.transport = launched.transport;
+    const raw = launched.transport;
+    const registry = this.registry;
+    this.rawTransport = raw;
+    this.transport = {
+      get protocolFailure() { return raw.protocolFailure; },
+      request: (method, params, opts) => registry.admitWork(() => raw.request(method, params, opts)),
+      notify: (method, params) => { registry.assertWorkAdmission(); raw.notify(method, params); },
+      respond: (id, response) => { registry.assertWorkAdmission(); raw.respond(id, response); },
+      notifications: () => {
+        registry.assertWorkAdmission();
+        const notes = raw.notifications();
+        return {
+          [Symbol.asyncIterator]() { return this; },
+          // A parked read has no bound of its own (it ends only when the transport closes, which is
+          // itself retained), so closure refuses new reads but a seal does not join a pending one.
+          next: async () => { registry.assertWorkAdmission(); return notes.next(); },
+          return: notes.return ? value => registry.retainCleanup(notes.return!(value)) : undefined,
+        };
+      },
+      installServerRequestInterceptor: raw.installServerRequestInterceptor?.bind(raw),
+      close: () => registry.retainCleanup(raw.close()),
+    };
     // The pinned initialize/initialized/login sequence completes before any thread/model
     // work. The auth owner has no reference to the model callback broker.
-    await this.appServerAuth?.authenticate(launched.transport, signal);
+    await this.registry.admitWork(() => this.appServerAuth?.authenticate(this.transport!, signal) ?? Promise.resolve());
     // Single-consumer: obtain the notifications iterator exactly once for the root.
-    this.notes = launched.transport.notifications();
+    this.notes = this.transport.notifications();
     this.log.debug("codex provider root launched", { supervisorPid: launched.supervisorPid });
   }
 
@@ -1543,6 +1670,39 @@ export class CodexHarness implements RunHarness {
     };
   }
 
+  /** The raw `model` / `reasoningEffort` of the last thread/start or thread/resume response; every
+   *  other field is ignored. Read once by reportRuntimeConfig. */
+  private threadResponse: { model?: unknown; reasoningEffort?: unknown } | undefined;
+  /** Set when a thread is established; cleared when its runtime config is reported after the first
+   *  accepted turn/start on it. */
+  private runtimeConfigPending = false;
+
+  /** PRD #3244 M2: report the thread's resolved model and effort to the owner. Effort is the value
+   *  sent on turn/start when there is one (`codex_sent`), else the thread's configured effort
+   *  (`codex_runtime_default`; absent or null is `unknown`). Never throws into the turn. */
+  private reportRuntimeConfig(request: RunTurnRequest, rendered: RenderedCodexRun): void {
+    const cb = request.onRuntimeConfig;
+    if (!cb) return;
+    try {
+      const response = this.threadResponse;
+      const model = decodeObservedModel(response?.model);
+      const sent = rendered.lead.modelReasoningEffort;
+      const reported = mapObservedEffort(response?.reasoningEffort);
+      const obs: RuntimeConfigObservation = {
+        ...(model !== undefined ? { model } : {}),
+        modelEvidence: model !== undefined ? "codex_thread_response" : "unknown",
+        ...(sent !== undefined
+          ? { effort: mapObservedEffort(sent), effortEvidence: "codex_sent" as const }
+          : reported !== undefined
+            ? { effort: reported, effortEvidence: "codex_runtime_default" as const }
+            : { effortEvidence: "unknown" as const }),
+      };
+      cb(obs);
+    } catch (err) {
+      this.log.warn("runtime config callback failed", { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
   private async startThread(
     transport: CodexTransport,
     rendered: RenderedCodexRun,
@@ -1550,7 +1710,7 @@ export class CodexHarness implements RunHarness {
   ): Promise<string> {
     // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
-    const res = await transport.request<{ thread?: { id?: string } }>(
+    const res = await transport.request<{ thread?: { id?: string }; model?: unknown; reasoningEffort?: unknown }>(
       "thread/start",
       {
         model: this.currentModel,
@@ -1572,6 +1732,7 @@ export class CodexHarness implements RunHarness {
     if (typeof id !== "string" || id.length === 0) {
       throw new CodexHarnessError({ category: "protocol", message: "codex thread/start returned no thread id" });
     }
+    this.threadResponse = { model: res.model, reasoningEffort: res.reasoningEffort };
     return id;
   }
 
@@ -1581,11 +1742,11 @@ export class CodexHarness implements RunHarness {
     rendered: RenderedCodexRun,
   ): Promise<string> {
     const resumeId = request.resumeSessionId;
-    let res: { thread?: { id?: string } };
+    let res: { thread?: { id?: string }; model?: unknown; reasoningEffort?: unknown };
     // issue #2213: before the try, so the typed refusal is never read by the resume-remap catch.
     assertResidueQuarantineOpen("provider_turn");
     try {
-      res = await transport.request<{ thread?: { id?: string } }>(
+      res = await transport.request<{ thread?: { id?: string }; model?: unknown; reasoningEffort?: unknown }>(
         "thread/resume",
         {
           threadId: resumeId,
@@ -1609,6 +1770,7 @@ export class CodexHarness implements RunHarness {
     }
     const id = res?.thread?.id;
     if (typeof id !== "string" || id.length === 0) throw new CodexResumeError();
+    this.threadResponse = { model: res.model, reasoningEffort: res.reasoningEffort };
     return id;
   }
 
@@ -1617,6 +1779,8 @@ export class CodexHarness implements RunHarness {
     threadId: string,
     rendered: RenderedCodexRun,
     signal: AbortSignal,
+    dispatch?: RunTurnRequest["rootDispatch"],
+    onDispatch?: () => void,
   ): Promise<string> {
     const params: Record<string, unknown> = {
       threadId,
@@ -1628,14 +1792,26 @@ export class CodexHarness implements RunHarness {
     };
     if (this.currentModel !== undefined) params.model = this.currentModel;
     if (rendered.lead.modelReasoningEffort !== undefined) params.effort = rendered.lead.modelReasoningEffort;
+    // Retry only preparation when negotiation invalidates an unsent permit.
+    // Cancellation and the run wall bound this wait; no provider attempt is started.
+    do {
+      await dispatch?.prepare();
+      signal.throwIfAborted();
+    } while (dispatch?.check() === false);
+    // No await separates the final local controls/source/capture guard from send.
+    signal.throwIfAborted();
     // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
+    this.admissionAttempt = this.admissionReporter?.begin(threadId);
     this.dispatchStartedAt = this.nowMs();
+    // A sent RPC can spend even if its acknowledgement never arrives.
+    onDispatch?.();
     const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {
       throw new CodexHarnessError({ category: "protocol", message: "codex turn/start returned no turn id" });
     }
+    this.admissionAttempt?.bind(id);
     return id;
   }
 
@@ -1649,6 +1825,7 @@ export class CodexHarness implements RunHarness {
     note: CodexNotification,
     signal?: AbortSignal,
   ): Promise<HarnessEvent> {
+    this.admissionAttempt?.observe(note);
     switch (note.kind) {
       case "rate_limits_updated":
         return { kind: "activity", sessionId: this.threadId };
@@ -1664,14 +1841,17 @@ export class CodexHarness implements RunHarness {
         // token-usage note never reaches here (the demux routes it to the child sink first).
         return { kind: "activity", sessionId: note.threadId };
       case "codex_error": {
-        // PRD #1534: bind the provider ErrorNotification to the ACTIVE root turn and retain
-        // its classification ONLY on an explicit non-retrying frame (willRetry === false) —
-        // final-non-retrying-wins. A retrying frame is liveness/diagnostic, never the terminal
-        // cause; a stale/foreign/child identity is ignored. Never emits a frame or latches the
-        // terminal; parsing stays in the single-source normalizer (no raw provider text kept).
-        if (note.threadId === this.threadId && note.turnId === this.activeTurnId && note.willRetry === false) {
+        // Final-non-retrying wins even without a known classification. Retry context is
+        // independent of terminal selection and contains no raw provider text.
+        if (note.threadId === this.threadId && note.turnId === this.activeTurnId) {
           const rawInfo = asObject(asObject(note.params)?.error)?.codexErrorInfo;
-          this.pendingCodexError = normalizeCodexErrorInfo(rawInfo);
+          if (note.willRetry === false) {
+            this.finalCodexErrorSeen = true;
+            this.retryCodexError = undefined;
+            this.pendingCodexError = normalizeCodexErrorInfo(rawInfo);
+          } else if (note.willRetry === true && !this.finalCodexErrorSeen) {
+            this.retryCodexError = normalizeCodexErrorInfo(rawInfo);
+          }
         }
         return { kind: "activity", sessionId: note.threadId };
       }

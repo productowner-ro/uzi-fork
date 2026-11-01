@@ -1,10 +1,12 @@
 package usagepoller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -96,7 +98,7 @@ func (f *fakeStore) GetAnthropicTokenToPoll(_ context.Context, arg store.GetAnth
 			return store.GetAnthropicTokenToPollRow{
 				ID: r.ID, UserID: r.UserID, Ciphertext: r.Ciphertext, SealedWith: r.SealedWith,
 				NotifyEarlyLimitReset: f.notify[r.UserID], EnablementRev: f.rev[r.ID],
-				AnthropicSuccessGeneration: f.generation[r.ID],
+				AnthropicSuccessGeneration: f.generation[r.ID], VaultEpoch: r.VaultEpoch,
 			}, nil
 		}
 	}
@@ -196,7 +198,7 @@ func (f *fakeOpener) resolve(userID uuid.UUID) ([]byte, error) {
 	}
 	return []byte("token"), nil
 }
-func (f *fakeOpener) OpenSealed(userID uuid.UUID, _ string, _ string, _ []byte) ([]byte, error) {
+func (f *fakeOpener) OpenSealedAtEpoch(_ context.Context, userID uuid.UUID, _ string, _ string, _ []byte, _ int64) ([]byte, error) {
 	return f.resolve(userID)
 }
 
@@ -253,7 +255,7 @@ func (c *clock) set(t time.Time) {
 
 func reading(five, seven int, source string) anthropic.Reading {
 	return anthropic.Reading{
-		FiveHour: anthropic.Window{Pct: five},
+		FiveHour: &anthropic.Window{Pct: five},
 		SevenDay: anthropic.Window{Pct: seven},
 		Source:   source,
 	}
@@ -497,7 +499,7 @@ func (m *multiTokenStore) ListAnthropicTokensToPoll(context.Context) ([]store.Li
 }
 func (m *multiTokenStore) GetAnthropicTokenToPoll(context.Context, store.GetAnthropicTokenToPollParams) (store.GetAnthropicTokenToPollRow, error) {
 	r := m.rows[0]
-	return store.GetAnthropicTokenToPollRow{ID: r.ID, UserID: r.UserID, Ciphertext: r.Ciphertext, SealedWith: r.SealedWith}, nil
+	return store.GetAnthropicTokenToPollRow(r), nil
 }
 func (m *multiTokenStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimitsParams) (int64, error) {
 	m.mu.Lock()
@@ -613,7 +615,7 @@ func TestPerTokenBackoffIsolation(t *testing.T) {
 // test's client can tell the tokens apart by their bytes.
 type passthroughOpener struct{}
 
-func (passthroughOpener) OpenSealed(_ uuid.UUID, _, _ string, ciphertext []byte) ([]byte, error) {
+func (passthroughOpener) OpenSealedAtEpoch(_ context.Context, _ uuid.UUID, _, _ string, ciphertext []byte, _ int64) ([]byte, error) {
 	return ciphertext, nil
 }
 
@@ -685,7 +687,7 @@ func TestEarlyResetDetection(t *testing.T) {
 	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
 	synced := tReset.Add(-72 * time.Hour)
 	moved := tReset.Add(72 * time.Hour)
-	movedTiny := tReset.Add(30 * time.Minute)  // +30m < resetEpochMoveMargin(1h): Arm A must stay silent
+	movedTiny := tReset.Add(30 * time.Minute)  // +30m < ResetEpochMoveMargin(1h): Arm A must stay silent
 	movedBack := tReset.Add(-30 * time.Minute) // boundary earlier than T: not an unmoved fixed grid -> Arm B must stay silent
 
 	cases := []struct {
@@ -746,7 +748,7 @@ func TestEarlyResetDetection(t *testing.T) {
 			name: "silent_pct_jitter_epoch_unchanged", prevPct: 100, prevSource: anthropic.SourceLimitReport,
 			nextResets: &tReset, nextPct: 99, nextSource: anthropic.SourceUsageEndpoint,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
-			why: "epoch unchanged (== T, Arm A false) AND used% 100->99 not a zeroing (99 > pctResetCeil, Arm B false) -> silent",
+			why: "epoch unchanged (== T, Arm A false) AND used% 100->99 not a zeroing (99 > PctResetCeil, Arm B false) -> silent",
 		},
 		{
 			name: "fires_arm_b_util_zeroed", prevPct: 12, prevSource: anthropic.SourceHeaderProbe,
@@ -758,25 +760,25 @@ func TestEarlyResetDetection(t *testing.T) {
 			name: "fires_arm_b_at_floor", prevPct: 5, prevSource: anthropic.SourceUsageEndpoint,
 			nextResets: &tReset, nextPct: 0, nextSource: anthropic.SourceUsageEndpoint,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: true,
-			why: "prev == pctResetFloor(5) and next <= pctResetCeil(1) fires Arm B; pins the floor boundary",
+			why: "prev == PctResetFloor(5) and next <= PctResetCeil(1) fires Arm B; pins the floor boundary",
 		},
 		{
 			name: "silent_epoch_move_below_margin", prevPct: 50, prevSource: anthropic.SourceUsageEndpoint,
 			nextResets: &movedTiny, nextPct: 50, nextSource: anthropic.SourceUsageEndpoint,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
-			why: "+30m < resetEpochMoveMargin(1h) so Arm A silent; pct 50->50 unchanged so Arm B false; WOULD fire if the margin were 0",
+			why: "+30m < ResetEpochMoveMargin(1h) so Arm A silent; pct 50->50 unchanged so Arm B false; WOULD fire if the margin were 0",
 		},
 		{
 			name: "silent_pct_drop_below_floor", prevPct: 3, prevSource: anthropic.SourceUsageEndpoint,
 			nextResets: &tReset, nextPct: 0, nextSource: anthropic.SourceUsageEndpoint,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
-			why: "prev 3 < pctResetFloor(5) so Arm B silent (near-zero-usage clear indistinguishable from jitter, D5); WOULD fire if the floor were 0",
+			why: "prev 3 < PctResetFloor(5) so Arm B silent (near-zero-usage clear indistinguishable from jitter, D5); WOULD fire if the floor were 0",
 		},
 		{
 			name: "silent_pct_drop_above_ceil", prevPct: 40, prevSource: anthropic.SourceUsageEndpoint,
 			nextResets: &tReset, nextPct: 20, nextSource: anthropic.SourceUsageEndpoint,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
-			why: "next 20 > pctResetCeil(1) is a source-flip/partial delta, not a zeroing, so Arm B silent; WOULD fire if the ceil were raised",
+			why: "next 20 > PctResetCeil(1) is a source-flip/partial delta, not a zeroing, so Arm B silent; WOULD fire if the ceil were raised",
 		},
 		{
 			name: "silent_arm_b_boundary_nil", prevPct: 12, prevSource: anthropic.SourceHeaderProbe,
@@ -788,7 +790,7 @@ func TestEarlyResetDetection(t *testing.T) {
 			name: "silent_arm_b_sub_margin_move", prevPct: 12, prevSource: anthropic.SourceHeaderProbe,
 			nextResets: &movedTiny, nextPct: 0, nextSource: anthropic.SourceHeaderProbe,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
-			why: "+30m < resetEpochMoveMargin(1h) so Arm A silent; boundary moved (!= T) so the grid is not unmoved -> Arm B silent even though used% 12->0; WOULD fire if Arm B ignored the boundary",
+			why: "+30m < ResetEpochMoveMargin(1h) so Arm A silent; boundary moved (!= T) so the grid is not unmoved -> Arm B silent even though used% 12->0; WOULD fire if Arm B ignored the boundary",
 		},
 		{
 			name: "silent_arm_b_backward_move", prevPct: 12, prevSource: anthropic.SourceHeaderProbe,
@@ -1074,5 +1076,58 @@ func TestEarlyResetOnPokePath(t *testing.T) {
 
 	if notif.count() != 1 {
 		t.Fatalf("notify calls = %d, want 1 (detection must run on the poke path)", notif.count())
+	}
+}
+
+// A 7-day-only probe reading (plans without a 5-hour window) is stored with NULL
+// five_hour pct + reset, and does not arm a backoff.
+func TestSevenDayOnlyReadingStoresNullFiveHour(t *testing.T) {
+	u := uuid.New()
+	st := newFakeStore(u)
+	cl := &fakeClient{
+		usage: func([]byte) (anthropic.Reading, error) { return anthropic.Reading{}, httpErr(403) },
+		probe: func([]byte) (anthropic.Reading, error) {
+			return anthropic.Reading{SevenDay: anthropic.Window{Pct: 7}, Source: anthropic.SourceHeaderProbe}, nil
+		},
+	}
+	e, _ := newEngine(t, st, &fakeOpener{}, cl, true)
+
+	e.tickAll(context.Background())
+
+	got, ok := st.got(u)
+	if !ok {
+		t.Fatal("no row written")
+	}
+	if got.FiveHourPct.Valid || got.FiveHourResetsAt.Valid {
+		t.Errorf("five_hour = %+v / %+v, want NULL", got.FiveHourPct, got.FiveHourResetsAt)
+	}
+	if !got.SevenDayPct.Valid || got.SevenDayPct.Int16 != 7 {
+		t.Errorf("seven_day_pct = %+v, want 7", got.SevenDayPct)
+	}
+	e.tickAll(context.Background())
+	if uc, pc := cl.calls(); uc != 2 || pc != 2 {
+		t.Errorf("usage=%d probe=%d, want 2 and 2 (no backoff armed)", uc, pc)
+	}
+}
+
+// Every poll that ends without a reading logs one line naming the secret, the
+// failing call, the kind and the status, and never the token.
+func TestPollFailureIsLogged(t *testing.T) {
+	u := uuid.New()
+	st := newFakeStore(u)
+	cl := &fakeClient{
+		usage: func([]byte) (anthropic.Reading, error) { return anthropic.Reading{}, malformed() },
+	}
+	var buf bytes.Buffer
+	e, _ := newEngine(t, st, &fakeOpener{}, cl, true)
+	e.logger = slog.New(slog.NewTextHandler(&buf, nil))
+
+	e.tickAll(context.Background())
+
+	out := buf.String()
+	for _, want := range []string{"poll failed", "call=usage", "kind=malformed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log %q missing %q", out, want)
+		}
 	}
 }

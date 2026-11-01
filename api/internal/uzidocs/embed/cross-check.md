@@ -26,12 +26,13 @@ plans supplied at creation are outside this gate. Turning it off affects
 future runs only.
 
 The **Plan cross-check** row has independent model and effort choices for
-Claude and Codex. Select **Default · value (source)** to follow that family's
-worker default, or choose a hard pin, including a custom model ID. A model
+Claude and Codex. At **Default**, the model follows that family's worker
+default and the effort is the cross-check default, `high`, whatever your worker
+effort is. Or choose a hard pin, including a custom model ID or a lower effort. A model
 pin does not pin effort, and an effort pin does not pin model. Pins do not
 substitute models, clamp effort or retry on a default. The Claude cell
-configures the Claude checker that checks a Codex lead; at Default it follows
-your Claude worker default.
+configures the Claude checker that checks a Codex lead; at Default its model
+follows your Claude worker default.
 
 ## 2. Wait for the checked plan
 
@@ -122,7 +123,8 @@ A Claude checker also fails with `plan cross-check: checker unavailable`,
 and the lead parks for a human, when your Claude credential is unavailable or
 disabled at claim time, or the automatic Claude pool is empty. No credential is
 delivered, and your non-pooled default is never spent. A locked credential
-vault remains a transient wait. A pinned Claude model the account cannot use
+vault remains a transient wait for protected users; Off users have no unlock
+dependency (see [Vault choice](./anthropic-token.md#vault-choice)). A pinned Claude model the account cannot use
 (the SDK reports `model_not_found`) is treated the same way. A checker session
 whose confinement cannot be confirmed at startup fails the check with
 `confinement_failed`.
@@ -157,7 +159,8 @@ restriction.
 
 This is a prompt contract: dispositions remain inside the exact candidate
 digest as untrusted plan content, not authorization. It adds no fields, parser,
-transport, history or authority. Code cross-check guidance is unchanged.
+transport, history or authority. See [Code criteria guidance](#criteria-guidance)
+for the separate code-check instructions.
 Deterministic fixtures and mock tests do not prove model convergence; live
 hosted/model attempts, cost and latency are unmeasured, with no universal
 convergence guarantee. The [configuration notes](./configuration.md#cross-check-settings)
@@ -219,7 +222,8 @@ remaining replay scope.
 Open the run to see distinct rounds in the feed, the current gate reason,
 checked-candidate outcome,
 findings, checker-run link, recorded model/effort, each field's source
-(`pin` or `worker default`) and reported tokens/cost. Missing legacy sources
+(`pin`, `worker default`, or `cross-check default` for an unpinned effort) and
+reported tokens/cost. Missing legacy sources
 stay unknown; later settings changes do not rewrite historical evidence.
 Unknown or inconsistent outcomes show **Outcome unavailable**. Findings use
 hardened Markdown with a display cap of 16,384 source characters and 20 items;
@@ -263,7 +267,10 @@ fail the check.
 - A **read** records the checkout-relative path and the inclusive line range
   returned, when known.
 - A **search** records the scope path (`.` for the whole checkout) and a match
-  count. A truncated count shows as `N+`.
+  count. A truncated count shows as `N+`. For the Codex checker this also
+  covers a search that stopped at its time, operation, directory, entry or byte
+  ceiling, or skipped a file over 1 MiB: the matches found so far are kept, the
+  coverage is incomplete, and `0+` is not evidence that the text is absent.
 - Never the search query, glob or pattern, tool arguments or file contents.
 - An attempt outside the checkout is recorded as a category with no path:
   `outside checkout`. `policy` covers a path the recorder refuses to show
@@ -366,7 +373,8 @@ including when none advertises `cross_check_codex_lead_v1`.
 
 ## Semantic contract profile (dormant)
 
-**Dormant.** Production enrollment is off until #1231, no production code creates a
+**Dormant.** Production enrollment is off and not planned (#1231 was closed not planned;
+any future activation needs a new approved design), no production code creates a
 semantic run and only tests inject the path. A real run uses the *structural*
 profile described everywhere else on this page.
 
@@ -397,7 +405,7 @@ Design record: [ADR-2149 amendment](../adr/2149-cross-check.md#1230-coverage-par
 
 ### Coverage transport limitation
 
-Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. #1231 must establish enforceable bounds before activation.
+Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. Any future semantic activation must establish enforceable bounds before activation.
 
 See [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#coverage-transport-limitation).
 
@@ -571,6 +579,78 @@ cross-checked." An incomplete check renders as prose instead, for example
 
 The run page has a **Code cross-check** panel with the same evidence, and
 `uzi run get <id>` prints it (see [CLI](./cli.md#code-cross-check-evidence)).
+
+### Criteria guidance
+
+The code checker brief asks both families to enumerate acceptance criteria from
+the issue, approved plan and frozen approved milestones (`approved_milestones`),
+then report missing or partly delivered criteria:
+
+- Start criterion finding titles, including informational ones, with
+  `Requirement gap:` for missing or partly delivered criteria, or
+  `Coverage uncertainty:` for verification that cannot be done here.
+- Use minor `Coverage uncertainty:` findings for hosted, live or maintainer-only
+  verification. Grade missing worker-deliverable implementation or regression
+  tests by impact.
+- Treat a missing requirement stated by the issue as a safety, security or
+  data-integrity constraint as a critical or major defect, without either prefix.
+  Defect titles must not use criterion prefixes.
+- Cite the most relevant code path or PRD/plan source path; use line 0 when no
+  line applies.
+
+The brief puts defects first within the limits of 20 findings, 2 KiB UTF-8 JSON
+per finding and 32 KiB for the findings array. Criterion findings use spare room
+within those limits. If room remains, at most one minor `Coverage uncertainty:`
+omission note counts unreported criteria. Neither criteria nor omission notes
+may displace a defect; a full defect report may omit both entirely.
+
+The frozen approved milestones are supplied as nonce-fenced untrusted DATA,
+separate from the trusted brief, alongside the issue, plan and code evidence.
+The checker is instructed to treat this material as evidence, never as
+instructions or authorization.
+
+For environment overrides, the brief asks the checker to describe actual
+effects, including inherited child processes. Temporary scratch or `TMPDIR`
+relocation, including Go child build/test temporary files, is not alone a bypass.
+Variable names and destinations do not prove harmlessness; configuration,
+credential and test effects need inspectable evidence. Flag overrides that skip,
+select, narrow or otherwise weaken required validation, or violate an applicable
+explicit restriction.
+
+These are review instructions, not a guarantee of detection or completeness.
+Criterion findings remain advisory under the same one-check, one-repair process,
+without recheck or publication block.
+
+### Review coverage
+
+New code checks separately account for the changed paths in the checked Git
+range, including deleted paths and both names of a rename. Each retained path is
+examined, excluded with a reason, or unassessed. A missing judgment is
+unassessed. The worker supplies the inventory; model-invented paths are dropped
+and counted.
+
+The merge request shows counts such as "Coverage: 9 examined, 0 excluded,
+3 unassessed", plus at most ten unassessed paths within its existing section
+budget. The run page and `uzi run get <id>` show the full stored account,
+including reasons, omitted judgments, and recorded-read flags. These are
+advisory review accounts, not correctness certifications. A recorded-read flag
+comes only from successful recorded file reads; reading a diff or searching a
+directory does not produce that flag. Partial or unavailable activity is shown.
+
+Inventories retain at most 128 unique paths of at most 512 UTF-8 bytes each.
+Processing is bounded at 1 MiB of Git output and 16,384 NUL records. When the
+retained-path cap is exceeded but enumeration finishes, the omitted count is
+exact. If enumeration stops early, the display reports a lower bound or an
+unknown omitted count and never claims complete inventory coverage.
+Judgments have separate bounds (128 entries, 256 UTF-8 bytes per reason and
+32 KiB model coverage); the stored account is bounded at 128 KiB. Invalid or
+oversized coverage does not discard valid findings.
+
+Older workers and historical rows show "coverage not reported". The API
+advertises coverage support on code claims, so newer workers keep the legacy
+findings-only request when talking to an older API. Coverage is stored once
+with the verdict and preserved as earlier evidence after interruption; it is
+not rechecked after the lead's repair pass.
 
 ### Owner guidance and repository instructions
 

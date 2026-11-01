@@ -1,6 +1,7 @@
 import type {
   Milestone,
   Run,
+  RunLeadConfig,
 } from "../../lib/api";
 import { daysAgo, minsAgo, minsAhead, secsAgo } from "./time";
 import { LIVE_RUN_ID } from "./boards";
@@ -28,6 +29,64 @@ const APPROVAL_NOTIFY_CANDIDATES: Milestone[] = [
   { id: "an-3", title: "Deliver via the existing notifier, respecting mutes" },
 ];
 
+// PRD #3244 lead_config demo fixtures. Rule 2 (run-queued: schedule pin, no rows), rule 3
+// (run-done: claimed by a worker that recorded nothing, still showing the schedule pin) and
+// rule 4 (run-failed: a requested-only row, the observed side not reported yet).
+const LEAD_CONFIG_NO_ROWS: RunLeadConfig = { applicable: true, claim_generation: 0, current: true, phases: [] };
+const LEAD_CONFIG_OPUS_MEDIUM: RunLeadConfig = {
+  applicable: true,
+  claim_generation: 1,
+  current: true,
+  phases: [
+    {
+      phase: "implement",
+      phase_entry: 1,
+      seq: 1,
+      harness: "claude",
+      requested_model: "opus",
+      requested_model_source: "user_default",
+      requested_model_fixed_at: "claim",
+      requested_effort: "medium",
+      requested_effort_mode: "explicit",
+      requested_effort_source: "builtin",
+      requested_effort_fixed_at: "claim",
+      observed_model: null,
+      observed_model_evidence: null,
+      observed_effort: null,
+      observed_effort_evidence: null,
+      truncated: false,
+      reported_at: minsAgo(300),
+    },
+  ],
+};
+
+const LEAD_CONFIG_CODEX_OBSERVED: RunLeadConfig = {
+  applicable: true,
+  claim_generation: 1,
+  current: true,
+  phases: [
+    {
+      phase: "implement",
+      phase_entry: 1,
+      seq: 2,
+      harness: "codex",
+      requested_model: "gpt-6-astra",
+      requested_model_source: "user_default",
+      requested_model_fixed_at: "claim",
+      requested_effort: null,
+      requested_effort_mode: "runtime_default",
+      requested_effort_source: "builtin",
+      requested_effort_fixed_at: "claim",
+      observed_model: "gpt-6-astra",
+      observed_model_evidence: "codex_thread_response",
+      observed_effort: "high",
+      observed_effort_evidence: "codex_runtime_default",
+      truncated: false,
+      reported_at: minsAgo(200),
+    },
+  ],
+};
+
 export const mockRuns: Run[] = [
   {
     // run-queued is parked in the queue, not yet claimed by a worker: it renders
@@ -52,7 +111,10 @@ export const mockRuns: Run[] = [
     plan_cross_check_required: false,
     worker_id: null,
     branch: null,
-    model: null,
+    // PRD #3244 rule 2: a schedule-pinned model on a queued run reads "lead: fable · effort
+    // resolves at claim".
+    model: "fable",
+    lead_config: LEAD_CONFIG_NO_ROWS,
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
@@ -981,9 +1043,11 @@ export const mockRuns: Run[] = [
     worker_id: "w-laptop",
     branch: "agent/issue-18",
     // PRD #300: a completed run whose schedule froze a per-run model, so the
-    // run-detail header model badge is exercisable in mock mode (the rest stay
-    // null = inherited the owner's Worker default).
+    // run-detail header lead chip is exercisable in mock mode (the rest stay
+    // null = inherited the owner's Worker default). PRD #3244 rule 3: claimed with no
+    // recorded rows, so the chip reads "lead: not recorded" beside the schedule pin.
     model: "fable",
+    lead_config: LEAD_CONFIG_NO_ROWS,
     override_subagent_model: true,
     forge_type: "gitlab",
     mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/42",
@@ -1149,6 +1213,9 @@ export const mockRuns: Run[] = [
     worker_id: "w-laptop",
     branch: "agent/issue-61",
     model: null,
+    // PRD #3244 rule 4, observed side: Codex was sent no effort ("runtime default") and reported
+    // its thread's configured effort, so the chip reads "runtime default: high".
+    lead_config: LEAD_CONFIG_CODEX_OBSERVED,
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/61",
@@ -1466,6 +1533,8 @@ export const mockRuns: Run[] = [
     worker_id: "w-ci",
     branch: "agent/issue-7",
     model: null,
+    // PRD #3244 rule 4: a default-model Claude run (model null) whose claim fixed opus / medium.
+    lead_config: LEAD_CONFIG_OPUS_MEDIUM,
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: null,
@@ -2106,6 +2175,29 @@ mockRuns.push(
     recovery_wait_cause: "provider_outage", provider_park_count: 3,
     provider_park_streak_started_at: minsAgo(90), recovery_retry_not_before: minsAhead(5) },
 );
+// Forge recovery: NULL is an owner hold; omitted timing is older-API uncertainty.
+for (const [id, status, retry] of [
+  ["run-forge-hold", "recovery_wait", null],
+  ["run-forge-timed", "recovery_wait", minsAhead(5)],
+  ["run-forge-overdue", "recovery_wait", minsAgo(5)],
+  ["run-forge-unknown", "recovery_wait", undefined],
+  ["run-forge-queued", "queued", null],
+] as const) {
+  mockRuns.push({
+    ...pausedBase, id, status, hold_reason: null,
+    issue_title: "Recover forge access without losing retained work",
+    recovery_wait_cause: status === "queued" ? null : "forge_unreachable",
+    recovery_retry_not_before: retry,
+    forge_park_count: 5, forge_park_max: 5,
+    health: "ok",
+    health_reason: status === "queued" ? "Origin cooldown: waiting for a bounded forge attempt; recovery unverified." : null,
+    forge_origin_cooldown: id === "run-forge-unknown" ? undefined : {
+      origin: "https://forge.example", cooled_until: minsAgo(1),
+      half_open_run_id: "run-forge-queued", state: "legacy_serialized_until_upgrade",
+      detail: "One active flight is checking this origin; recovery is unverified.",
+    },
+  });
+}
 // Issue #3181: the token-switch holds. The owner switched each run to console-key; its
 // processes could not be proven stopped. Open /runs/run-cred-switch-settling (the worker is
 // still finishing its own operations for the run, the live-worker case: Resume and Switch token

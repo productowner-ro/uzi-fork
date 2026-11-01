@@ -6,6 +6,7 @@ import { watch } from "node:fs";
 import path from "node:path";
 import type { Logger } from "./log.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
+import type { ExecutorSealResult, ExecutorTerminalSeal } from "./codex/executor-lifetime.js";
 import type { UsageSink } from "./usage-recorder.js";
 import type { RunCacheDropResult } from "./run-caches.js";
 import type { BoundarySink, CodexExecutionSafety, CredentialFreeCaptureContext, HarnessError } from "./harness.js";
@@ -18,6 +19,7 @@ import type {
   ClaimPipeline,
   ClaimSkill,
   ClaimSkillDrop,
+  CodexOperationIdentity,
   FixVerdict,
   IssueCommentsSnapshot,
   IterationBudget,
@@ -111,6 +113,12 @@ export type SecretRemediationDecision =
   | { action: "remediate"; followUp: string }
   | { action: "fail" };
 
+/** Marks only the exhausted revision's owner-event wait, excluding recovery work. */
+export type PlanRevisionOwnerWaitObserver = (waiting: boolean) => void;
+
+/** Silent recovery spent its wall before owner waiting; the executor owns wall routing. */
+export type PlanRevisionRetryOutcome = "wall" | void;
+
 /**
  * Everything an executor needs to work one run.
  *
@@ -126,6 +134,11 @@ export interface RunContext {
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
+  /** PRD #3244: the claim's single lead-config reporter, constructed by the runner only. Executors
+   *  call `enterPhase` before a lead turn; absent for stub/test executors and non-lead lanes. */
+  leadConfig?: import("./lead-config-report.js").LeadConfigReporter;
+  /** Negotiated before execution/capture; remains binding if registration features shrink. */
+  codexIdleStallRecovery?: boolean;
   /** Claim support assertion; absent means false. The runner separately gates root and phase. */
   parkRunSupported?: boolean;
   /** Request a park and await its authoritative outcome or a racing owner answer. */
@@ -135,6 +148,11 @@ export interface RunContext {
   /** Issue #2686: true once this run's claim is fenced (lost), so accounting-only side messages
    *  (summary_usage) are suppressed. Absent = never fenced (stub/test executors). */
   claimFenced?(): boolean;
+  /** Fresh operation admission for root/child/advice at the lazy provider send boundary.
+   * Returns the repeatable local source guard; no recovery grant is consumed.
+   */
+  codexRootAdmissionActive?(): boolean;
+  prepareCodexRootDispatch?(signal: AbortSignal, check: () => void, kind?: CodexOperationIdentity["kind"]): Promise<() => boolean | void>;
   /** Run kind (PRD #6). "issue" (default when absent) works issueIid's card;
    *  "ci_fix" diagnoses + fixes `pipeline`. */
   kind?: RunKind;
@@ -424,13 +442,14 @@ export interface RunContext {
    * a fenced claim ends quietly. Absent on the stub/test executors ⇒ today's behaviour.
    */
   takeResumedGateEvent?(signal?: AbortSignal): Promise<PlanVerdict | undefined>;
-  /** Only human revision drivers call this after typed provider retry exhaustion.
+  /** Only human revision drivers call this after typed provider exhaustion or measured Codex silence.
    * Resolves to redrive, or throws controls / PlanRevisionReplacedError to exit this driver.
    * The runner must prove ownership before resolving; unknown ownership permits no provider start.
+   * remainingWallMs caps silent-recovery work before an owner-event wait; the wait itself is free.
    */
-  retryPlanRevisionTurn?(cause: unknown): Promise<void>;
-  /** Check the captured source before each human revision provider turn, including continuations. */
-  beforePlanRevisionTurn?(): Promise<void>;
+  retryPlanRevisionTurn?(cause: unknown, observer?: PlanRevisionOwnerWaitObserver, remainingWallMs?: () => number): Promise<PlanRevisionRetryOutcome>;
+  /** Check the captured source before human revision turns and fresh epoch credential/root admission. */
+  beforePlanRevisionTurn?(observer?: PlanRevisionOwnerWaitObserver, remainingWallMs?: () => number): Promise<PlanRevisionRetryOutcome>;
   /** An associated cross-check human gate continues its established wait after switch give-up. */
   continueExistingPlanGate?(otherwise: () => Promise<PlanVerdict>): Promise<PlanVerdict>;
   /**
@@ -831,7 +850,7 @@ export interface ExecutorResult {
    *  runner completes it with NO push/MR. Issue runs only. Absent ⇒ normal push+MR path. */
   reportOnly?: boolean;
   /** issue #279: the one-line/short findings summary from signal_done, persisted as
-   *  report_md on a report-only completion. Issue runs only. */
+   *  report_md on a report-only issue completion or a prompt completion. Issue and prompt runs only. */
   summary?: string;
   /** PRD #929 M2: a scheduled `prompt` run's structured proposal (title + body) from
    *  signal_done, forwarded verbatim on the prompt-run completion report so the server can
@@ -939,6 +958,18 @@ export interface Executor {
   /** Close summary admission synchronously, then abort/join within the remaining sink deadline. */
   closeAndSettlePlanSummary?(deadlineMs?: number): Promise<void>;
   /**
+   * #3404 M1b: irreversibly close this executor's lifetime and, only when every owned producer,
+   * observer and cleanup tail has settled with unchanged successful disposal facts, return an opaque
+   * seal bound to `sourceUse` (an opaque caller-owned identity, e.g. the source-use lease). Failure
+   * is `{ kind: "unproven" }`, permanently closed, and never changes a completed run. Only the Codex
+   * executor implements it; absent means the executor has no closed lifetime to prove. The runner
+   * calls it at publication (RunRunner.publishFlightSource): only after every executor-dependent terminal sink, never under a
+   * safety, journal or bare lock.
+   */
+  sealLifetime?(sourceUse: object): Promise<ExecutorSealResult>;
+  /** True only for the exact, still-current seal this executor issued for `sourceUse`. */
+  acceptsLifetimeSeal?(seal: unknown, sourceUse: object): seal is ExecutorTerminalSeal;
+  /**
    * Group-kill every subprocess the agent spawned for the last run. The runner
    * calls this BEFORE any PAT-bearing git op (push) so an agent-backgrounded
    * process cannot survive to read the PAT out of the git child's /proc/environ
@@ -997,6 +1028,10 @@ export interface Executor {
    * inside `run()`), this is readable before the runner clone is seeded, so the seed can make
    * the clone self-contained. Every other executor leaves it unset. */
   readonly sandboxesCommands?: boolean;
+  /** issue #3404 M2: this executor's lifetime incarnation, the value a source-use admission binds
+   * (`admitSourceUse(tx, clonePath, { executor })`) before the executor launches anything against the
+   * flight's clone. Only the Codex executor has one; every other executor leaves it unset. */
+  readonly executorIncarnation?: string;
   /** Issue #1604: true when run() awaits a resumed claim's pending gate inputs
    * (ctx.takeResumedGateEvent) and may RE-PRESENT its persisted unapproved plan at the gate
    * (resume_phase "awaiting_approval"). The runner then lets the re-presented gate keep epoch 0.

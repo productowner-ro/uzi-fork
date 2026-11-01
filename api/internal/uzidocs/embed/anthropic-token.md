@@ -21,7 +21,7 @@ Either works; pick the one that matches how you pay for Claude.
 | Credential | How you get it | Best for |
 |---|---|---|
 | **OAuth token** | `claude setup-token` (needs the Claude Code CLI and a Claude Pro/Max subscription login) | Anyone already on Claude Code; billed against your subscription. |
-| **Console API key** | [console.anthropic.com](https://console.anthropic.com) → **API keys** → **Create key** | Anyone on usage-based API billing without a subscription. |
+| **Console API key** | [platform.claude.com](https://platform.claude.com/) → **API keys** → **Create key** | Anyone on usage-based API billing without a subscription. |
 
 Both paste into the same field; uzi doesn't check for a particular prefix,
 so either kind is accepted. Storing one of each is the common reason to hold
@@ -51,11 +51,11 @@ set by Anthropic's terms, not by uzi.
 
 ## 1. Mint a credential
 
-- **OAuth token**: install the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/overview)
+- **OAuth token**: install the [Claude Code CLI](https://code.claude.com/docs/en/overview)
   if needed, then run `claude setup-token`. It opens your browser to sign
   in and prints a long-lived token to your terminal: copy it, then clear
   your terminal scrollback/history if it persists.
-- **Console API key**: sign in at [console.anthropic.com](https://console.anthropic.com),
+- **Console API key**: sign in at [platform.claude.com](https://platform.claude.com/),
   open **API keys**, **Create key**, and copy it; the console shows it
   only once.
 
@@ -178,7 +178,8 @@ The emptiest token wins. When two are within a few points of each other, the
 one that **replenishes soonest** wins — and it is the reset of the window
 that is actually holding it back, because a 5-hour reset does not relieve a
 7-day cap. Ties beyond that are broken deterministically, so the same inputs
-always give the same answer.
+always give the same answer. A token whose plan has no 5-hour window is ranked
+on its 7-day headroom alone.
 
 A small bias spreads work: each run already in flight on a token counts
 slightly against it, so several claims arriving inside one polling interval
@@ -489,13 +490,96 @@ Click **Delete** on the token's row. Two rules:
   with a hint explaining why. Deleting your *last* token is allowed, and returns you
   to the disconnected state: no token, no runs.
 
+## Vault choice
+
+In **Settings → Protect my credentials with my password (vault)**, choose
+whether personal credentials use password protection. The same choice covers
+[OpenAI keys and Codex logins](./codex-credentials.md).
+
+- **On (protected)** uses a per-user key wrapped with your login password.
+  It makes theft of the database together with the server key insufficient
+  to open those credentials, subject to password strength and retained
+  master-sealed copies. A compromised running server can still read them
+  while unlocked. Password login unlocks the vault; its key stays in server
+  memory until **Lock vault** or a server restart. After a restart, an
+  eligible foreground browser request can re-unlock with a live browser
+  grant; otherwise unlock with your password or vault passphrase. Losing
+  both that secret and remaining usable key material makes protected
+  contents unrecoverable; there is no recovery workflow.
+- **Off (unprotected)** still encrypts credentials at rest, using the server
+  key like forge bot tokens. Theft of both the database and server key exposes
+  them. There is no vault wrapper, unlock step or lock notice; runs and usage
+  polling continue after restarts without unlocking.
+
+To turn On, verify your login password. If you use SSO without a password,
+create and confirm a dedicated vault passphrase of **12–1024 UTF-8 bytes**;
+this is create-only, with no passphrase change or recovery flow. Linking SSO
+to a password account retains its mode and password-based vault semantics.
+To turn Off, first unlock your protected vault; your administrator must allow
+optional protection. Login, seed startup and ordinary unlock do not turn
+protection On for an Off account.
+
+### Re-unlock after a restart
+
+**Re-unlock automatically in this browser** in Settings is on by default.
+Despite the label, this is **account-wide permission**: turning it off revokes
+every browser's grants. Turning it on alone creates no grant; verify your
+password/passphrase through interactive unlock, password login or enrollment.
+An SSO callback does not mint a grant.
+
+On HTTPS, the browser receives a Secure, HttpOnly, SameSite=Strict, host-only
+cookie scoped to /api. With a valid session and its CSRF header, an eligible
+foreground request can restore your vault after restart. Hidden-tab polling,
+passive requests and WebSocket connections do not restore it. On HTTP there
+is no secret browser cookie; unlock manually after restart.
+
+Runs of a user who keeps the vault still wait after a restart until that user opens or focuses a uzi tab.
+
+The CLI does not get a keyslot here.
+This does not provide unattended continuity. You can still use
+[`uzi vault unlock`](./cli.md#vault-check-status-and-unlock) manually.
+
+The administrator's browser grant lifetime defaults to **7 days**, adjustable
+from **1 to 30 days**. A grant expires at the earlier of that lifetime and the
+session expiry at mint time; session refresh does not extend it. Lowering the
+setting affects new grants. Expiry does not lock an already unlocked vault.
+Up to **32 browser grants** are retained per account; newer grants can displace
+the oldest. Browser identity survives session refresh; fresh login gets a new
+identity.
+
+**Lock vault** revokes browser grants and locks the vault. Global logout
+revokes sessions and grants but leaves an already cached vault key available
+to runs. Turning off automatic re-unlock revokes grants without locking an
+already unlocked vault. Password changes, turning protection Off, vault
+recreation and account deactivation also revoke grants. A usable browser grant
+or cached key can preserve access after a forgotten password, but this adds
+no password-reset or passphrase-recovery feature. See the
+[threat model](./vault-threat-model.md#browser-re-unlock) for cookie-theft risks.
+
+### Enrollment and conversion
+
+New users start Off on an optional-policy instance and protected on a
+required-policy instance. If your administrator later requires protection,
+an existing Off account stays runnable and keeps prompting you to enroll
+until you enable it. Changing policy does not convert your credentials.
+
+Enabling or disabling converts saved personal credentials together, including
+both live and recovery Codex logins. A resource-limit refusal reports measured
+totals and limits and leaves your mode and credentials unchanged: remove
+credentials through their existing management UI before retrying. Removing a
+saved Codex alias need not remove its underlying account, so it need not free
+conversion capacity. If the outcome is **uncertain**, refresh vault status
+before retrying and unlock if protection is enabled; the change may have
+committed. Credentials previously stored Off may remain in backups after
+enabling: rotate them to address that exposure.
+
 ## Good to know
 
 - **Encrypted, never returned.** uzi seals each token at rest and never
   echoes it back in any response or log; see
   [ARCHITECTURE.md](../ARCHITECTURE.md#secrets-per-user-credentials-at-rest)
-  for the mechanism and [the vault threat model](./vault-threat-model.md) for
-  what that does and does not protect against.
+  for the mechanism and [Vault choice](#vault-choice) for what your protection
+  setting means. Admins can read [the vault threat model](./vault-threat-model.md).
 - **Save does not wait for a verdict.** Saving or replacing a token requests
   a best-effort background usage poll, so a meter or rejection may appear soon
   afterwards; the save succeeds without waiting for that poll. Use **Test** on
@@ -516,9 +600,11 @@ Click **Delete** on the token's row. Two rules:
   token is a bearer credential, and if it could mint or replace Anthropic
   credentials, a stolen one could swap out your account's credentials rather
   than merely read their names. See [the CLI guide](./cli.md#anthropic-tokens).
-- **Key rotation resets everything.** If an operator rotates the server's
-  master key, every stored token (yours included) must be re-pasted; see
-  [configuration.md](./configuration.md).
+- **Master-key rotation affects server-key-sealed material.** Off tokens,
+  legacy master-sealed rows and server-key-sealed Codex recovery copies become
+  unreadable when that key is replaced. Protected tokens already sealed under
+  a DEK remain decryptable with their password-wrapped key; replacing the
+  server key alone does not invalidate them. See [Vault choice](#vault-choice).
 - **Which model runs against it?** See [Worker model](./worker-model.md),
   further down the Settings page, to pick or override the Claude model your
   runs use.

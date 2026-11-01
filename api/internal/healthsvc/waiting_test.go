@@ -72,6 +72,84 @@ func TestWaitingM2Evaluation(t *testing.T) {
 	}
 }
 
+// Even a stale stored upgrade reason must be revalidated against manual intent.
+// Both real checks share confirmation, but retain their ordinary 5m/10m/30m ages.
+func TestWaitingManualCordonEvaluation(t *testing.T) {
+	for _, age := range []time.Duration{6 * time.Minute, 40 * time.Minute} {
+		for _, mode := range []string{"manual only", "manual plus image roll", "suitable uncordoned peer", "assigned continuation", "upgrade only"} {
+			t.Run(age.String()+"/"+mode, func(t *testing.T) {
+				id, owner := uuid.New(), uuid.New()
+				since := pgtype.Timestamptz{Time: fixedNow.Add(-age), Valid: true}
+				reason := pgtype.Text{String: workersvc.ReasonWorkersUpgrading, Valid: true}
+				counts := store.CountOnlineWorkersClaimableForRunRow{
+					ManualSuitable: 1, ManualCordoned: 1,
+					LatestSuitableDrainingSince: since,
+				}
+				switch mode {
+				case "manual plus image roll":
+					counts.DrainingEligible = 1
+				case "suitable uncordoned peer":
+					counts.ManualSuitable = 2
+					counts.DrainingEligible = 1
+					counts.NonDrainingEligible = 1
+				case "assigned continuation":
+					counts.DrainingEligible = 1
+					counts.SuitableOwnDraining = 1
+					counts.Claimable = 1
+					counts.AssignedClaimable = 1
+				case "upgrade only":
+					counts.ManualCordoned = 0
+					counts.DrainingEligible = 1
+				}
+				f := &fakeStore{
+					capacityRows: []store.ListOwnersWaitingNoCapacityRow{{RunID: id, UserID: owner, HealthSince: since, HealthReason: reason}},
+					waitingRows:  []store.ListWaitingWorkerRunsRow{{RunID: id, UserID: owner, HealthSince: since, HealthReason: reason}},
+					controller:   pgtype.Timestamptz{Time: fixedNow, Valid: true},
+				}
+				s := newSvc(f, &fakeSettings{healthEnabled: true})
+				calls := 0
+				s.cfg.WorkerEligibilityForHealth = func(_ context.Context, _ time.Time, run uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error) {
+					if run != id {
+						t.Fatalf("confirmation run=%s want=%s", run, id)
+					}
+					calls++
+					return counts, nil
+				}
+				d, err := s.Evaluate(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCap, wantQueue := sevDanger, sevOK
+				if age == 40*time.Minute {
+					wantQueue = sevDanger
+				}
+				if mode == "upgrade only" {
+					wantCap, wantQueue = sevOK, sevOK
+				}
+				seen := map[string]bool{}
+				for _, c := range d.Checks {
+					want := ""
+					switch c.ID {
+					case "fleet.capacity":
+						want = wantCap
+					case "queue.waiting":
+						want = wantQueue
+					default:
+						continue
+					}
+					seen[c.ID] = true
+					if c.Severity != want {
+						t.Fatalf("%s: severity=%s want=%s summary=%q", c.ID, c.Severity, want, c.Summary)
+					}
+				}
+				if !seen["fleet.capacity"] || !seen["queue.waiting"] || calls != 1 {
+					t.Fatalf("missing evaluation checks or shared confirmation: seen=%v calls=%d", seen, calls)
+				}
+			})
+		}
+	}
+}
+
 func TestWaitingM2InvalidAndEvidence(t *testing.T) {
 	for _, bad := range []pgtype.Timestamptz{{}, {Valid: true, InfinityModifier: pgtype.Infinity}, {Valid: true, InfinityModifier: pgtype.NegativeInfinity}, {Valid: true}, {Valid: true, Time: fixedNow.Add(time.Second)}} {
 		for _, danger := range []bool{false, true} {
@@ -100,7 +178,7 @@ func TestWaitingM2InvalidAndEvidence(t *testing.T) {
 			text := ""
 			named := 0
 			for _, e := range c.Evidence {
-				text += e.Value
+				text += e.RunID + e.Value
 				if e.Label == "Waiting run" {
 					named++
 				}
@@ -215,11 +293,11 @@ func TestWaitingM2LateSuccessAndSharedBudget(t *testing.T) {
 			}
 			late := map[uuid.UUID]bool{second: false, third: false}
 			for _, e := range c.Evidence {
-				if strings.Contains(e.Value, first.String()) {
+				if e.RunID == first.String() {
 					t.Fatal("timely memo was discarded after expiry")
 				}
 				for id := range late {
-					if strings.Contains(e.Value, id.String()) {
+					if e.RunID == id.String() {
 						late[id] = true
 					}
 				}
@@ -303,7 +381,7 @@ func TestWaitingM2QueueConfirmationFallback(t *testing.T) {
 				t.Fatalf("check=%+v calls=%d want=%d", c, calls, tc.calls)
 			}
 			if tc.want == sevUnknown {
-				if c.Since != nil || c.Summary != "Waiting run age is unavailable." || !strings.Contains(c.Evidence[0].Value, "waited unavailable;") {
+				if c.Since != nil || c.Summary != "Waiting run age is unavailable." || !strings.Contains(c.Evidence[0].Value, "waited unavailable.") {
 					t.Fatalf("unknown wait=%+v", c)
 				}
 			} else if c.Since == nil || *c.Since != valid.Time.Format(time.RFC3339) || c.Summary != "A run has been waiting for a worker for 40m." {

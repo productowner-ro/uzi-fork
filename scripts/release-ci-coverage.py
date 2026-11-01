@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Fail-closed release coverage and tagged smoke, using only git and gh reads."""
+"""Fail-closed release coverage, smoke and publication, using git and gh reads."""
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -13,10 +14,18 @@ class Refusal(Exception):
     """Coverage is absent, failed, or cannot be established."""
 
 
+class TransientAPIError(Refusal):
+    """A recognized temporary gh API failure; evidence remains unproven."""
+
+
 def command(*args):
     result = subprocess.run(args, capture_output=True, check=False)
     if result.returncode:
-        raise Refusal(f"{args[0]} failed: {result.stderr.decode(errors='replace').strip()}")
+        error = result.stderr.decode(errors='replace').strip()
+        temporary = (re.search(r'\bHTTP (?:429|5[0-9]{2})\b', error)
+                     or re.search(r'i/o timeout|TLS handshake timeout|connection reset by peer|temporary failure in name resolution', error, re.I))
+        refusal = TransientAPIError if args[:2] == ('gh', 'api') and temporary else Refusal
+        raise refusal(f"{args[0]} failed: {error}")
     return result.stdout.decode()
 
 
@@ -25,6 +34,16 @@ def git(*args):
 
 
 VERSION = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?"
+
+
+def skips_ci(message):
+    """Recognize documented skip instructions, never infer them from absent CI."""
+    message = message.replace('\r\n', '\n')
+    if any('[' + instruction + ']' in message for instruction in
+           ('skip ci', 'ci skip', 'no ci', 'skip actions', 'actions skip')):
+        return True
+    # GitHub requires two blank lines before trailers, with skip-checks last.
+    return bool(re.search(r'(?:\A|\n)\n\n(?:[A-Za-z0-9-]+:[^\n]*\n)*skip-checks: ?true[ \t]*\n*\Z', message))
 
 
 def normalize_scalar(text, key, indent=0):
@@ -223,7 +242,7 @@ def metadata_chain(sha, hops=2):
     return chain
 
 
-def coverage(api, sha, parent, inherit, wait, interval, tag=None, chain=None):
+def coverage(api, sha, parent, inherit, wait, interval, tag=None, chain=None, tip=False):
     deadline = time.monotonic() + wait
     workflows = ('ci.yml', 'kind-smoke.yml')
     candidates = chain if chain is not None else ([sha, parent] if inherit else [sha])
@@ -238,6 +257,8 @@ def coverage(api, sha, parent, inherit, wait, interval, tag=None, chain=None):
                 heads = runs
             if any(state(r) == 'failed' for r in runs.values()):
                 raise Refusal(f'coverage SHA {candidate} has failed CI: {runs}; chain={visited}')
+            if tip and any(run is None for run in runs.values()) and skips_ci(git('show', '-s', '--format=%B', sha)):
+                raise Refusal('skip-ci-tip: required exact main-push proof is absent; use a newer CI-bearing main tip')
             if candidate == sha:
                 exception = hotfix_exception(sha, tag) if tag else None
                 if exception:
@@ -278,13 +299,34 @@ def smoke(api, sha, tag, wait, interval):
         time.sleep(min(interval, max(0, deadline - time.monotonic())))
 
 
+def published(api, sha, tag, wait, interval):
+    if not math.isfinite(wait) or not math.isfinite(interval) or wait < 0 or interval <= 0:
+        raise Refusal('invalid publication poll bounds')
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            release = api.run('release.yml', sha, tag)
+            current = state(release)
+        except TransientAPIError:
+            release = None
+            current = 'temporary API failure'
+        if current == 'success':
+            print(f'PASS release published: {tag}, SHA {sha}, run {release["id"]}, attempt {release["run_attempt"]}')
+            return
+        if time.monotonic() >= deadline:
+            raise Refusal(f'release {tag} at {sha} not successful (latest state: {current})')
+        # A failed publication attempt may be recovered by the existing bounded watcher.
+        print(f'Waiting for release publication {tag} at {sha}: {current}', flush=True)
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('metadata', 'coverage', 'tip', 'smoke', 'annotation'))
+    parser.add_argument('mode', choices=('metadata', 'coverage', 'tip', 'smoke', 'annotation', 'published', 'publication'))
     parser.add_argument('ref')
     parser.add_argument('other', nargs='?')
     parser.add_argument('--repo')
-    parser.add_argument('--tag', help='actual annotated release tag; enables the explicit hotfix exception')
+    parser.add_argument('--tag', help='actual release tag; coverage uses it for the annotated hotfix exception')
     parser.add_argument('--wait', type=float, default=2700)
     parser.add_argument('--interval', type=float, default=15)
     parser.add_argument('--hops', type=int, default=2,
@@ -308,15 +350,24 @@ def main():
             raise Refusal('no explicit annotated hotfix intent')
         print(f'UNVERIFIED hotfix annotation: no full CI evidence; tag {args.tag}, SHA {sha}')
         return
+    if args.mode == 'published' and (not args.tag or not re.fullmatch('v' + VERSION, args.tag)):
+        raise Refusal('published needs a valid release tag')
     repo = args.repo or os.environ.get('GITHUB_REPOSITORY') or command('gh', 'repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner').strip()
     api = GitHub(repo)
-    if args.mode == 'smoke':
+    if args.mode == 'publication':
+        if not args.tag or not re.fullmatch('v' + VERSION, args.tag):
+            raise Refusal('publication needs a valid release tag')
+        print(state(api.run('release.yml', sha, args.tag)))
+        return
+    if args.mode == 'published':
+        published(api, sha, args.tag, args.wait, args.interval)
+    elif args.mode == 'smoke':
         if not args.other or not re.fullmatch('v' + VERSION, args.other):
             raise Refusal('smoke needs a valid release tag')
         smoke(api, sha, args.other, args.wait, args.interval)
     else:
         chain = metadata_chain(sha, args.hops) if args.mode == 'coverage' else [sha]
-        unverified = coverage(api, sha, None, False, args.wait, args.interval, args.tag if args.mode == 'coverage' else None, chain=chain)
+        unverified = coverage(api, sha, None, False, args.wait, args.interval, args.tag if args.mode == 'coverage' else None, chain=chain, tip=args.mode == 'tip')
         if args.mode == 'coverage' and os.environ.get('GITHUB_OUTPUT'):
             with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
                 output.write(f'hotfix_unverified={str(unverified).lower()}\n')

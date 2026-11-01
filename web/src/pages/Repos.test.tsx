@@ -25,6 +25,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       setRepoDevboxOptIn: vi.fn(),
       setRepoFoldImproveUziBacklog: vi.fn(),
       setRepoRequiredCapabilities: vi.fn(),
+      setRepoIgnoredInferredCapabilities: vi.fn(),
       setRepoGuardrailOverride: vi.fn(),
       clearRepoGuardrailOverride: vi.fn(),
       requestGuardrailOverride: vi.fn(),
@@ -140,6 +141,7 @@ describe("Repos — always-visible repo-agents guide link (PRD #57 M3)", () => {
     renderPage();
     await screen.findByText("vtmocanu/uzi");
     const docLink = screen.getByRole("link", { name: "repo agents" });
+    expect(screen.getByRole("heading", { name: "Repos" })).toBeTruthy();
     expect(docLink.getAttribute("href")).toBe("/docs/repo-agents");
   });
 });
@@ -592,7 +594,7 @@ describe("Repos — static capability hint (PRD #84 M2)", () => {
 
     fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
     // The fixed vocabulary renders as two checkboxes; tick docker.
-    const docker = await screen.findByRole("checkbox", { name: "docker" });
+    const docker = within(await screen.findByRole("group", { name: "Required capabilities" })).getByRole("checkbox", { name: "docker" });
     expect((docker as HTMLInputElement).checked).toBe(false);
     fireEvent.click(docker);
 
@@ -612,13 +614,42 @@ describe("Repos — static capability hint (PRD #84 M2)", () => {
     await screen.findByText("vtmocanu/uzi");
 
     fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
-    const docker = (await screen.findByRole("checkbox", { name: "docker" })) as HTMLInputElement;
+    const docker = within(await screen.findByRole("group", { name: "Required capabilities" })).getByRole("checkbox", { name: "docker" }) as HTMLInputElement;
     expect(docker.checked).toBe(true);
     fireEvent.click(docker);
 
     await waitFor(() =>
       expect(mockApi.setRepoRequiredCapabilities).toHaveBeenCalledWith("repo-uzi", ["jvm"]),
     );
+  });
+});
+
+describe("Repos ignored inference policy", () => {
+  it("changes only the ignored set and explains declared-hint precedence", async () => {
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...REPOS[0], required_capabilities: ["jvm"] }] });
+    mockApi.setRepoIgnoredInferredCapabilities.mockResolvedValue({ repo: { ...REPOS[0], required_capabilities: ["jvm"], ignored_inferred_capabilities: ["jvm"] } });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
+    const group = await screen.findByRole("group", { name: "Ignored inferred capabilities" });
+    fireEvent.click(within(group).getByRole("checkbox", { name: "jvm" }));
+    await waitFor(() => expect(mockApi.setRepoIgnoredInferredCapabilities).toHaveBeenCalledWith("repo-uzi", ["jvm"]));
+    expect(mockApi.setRepoRequiredCapabilities).not.toHaveBeenCalled();
+    expect(await within(group).findByRole("note")).toHaveProperty("textContent", "Explicit requirements take precedence: jvm remain required.");
+    expect(within(screen.getByRole("group", { name: "Required capabilities" })).getByRole("checkbox", { name: "jvm" })).toHaveProperty("checked", true);
+  });
+
+  it("can clear ignored inference without clearing the declared hint", async () => {
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...REPOS[0], required_capabilities: ["jvm"], ignored_inferred_capabilities: ["jvm"] }] });
+    mockApi.setRepoIgnoredInferredCapabilities.mockResolvedValue({ repo: { ...REPOS[0], required_capabilities: ["jvm"], ignored_inferred_capabilities: [] } });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
+    const group = await screen.findByRole("group", { name: "Ignored inferred capabilities" });
+    fireEvent.click(within(group).getByRole("checkbox", { name: "jvm" }));
+    await waitFor(() => expect(mockApi.setRepoIgnoredInferredCapabilities).toHaveBeenCalledWith("repo-uzi", []));
+    await waitFor(() => expect(within(group).queryByRole("note")).toBeNull());
+    expect(mockApi.setRepoRequiredCapabilities).not.toHaveBeenCalled();
   });
 });
 
@@ -775,6 +806,48 @@ describe("Repos — enable guardrail 422 violations (PRD #345)", () => {
     fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
     await waitFor(() => expect(screen.queryByText("reason one")).toBeNull());
     expect(screen.queryByText("reason two")).toBeNull();
+  });
+
+  // The refusal renders above the repo list; clicking Enable on a row far down a long
+  // list left it off-screen, so the click read as "nothing happens". It must scroll in,
+  // smoothly unless the user asked for reduced motion.
+  it.each([
+    { reduce: false, behavior: "smooth" },
+    { reduce: true, behavior: "auto" },
+  ])("scrolls the refusal into view when an enable is refused (reduced motion: $reduce)", async ({ reduce, behavior }) => {
+    const scrolled: { el: Element; opts?: ScrollIntoViewOptions }[] = [];
+    const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+    const originalMatchMedia = window.matchMedia;
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value(this: HTMLElement, opts?: ScrollIntoViewOptions) {
+        scrolled.push({ el: this, opts });
+      },
+    });
+    window.matchMedia = ((query: string) => ({
+      matches: reduce && query.includes("prefers-reduced-motion: reduce"),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    try {
+      mockApi.setRepoEnabled.mockRejectedValue(
+        new ApiError(422, "this repo was not enabled", { violations: ["reason one"] }),
+      );
+      renderPage();
+      await screen.findByText("example/website");
+      fireEvent.click(within(rowFor("example/website")).getByRole("button", { name: /^Enable$/ }));
+
+      await screen.findByText("reason one");
+      await waitFor(() => {
+        const hit = scrolled.find((s) => s.el.contains(screen.getByText("reason one")));
+        expect(hit?.opts).toEqual({ block: "nearest", behavior });
+      });
+    } finally {
+      window.matchMedia = originalMatchMedia;
+      if (original) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", original);
+      else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+    }
   });
 });
 

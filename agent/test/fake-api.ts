@@ -209,6 +209,7 @@ export class FakeApi {
     if (this.admittedAttempts.has(runId)) this.admittedAttempts.set(runId, count);
     this.publicationState.set(runId, { deferred, attempts: count });
   }
+  checkpointPublishHttpStatus = 404;
   stateAckWire?: (body: StateRequest, run: Record<string, unknown>) => { status: number; body: unknown } | undefined;
   completionAttemptHttpStatus = 200;
   completionAttemptDropReplies = 0;
@@ -232,6 +233,7 @@ export class FakeApi {
     {
       matchesState: (body: StateRequest) => boolean;
       httpStatus: number;
+      error?: string;
       runStatus?: string;
       // PRD #1247 M5b: when set, a 409 refusal carries this TOP-LEVEL disposition (e.g.
       // "stale_claim"), the shape the server produces when a held-state switch released this
@@ -421,6 +423,13 @@ export class FakeApi {
   completionAttemptWire: ((body: Record<string, unknown>) => Record<string, unknown>) | undefined;
   readonly completionAttemptRequests: Record<string, unknown>[] = [];
   completionPermitScope: NonNullable<CompletionPermitResponse["permit"]>["completion_scope"] = {};
+  /** Value-level knobs (PRD #1232 M2): the server-authoritative unmet milestone ids the attempt
+   *  reply carries (default none) and, on a permit denial, the `unmet` ids; plus the granted
+   *  permit's id (default `permit-<runId>`). Unlike the *Wire hooks they leave the reply shape
+   *  to the fake, so a wire-parity test can compare the fake's own bytes to a recorded fixture. */
+  private completionAttemptUnmet: string[] = [];
+  private completionPermitDenyUnmet: string[] | undefined;
+  private completionPermitId: string | undefined;
   private completionPermitGranted = true;
   private completionPermitDenyReason: string | undefined;
   private completionPermitHttpStatus = 200;
@@ -444,6 +453,15 @@ export class FakeApi {
   readonly interruptedCallsGets: Array<{ runId: string; generation: string | null; nonce: string | undefined }> = [];
   readonly decisionsMemoGets: Array<{ runId: string; claimGeneration: string | null }> = [];
   readonly decisionsMemoPosts: Array<{ runId: string; body: { claim_generation?: number; body?: string } }> = [];
+
+  /** PRD #3244: the lead-config route. Every POST body is recorded in `leadConfigPosts`; the
+   *  answer is the next entry of `leadConfig.queue` (consumed in order), else `leadConfig.fallback`
+   *  (default 204 = stored). A non-204 status answers `{error, reason}` like httpx.ErrorReason when `reason` is set. */
+  leadConfig: {
+    queue: Array<{ status: number; reason?: string }>;
+    fallback: { status: number; reason?: string };
+  } = { queue: [], fallback: { status: 204 } };
+  readonly leadConfigPosts: Array<{ runId: string; body: Record<string, unknown> }> = [];
 
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
@@ -591,6 +609,7 @@ export class FakeApi {
     matchesState: (body: StateRequest) => boolean,
     opts: {
       httpStatus?: number;
+      error?: string;
       runStatus?: string;
       disposition?: string;
       holdReason?: string;
@@ -600,6 +619,7 @@ export class FakeApi {
     this.stateFailWhen.set(runId, {
       matchesState,
       httpStatus: opts.httpStatus ?? 409,
+      error: opts.error,
       runStatus: opts.runStatus,
       disposition: opts.disposition,
       holdReason: opts.holdReason,
@@ -1098,6 +1118,21 @@ export class FakeApi {
     this.completionPermitFailTimes = opts.failTimes;
   }
 
+  /** Value-level: the unmet milestone ids the next completion-attempt replies carry. */
+  setCompletionAttemptUnmet(ids: string[]): void {
+    this.completionAttemptUnmet = [...ids];
+  }
+
+  /** Value-level: the `unmet` ids a denied permit reply carries (omitted when never set). */
+  setCompletionPermitDenyUnmet(ids: string[]): void {
+    this.completionPermitDenyUnmet = [...ids];
+  }
+
+  /** Value-level: the id a granted permit carries (default `permit-<runId>`). */
+  setCompletionPermitId(id: string): void {
+    this.completionPermitId = id;
+  }
+
   /** Observe each /state report as it lands, so a test can react to a value the
    *  WORKER minted rather than one the test guessed. PRD #88 needs this: the answer
    *  to a clarification must name the question id the runner generated at the park,
@@ -1143,7 +1178,10 @@ export class FakeApi {
     // The checkpoint broker streams a Git pack, not JSON. This fake has no publisher:
     // preserve the ordinary missing-route answer instead of throwing on the PACK header.
     if (req.method === "POST" && /^\/api\/worker\/runs\/[^/]+\/publish$/.test(p))
-      return send(res, 404, { error: "not found", path: p });
+      return send(res, this.checkpointPublishHttpStatus, {
+        error: this.checkpointPublishHttpStatus === 404 ? "not found" : "checkpoint unavailable",
+        path: p,
+      });
     const json: Record<string, unknown> = body ? JSON.parse(body) : {};
 
     if (req.method === "POST" && p === "/api/worker/register") {
@@ -1637,6 +1675,15 @@ export class FakeApi {
       }
     }
 
+    // PRD #3244: the lead-config route.
+    const leadConfigMatch = /^\/api\/worker\/runs\/([^/]+)\/lead-config$/.exec(p);
+    if (leadConfigMatch && req.method === "POST") {
+      this.leadConfigPosts.push({ runId: leadConfigMatch[1] as string, body: json as Record<string, unknown> });
+      const answer = this.leadConfig.queue.shift() ?? this.leadConfig.fallback;
+      if (answer.status === 204) return sendEmpty(res, 204);
+      return send(res, answer.status, answer.reason ? { error: "fake lead-config refusal", reason: answer.reason } : {});
+    }
+
     // PRD #1798 M6: the pr-description routes, answered by an in-memory model when a test installs
     // one (prDescription); without one they fall through to the 404 below, like an older api.
     const prDescMatch = /^\/api\/worker\/runs\/([^/]+)\/pr-description\/(stage|bind|lookup|ack)$/.exec(p);
@@ -1655,7 +1702,7 @@ export class FakeApi {
       if (this.completionAttemptRequests.length <= this.completionAttemptFailTimes && this.completionAttemptHttpStatus !== 200)
         return send(res, this.completionAttemptHttpStatus, { error: this.completionAttemptHttpStatus === 409 ? "run is not in a live claimed state for this worker" : "injected attempt failure" });
       const count = (this.admittedAttempts.get(runId) ?? this.publicationState.get(runId)?.attempts ?? 0) + 1;
-      const reply = this.completionAttemptWire?.(json) ?? { unmet: [], attempt_count: count };
+      const reply = this.completionAttemptWire?.(json) ?? { unmet: this.completionAttemptUnmet, attempt_count: count };
       this.admittedAttempts.set(runId, count);
       const state = this.publicationState.get(runId);
       if (state) state.attempts = count;
@@ -1680,12 +1727,15 @@ export class FakeApi {
       if (this.completionPermitWire) return send(res, 200, this.completionPermitWire(json));
       const body: Record<string, unknown> = { granted: this.completionPermitGranted };
       if (this.completionPermitGranted) body.permit = {
-        id: `permit-${runId}`, contract_revision: json.contract_revision,
+        id: this.completionPermitId ?? `permit-${runId}`, contract_revision: json.contract_revision,
         branch: json.branch, head: json.head, issued_at: "2026-10-17T00:00:00Z", finding_ids: [],
         ...(this.completionPermitScope !== undefined ? { completion_scope: this.completionPermitScope } : {}),
       };
       if (!this.completionPermitGranted && this.completionPermitDenyReason !== undefined) {
         body["deny_reason"] = this.completionPermitDenyReason;
+      }
+      if (!this.completionPermitGranted && this.completionPermitDenyUnmet !== undefined) {
+        body["unmet"] = this.completionPermitDenyUnmet;
       }
       return send(res, 200, body);
     }
@@ -1770,10 +1820,11 @@ export class FakeApi {
     send(res, 200, { accepted: incoming.length });
   }
 
-  /** PRD #1795 M1: classify an awaiting_approval report against the run's gate (the real
-   *  api's gate_revision.go), applying an accepted one's allocation / adoption. */
-  private classifyGate(runId: string, body: StateRequest): { revision: number } | { refused: string } {
-    const gate: FakeGate = this.gateByRun.get(runId) ?? {
+  /** Classify on a copy: source-fenced reports must pass their checks before allocation,
+   *  adoption or counter resets become visible (issue #3395; api's gate_revision.go). */
+  private classifyGate(runId: string, body: StateRequest): { gate: FakeGate; revision: number } | { gate: FakeGate; refused: string } {
+    const current = this.gateByRun.get(runId);
+    const gate: FakeGate = current ? { ...current, presentations: new Map(current.presentations) } : {
       revision: 0,
       currentId: null,
       presentations: new Map(),
@@ -1781,27 +1832,26 @@ export class FakeApi {
       countedGeneration: undefined,
       refusals: 0,
     };
-    this.gateByRun.set(runId, gate);
     const effective = normalizePayload(body, gate.snapshot);
     const same = JSON.stringify(effective) === JSON.stringify(gate.snapshot);
     const id = body.presentation_id;
-    const accept = (): { revision: number } => {
+    const accept = (): { gate: FakeGate; revision: number } => {
       gate.refusals = 0;
       gate.countedGeneration = undefined;
-      return { revision: gate.revision };
+      return { gate, revision: gate.revision };
     };
     if (body.adopt_gate_revision !== undefined) {
       if (id === undefined || gate.revision <= 0 || gate.revision !== body.adopt_gate_revision || gate.currentId !== null || !same) {
         // A retry after a lost adoption ACK is a current-id retry.
         if (id !== undefined && id === gate.currentId && same) return accept();
-        return { refused: "gate_adoption_stale" };
+        return { gate, refused: "gate_adoption_stale" };
       }
       gate.currentId = id;
       gate.presentations.set(id, gate.revision);
       return accept();
     }
-    if (id !== undefined && id === gate.currentId) return same ? accept() : { refused: "gate_presentation_conflict" };
-    if (id !== undefined && gate.presentations.has(id)) return { refused: "gate_presentation_historical" };
+    if (id !== undefined && id === gate.currentId) return same ? accept() : { gate, refused: "gate_presentation_conflict" };
+    if (id !== undefined && gate.presentations.has(id)) return { gate, refused: "gate_presentation_historical" };
     gate.revision++;
     gate.currentId = id ?? null;
     if (id !== undefined) gate.presentations.set(id, gate.revision);
@@ -1898,7 +1948,7 @@ export class FakeApi {
           ...(when.disposition ? { disposition: when.disposition } : {}),
         });
       }
-      return send(res, when.httpStatus, { error: "injected state failure" });
+      return send(res, when.httpStatus, { error: when.error ?? "injected state failure" });
     }
     const terminal = body.status === "completed" || body.status === "failed";
     // Both answers carry `{"run": {...}}` because BOTH real handlers do
@@ -1929,19 +1979,16 @@ export class FakeApi {
       receipt.body === JSON.stringify(body) &&
       this.gateByRun.get(runId)?.currentId === body.presentation_id &&
       this.gateByRun.get(runId)?.revision === receipt.revision;
-    if (this.planRevisionRetries && body.expected_gate_revision !== undefined &&
-        body.expected_gate_revision !== this.gateByRun.get(runId)?.revision && !receiptReplay) {
-      return send(res, 409, { reason: "stale_revision_source", run: { id: runId, status: lastStatus ?? "running" } });
-    }
     // PRD #1795 M1: classify an awaiting_approval report under the modelled run-row lock, before
     // anything is recorded: a refusal publishes nothing.
     let gateRevision: number | undefined;
+    let acceptedGate: FakeGate | undefined;
     if (this.gateRevisions && body.status === "awaiting_approval") {
       if ((body.presentation_id !== undefined || body.adopt_gate_revision !== undefined) && body.claim_generation === undefined)
         return send(res, 400, { error: "presentation_id and adopt_gate_revision require claim_generation", reason: "claim_generation_required" });
       const verdict = this.classifyGate(runId, body);
       if ("refused" in verdict) {
-        const gate = this.gateByRun.get(runId)!;
+        const gate = verdict.gate;
         this.gateRefusals.push({ runId, reason: verdict.refused, generation: body.claim_generation });
         let status = lastStatus ?? "running";
         if (gate.countedGeneration !== body.claim_generation) {
@@ -1952,10 +1999,19 @@ export class FakeApi {
             this.lastRecordedStatus.set(runId, "failed");
           }
         }
-        return send(res, 409, { run: { id: runId, status }, reason: verdict.refused });
+        this.gateByRun.set(runId, gate);
+        const reason = this.planRevisionRetries && body.expected_gate_revision !== undefined
+          ? "stale_revision_source" : verdict.refused;
+        return send(res, 409, { run: { id: runId, status }, reason });
       }
       gateRevision = verdict.revision;
+      acceptedGate = verdict.gate;
     }
+    if (this.planRevisionRetries && body.expected_gate_revision !== undefined &&
+        body.expected_gate_revision !== this.gateByRun.get(runId)?.revision && !receiptReplay) {
+      return send(res, 409, { reason: "stale_revision_source", run: { id: runId, status: lastStatus ?? "running" } });
+    }
+    if (acceptedGate) this.gateByRun.set(runId, acceptedGate);
     if (this.planRevisionRetries && gateRevision !== undefined && body.revision_input_id !== undefined) {
       const superseded = body.superseded_revision_input_ids ?? [];
       const applied = this.appliedByRun.get(runId) ?? new Set<number>();

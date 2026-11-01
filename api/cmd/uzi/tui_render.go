@@ -107,6 +107,13 @@ func (r *tuiRenderer) Plain(s string, maxRunes int) string {
 	return capCell(cellText(s), maxRunes)
 }
 
+// WorkerName preserves identifying tails within terminal columns, after D7
+// sanitization. cellText caps at 200 runes, so longer inputs have already lost
+// their original tail before this shortening step.
+func (r *tuiRenderer) WorkerName(s string, width int) string {
+	return middleCell(cellText(s), width)
+}
+
 // provenanceBox draws untrusted free text inside a bordered box titled with WHERE the
 // text came from.
 //
@@ -259,6 +266,9 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 	if status != statusRecoveryWait && stalledHealth[health] {
 		return "▲", displayHealth(health)
 	}
+	if health == "waiting_account_cooldown" && (status == "claimed" || status == "running" || status == "awaiting_approval") {
+		return "~", "account cooldown"
+	}
 	switch effectiveRunStatus(status, isPlanning, isRevising) {
 	case "running":
 		return "●", "running"
@@ -288,6 +298,9 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 		// two apart at a glance.
 		return "~", "pool wait"
 	case statusRecoveryWait:
+		if len(cause) > 0 && cause[0] == retainedRecoveryAdoptionFailedCause {
+			return "!", "recovery held"
+		}
 		if len(cause) > 0 && cause[0] == workerMemoryPressureCause {
 			return "!", "memory hold"
 		}
@@ -430,6 +443,15 @@ func tuiRejectedRun(r apitypes.RunDTO) bool {
 // runStateToken gives typed provider, Codex relogin and credential holds their
 // own tokens; other runs use stateToken. Provider markers require matching status.
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
+	if isForgeOwnerHold(r) {
+		return runToken{glyph: "!", word: "forge held", color: p.amber}
+	}
+	if isRecoveryDecisionPark(r) {
+		if isRecoveryDecisionHold(r) {
+			return runToken{glyph: "!", word: recoveryDecisionWord(r), color: p.amber}
+		}
+		return runToken{glyph: "~", word: recoveryDecisionWord(r), color: p.wait}
+	}
 	if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) != "" {
 		return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.StopKind, ""))
 	}

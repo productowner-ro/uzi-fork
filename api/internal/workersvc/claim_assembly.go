@@ -21,9 +21,11 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
+	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 	"github.com/vtmocanu/uzi/api/internal/toolseed"
@@ -183,6 +185,10 @@ func completionNonClosingClaim(run store.Run) *CompletionNonClosing {
 	return &CompletionNonClosing{Reason: run.CompletionNonClosingReason.String}
 }
 
+// errForgeOriginClaimRefused uses existing exact-generation assembly cleanup without
+// attributing missing normalization or an edited mapping to foreign ownership.
+var errForgeOriginClaimRefused = errors.New("forge origin snapshot is unknown or repository mapping changed after claim")
+
 // assembleClaim builds the claim payload for an already-claimed run. It takes the
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
@@ -216,6 +222,29 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if isolated != wkr.IsolatedLane {
 		return nil, errIsolatedLaneMismatch
 	}
+	// PRD #3522 M3: the weekly usage reserve. The gate is nil unless the reserve applies to this
+	// run (a threshold is set, the run is not chat, no manual-resume override is active, and a
+	// started run's pause toggle is on), and then rides the context into every credential
+	// resolution below (claimSecretID, judgeChoice, autoChoice, autoFloorRetry), so the credential
+	// a claim finally spends is checked, not only the one ClaimRun admitted. A Codex run is checked
+	// HERE, before anything is minted or opened: a held Codex claim leaves no capability behind.
+	gate, gerr := s.reserveGateFor(ctx, run)
+	if gerr != nil {
+		return nil, gerr
+	}
+	ctx = gate.attach(ctx)
+	// PRD #3522 M4a: a pending RESERVE pause request the reserve no longer enforces (threshold cleared,
+	// pause toggle off, a manual-resume override in force) is withdrawn BEFORE it is re-delivered, so a
+	// requeued run does not park on a request nobody would now make. The sweeper's withdraw pass is the
+	// authority for the other withdrawals (a fresh OK reading); this is only the claim-time floor.
+	if gate == nil {
+		run = s.withdrawStaleReserveRequest(ctx, run)
+	}
+	if run.Harness == harnessCodex {
+		if herr := gate.checkCodex(run); herr != nil {
+			return nil, herr
+		}
+	}
 	if run.Kind == runkind.Judge {
 		// PRD #1429 M3: the judge lane now threads the CLAIMING worker through too —
 		// assembleJudgeClaim's Codex branch needs it (codexClaimSecrets is worker-scoped),
@@ -242,11 +271,25 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return payload, nil
 	}
 
+	// GetRunClaimContext rechecks the separately loaded repo/connection against the
+	// exact-generation run_forge_origins snapshot before any URL or PAT is delivered.
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// No rows is two different things. A repo or connection delete cascades to the
-			// run, and every kind that reaches here has a repo, so a run row that still
+			if q, ok := s.q.(interface {
+				RunForgeOriginClaimRefused(context.Context, uuid.UUID) (bool, error)
+			}); ok {
+				refused, refusalErr := q.RunForgeOriginClaimRefused(ctx, run.ID)
+				if refusalErr != nil {
+					return nil, fmt.Errorf("claim origin context: %w", refusalErr)
+				}
+				if refused {
+					// Use the existing fenced assembly failure/custody cleanup.
+					return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, errForgeOriginClaimRefused)
+				}
+			}
+			// After excluding an origin refusal, distinguish deletion from ownership.
+			// A repo or connection delete cascades to the run, and every kind that reaches here has a repo, so a run row that still
 			// exists means the owner predicate (#1688) refused it: the run's repo belongs
 			// to another user. Failing that terminally (#1691) beats the silent drop,
 			// which left the run cycling claimed -> queued.
@@ -378,30 +421,36 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 	var defaultModel pgtype.Text
+	var leadSettings LeadSettings
+	leadResolved := false
 	if checkerResolution == nil && (harness != HarnessCodex || !isReviewRun) {
 		lanes, lerr := s.q.GetUserHarnessModelDefaults(ctx, run.UserID)
 		if lerr != nil {
 			return nil, fmt.Errorf("harness model defaults lookup: %w", lerr)
 		}
+		laneModel := lanes.DefaultClaudeModel
 		if harness == HarnessCodex {
-			defaultModel = lanes.DefaultCodexModel
-		} else {
-			defaultModel = lanes.DefaultClaudeModel
+			laneModel = lanes.DefaultCodexModel
 		}
-		// PRD #300 / PRD #1551 D4: a schedule can freeze a per-run model onto the run
-		// (runs.model). It wins over the owner's lane ONLY when it is compatible with the run
-		// harness; delivered on the SAME default_model claim field, so the worker is unchanged
-		// (Decision 7) and a subagent template's own model: pin still wins. An INCOMPATIBLE
-		// frozen model records the existing visible fallback note and falls back to the owner's
-		// lane for that harness (D4 as written), never the worker's bare harness default. Lane
-		// values already carry their harness and NEVER traverse harnessModelCompatible — it now
-		// screens only frozen run.model values.
-		if run.Model.Valid {
-			if harnessModelCompatible(harness, run.Model.String) {
-				defaultModel = run.Model
-			} else {
-				recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, run.Model.String)
-			}
+		// PRD #300 / PRD #1551 D4 / #3245 / #3244: resolveLeadSettings owns the lead precedence.
+		// A Claude lane holding a Codex role token is cleared (note below); a schedule's frozen
+		// runs.model wins over the owner's lane ONLY when compatible with the run harness,
+		// delivered on the SAME default_model claim field so the worker is unchanged (Decision 7)
+		// and a subagent template's own model: pin still wins. An INCOMPATIBLE frozen model
+		// records the existing visible fallback note and falls back to the lane, or the harness
+		// default when that lane is unset or dropped.
+		leadSettings = resolveLeadSettings(LeadSettingsInput{
+			Harness:   harness,
+			RunModel:  run.Model,
+			LaneModel: laneModel,
+		})
+		leadResolved = true
+		defaultModel = leadSettings.Model
+		if leadSettings.DroppedLaneModel.Valid {
+			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, leadSettings.DroppedLaneModel.String)
+		}
+		if leadSettings.DroppedRunModel.Valid {
+			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, leadSettings.DroppedRunModel.String)
 		}
 	}
 
@@ -425,10 +474,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 
 	// The run owner's per-user default reasoning effort (PRD #617). NULL now
-	// resolves to the uzi default `medium` at this sink (via resolveEffortPtr /
-	// agenttmpl.ResolveDefaultEffort, issue #1157); an explicit choice is carried
-	// verbatim. Unlike DefaultModel there is no per-schedule freeze — the owner's
-	// per-user value is the only source.
+	// resolves to the uzi default `medium` at this sink (via resolveHarnessEffortPtr /
+	// agenttmpl.ResolveHarnessEffort, issue #1157); an explicit level is carried and
+	// the owner's `runtime` choice (PRD #3247) yields no default_effort at all. Unlike
+	// DefaultModel there is no per-schedule freeze — the owner's per-user value is the
+	// only source, except for a checker child, which carries its frozen cross-check
+	// resolution (an unpinned checker is CrossCheckDefaultEffort). That checker effort
+	// is always a canonical level (validated pin or high), never `runtime`, so it
+	// passes through resolveHarnessEffortPtr unchanged and the worker's ordinary
+	// preference cannot omit it.
 	var defaultEffort pgtype.Text
 	if checkerResolution != nil {
 		defaultEffort = pgconv.TextOrNull(checkerResolution.Effort)
@@ -437,6 +491,22 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	if err != nil {
 		return nil, fmt.Errorf("default effort lookup: %w", err)
+	}
+	// PRD #3244: the effort column is read here, after the model block and its notes (statement
+	// order unchanged), so the effort half of the lead settings is completed now. A lead-lane claim
+	// ships resolveLeadEffort's value as DefaultEffort (nil for the owner's runtime default), so the
+	// value and its source come from one agenttmpl.ResolveHarnessEffort call.
+	var defaultModelSource, defaultEffortSource *string
+	shippedEffort := resolveHarnessEffortPtr(harness, defaultEffort)
+	if leadResolved && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
+		leadSettings.Effort, leadSettings.EffortSource = resolveLeadEffort(harness, defaultEffort)
+		shippedEffort = leadSettings.Effort
+		es := string(leadSettings.EffortSource)
+		defaultEffortSource = &es
+		if leadSettings.Model.Valid {
+			ms := string(leadSettings.ModelSource)
+			defaultModelSource = &ms
+		}
 	}
 
 	// The run owner's AI-attribution opt-out (issue #916), read live per claim so a
@@ -696,14 +766,19 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if err != nil {
 		return nil, err
 	}
+	coordinates, err := checkpointCoordinatesForWorker(wkr, run)
+	if err != nil {
+		return nil, err
+	}
 	payload := &ClaimPayload{
-		CIRepair:         ciRepair,
-		InventoryGuarded: inventoryGuarded,
-		RunID:            run.ID.String(),
-		Kind:             run.Kind,
-		IssueIID:         issueIID,
-		IssueTitle:       run.IssueTitle,
-		IssueDescription: run.IssueDescription,
+		CheckpointCoordinates: coordinates,
+		CIRepair:              ciRepair,
+		InventoryGuarded:      inventoryGuarded,
+		RunID:                 run.ID.String(),
+		Kind:                  run.Kind,
+		IssueIID:              issueIID,
+		IssueTitle:            run.IssueTitle,
+		IssueDescription:      run.IssueDescription,
 		// PRD #381: the structured comments snapshot, decoded above. omitempty keeps a
 		// comment-less run's claim byte-identical to today's.
 		IssueComments: issueComments,
@@ -726,16 +801,18 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		RequeueCount:   run.RequeueCount,
 		// PRD #1296 M1 (D2): the claim-lane counter the ClaimRun CTE just incremented, read
 		// straight off the returned run row and returned in the claim payload.
-		ClaimGeneration:          run.ClaimGeneration,
-		MemoryEpisode:            run.MemoryEpisode,
-		MemoryInterventionCount:  run.MemoryInterventionCount,
-		MemoryPolicy:             frozenMemoryPolicy,
-		PlanMd:                   textPtr(run.PlanMd),
-		AutoApprove:              run.AutoApprove,
-		PlanCrossCheckRequired:   run.PlanCrossCheckRequired,
-		CodeCrossCheckRequired:   run.CodeCrossCheckRequired,
-		PlanCrossCheckCodexLead:  planCrossCheckCodexLeadSupported(run),
-		PlanCrossCheckGateReason: textPtr(run.PlanCrossCheckGateReason),
+		ClaimGeneration:            run.ClaimGeneration,
+		WorkerRecoveryEpisode:      claimRecoveryEpisode(run),
+		WorkerRecoveryOwnerEpisode: run.WorkerRecoveryEpisode,
+		MemoryEpisode:              run.MemoryEpisode,
+		MemoryInterventionCount:    run.MemoryInterventionCount,
+		MemoryPolicy:               frozenMemoryPolicy,
+		PlanMd:                     textPtr(run.PlanMd),
+		AutoApprove:                run.AutoApprove,
+		PlanCrossCheckRequired:     run.PlanCrossCheckRequired,
+		CodeCrossCheckRequired:     run.CodeCrossCheckRequired,
+		PlanCrossCheckCodexLead:    planCrossCheckCodexLeadSupported(run),
+		PlanCrossCheckGateReason:   textPtr(run.PlanCrossCheckGateReason),
 		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false
 		// for every non-task run); base_branch is pgtype.Text (nil for a run that has
 		// none). Both re-read from the row on every claim, like AutoApprove above.
@@ -758,7 +835,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// columns survive every requeue, so the re-claim carries the intent forward.
 		ParkRunSupported: slices.Contains(wkr.ProtocolCapabilities, capability.ParkRunV1),
 		PausePending:     run.PauseRequestedAt.Valid,
-		PauseMode:        run.PauseMode.String,
+		PauseMode:        servedPauseMode(run.PauseMode.String),
 		// PRD #400 M4a: when set, this task run is a diff-review of that target task, and
 		// the worker (M4b) routes on it. nil for a plain handoff and every non-task run.
 		ReviewTargetRunID: uuidPtr(run.ReviewTargetRunID),
@@ -874,7 +951,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// completion-blocked run. Configured server-side, shipped like the question bounds above.
 			CompletionHoldWindowSeconds: s.p.CompletionHoldWindowSeconds,
 			DefaultModel:                textPtr(defaultModel),
-			DefaultEffort:               resolveHarnessEffortPtr(Harness(run.Harness), defaultEffort),
+			DefaultEffort:               shippedEffort,
+			DefaultModelSource:          defaultModelSource,
+			DefaultEffortSource:         defaultEffortSource,
 			AttributionEnabled:          attributionEnabled,
 			// PRD #305 M3: deliver the flag frozen onto the run at fire time (M1). Read
 			// straight off the run row — not re-derived from the schedule. false for every
@@ -935,15 +1014,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// transaction and matches these by IDENTITY, so pass them through untouched:
 			// errVaultLocked (transient requeue), errRunVanished (drop) and
 			// errCodexMintAmbiguous (no payload, no mutation: the mint write may have landed).
-			// Every other Codex error is wrapped as errCredentialUnavailable with %w, so the
+			// Snapshot reader infrastructure errors pass through with their underlying cause.
+			// Other Codex errors are wrapped as errCredentialUnavailable with %w, so the
 			// sentinel and any minted epoch/hash survive for that classifier: a quarantine or a
 			// same-alias re-login in flight parks the run in recovery_wait, and the other
 			// credential failures (kind/mode mismatch, login blob, revoked revision, identity
-			// change, a store defect) stay terminal.
+			// change) stay terminal.
 			// errCredentialDisabled (the frozen alias is disabled, refused before any mint) passes
 			// through too: finishRunClaim parks it on credential_disabled (PRD #1732 D14).
 			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) || errors.Is(err, errCodexMintAmbiguous) ||
-				errors.Is(err, errCredentialDisabled) {
+				errors.Is(err, errCredentialDisabled) || errors.Is(err, store.ErrVaultSealStale) || errors.Is(err, secretopen.ErrReaderFailure) {
 				return nil, err
 			}
 			return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
@@ -1015,6 +1095,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 				payload.IssueDescription = run.IssueDescription
 			}
 		}
+	}
+	if !isolated {
+		payload.ForgeOriginReservation = s.forgeOriginReservation(ctx, wkr, run)
 	}
 	return payload, nil
 }

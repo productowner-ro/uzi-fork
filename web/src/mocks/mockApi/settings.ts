@@ -8,6 +8,8 @@ import {
   type UpdateSettingsPayload,
   type UserSettings,
   type UserSettingsPatch,
+  type VaultStatus,
+  type VaultDisableResponse,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
@@ -24,12 +26,12 @@ import {
 import { daysAgo, mockBuildInfo } from "../data";
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { trustedBotsValueError } from "../../lib/trustedReviewBots";
-import { state } from "../store";
+import { mockVaultMaterial, state } from "../store";
 import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
 import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
-import type { CrossCheckPinDTO, Harness } from "../../lib/apiTypes";
+import type { CrossCheckPinDTO, EffortSettingCell, Harness } from "../../lib/apiTypes";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { mockDefaultClaudeModel } from "./agents";
@@ -74,6 +76,7 @@ const FETCH_CAP_BOUNDS: Record<string, [number, number]> = {
   fetch_max_run_attempts: [1, 100000],
 };
 const SEED_USER_SETTINGS: UserSettings = {
+  vault_auto_reunlock: true,
   cross_check_pins: [],
   default_model: null,
   // PRD #1551 M1/D2: the two explicit per-harness worker-model lanes; null = inherit.
@@ -110,7 +113,7 @@ const SEED_USER_SETTINGS: UserSettings = {
 if (mockScenario() === "cross-check-mixed") {
   SEED_USER_SETTINGS.cross_check_pins = [
     { stage: "plan", harness: "codex", model: "gpt-6-sol", effort: null,
-      worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "worker default", active: true },
+      worker_default_model: null, resolved_model: null, resolved_effort: "high", model_source: "pin", effort_source: "cross-check default", active: true },
   ];
 }
 if (mockScenario() === "cross-check-dormant-claude") {
@@ -121,6 +124,8 @@ if (mockScenario() === "cross-check-dormant-claude") {
 }
 
 const SEED_APP_SETTINGS: AppSettings = {
+  vault_policy: "required",
+  vault_reunlock_days: "7",
   autopilot_label: "autopilot",
   // PRD #764: the single run-eligibility label.
   uzi_label: "uzi",
@@ -250,6 +255,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
           (pin.effort === null || (typeof pin.effort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(pin.effort)));
       }));
   const okUser = validPins &&
+    (u.vault_auto_reunlock === undefined || typeof u.vault_auto_reunlock === "boolean") &&
     (u.default_model === null || typeof u.default_model === "string") &&
     // PRD #1551 M1: optional so a pre-split blob stays valid; absent/null reads as
     // inherit (treated as null), and the SEED fills them going forward — the same
@@ -290,6 +296,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
       (Array.isArray(u.sidebar_codex_account_ids) &&
         u.sidebar_codex_account_ids.every((id) => typeof id === "string")));
   const okApp =
+    (a.vault_reunlock_days === undefined || (typeof a.vault_reunlock_days === "string" && /^(?:[1-9]|[12][0-9]|30)$/.test(a.vault_reunlock_days))) &&
+    (a.vault_policy === undefined || a.vault_policy === "optional" || a.vault_policy === "required") &&
     typeof a.autopilot_label === "string" &&
     // PRD #764: accept legacy blobs that predate this field (undefined) — it is filled
     // from the seed default ("uzi") on load — but reject a malformed non-string.
@@ -504,6 +512,35 @@ function effectiveLegacyLane(harness: UserSettings["default_harness"]): "claude"
   return codexUsable && !claudeUsable ? "codex" : "claude";
 }
 
+// PRD #3247: the user effort preference validator, mirroring Go validateDefaultEffort:
+// blank/whitespace clears to null; otherwise one of the five levels or the
+// preference-only "runtime" token, stored trimmed and case-sensitive.
+function mockDefaultEffort(raw: string | null | undefined): string | null {
+  const trimmed = raw?.trim() ?? "";
+  if (trimmed === "") return null;
+  if (!["low", "medium", "high", "xhigh", "max", "runtime"].includes(trimmed)) {
+    throw new ApiError(400, "effort must be one of low, medium, high, xhigh, max or runtime");
+  }
+  return trimmed;
+}
+
+// PRD #3247: one harness's ordinary reasoning-effort cell, mirroring Go
+// effortSettingCell/agenttmpl.ResolveHarnessEffort (pinned by
+// fixtures/effort-defaults/cases.json). The stored token is "runtime", a level, or
+// null; a blank/whitespace value reads as null and any other (corrupt) value resolves
+// to the medium builtin, so the cell keeps the stored value but never trusts it.
+function mockEffortCell(harness: Harness, stored: string | null | undefined): EffortSettingCell {
+  const token = (stored ?? "").trim();
+  const base = { harness, effort: stored ?? null, default_effort: "medium", default_source: "builtin" };
+  if (token === "runtime") {
+    return { ...base, resolved_effort: null, source: "user_default", mode: "runtime_default" };
+  }
+  if (["low", "medium", "high", "xhigh", "max"].includes(token)) {
+    return { ...base, resolved_effort: token, source: "user_default", mode: "explicit" };
+  }
+  return { ...base, resolved_effort: "medium", source: "builtin", mode: "explicit" };
+}
+
 // mySettingsResponse projects the deprecated default_model from the effective-harness
 // lane so a stale client still reads a coherent single model, while the two explicit
 // lanes remain the stored source of truth.
@@ -516,10 +553,10 @@ function mySettingsResponse(): { settings: UserSettings } {
     const model = pin?.model ?? null, effort = pin?.effort ?? null;
     const workerModel = harness === "claude" ? userSettings.default_claude_model ?? mockDefaultClaudeModel()
       : userSettings.default_codex_model ?? "gpt-6.1-sol";
-    const workerEffort = harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
+    // An unpinned checker effort is the server's cross-check default, never the worker effort.
     return { stage, harness, model, effort, worker_default_model: workerModel, resolved_model: model ?? workerModel,
-      resolved_effort: effort ?? workerEffort ?? "medium", model_source: model === null ? "worker default" : "pin",
-      effort_source: effort === null ? "worker default" : "pin", active: true };
+      resolved_effort: effort ?? "high", model_source: model === null ? "worker default" : "pin",
+      effort_source: effort === null ? "cross-check default" : "pin", active: true };
   }));
   // PRD #3245: both judge cells through the one mock resolver (pinned to the server's by
   // fixtures/model-settings/judge.json), from the stored user lanes and instance values.
@@ -527,7 +564,17 @@ function mySettingsResponse(): { settings: UserSettings } {
     { claude: userSettings.judge_model, codex: userSettings.codex_judge_model },
     { claude: appSettings.judge_model, codex: appSettings.codex_judge_model },
   );
-  return { settings: { ...userSettings, cross_check_pins, judge_models, default_model: projected ?? null } };
+  const effort_settings = [
+    mockEffortCell("claude", userSettings.default_effort),
+    mockEffortCell("codex", userSettings.default_codex_effort),
+  ];
+  // PRD #3522: the reserve lives on the user row (written by setUsageReserve), and the
+  // server's GET /me/settings reads it from there, so project it from the session user.
+  const me = state.session;
+  const reserve = me
+    ? { weekly_reserve_pct: me.weekly_reserve_pct ?? null, weekly_reserve_pause_running: me.weekly_reserve_pause_running ?? true }
+    : {};
+  return { settings: { ...userSettings, ...reserve, cross_check_pins, judge_models, effort_settings, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -578,6 +625,7 @@ function settingsResponse(): SettingsResponse {
   }
   // The demo has no real socket, so Slack is always "disabled" here.
   return {
+    unprotected_users: state.vaultMode === "unprotected" ? 1 : 0,
     settings: effective,
     secrets: { ...slackSecrets },
     sources,
@@ -586,6 +634,21 @@ function settingsResponse(): SettingsResponse {
     oidc_status: oidcDemo().oidcStatus,
     oidc_provider_name: oidcDemo().providerName,
   };
+}
+
+// Shared session/status projection; wrapper absence does not determine mode.
+function mockVaultStatus(): VaultStatus {
+  return {
+    ...mockVaultMaterial(oidcDemo().passwordless),
+    policy: appSettings.vault_policy === "optional" ? "optional" : "required",
+  };
+}
+
+// Project mode and lock state from one status observation for both admin meters.
+export function mockVaultRateFields(userId: string) {
+  if (userId !== state.session?.id) return {};
+  const vault = mockVaultStatus();
+  return { vault_mode: vault.mode, vault_locked: vault.mode === "protected" && !vault.unlocked };
 }
 
 // sessionBody is the auth/session bootstrap payload: the signed-in user, the
@@ -642,11 +705,7 @@ export function sessionBody() {
       {},
       { dark: appSettings.default_dark_theme || appSettings.default_theme },
     ).dark,
-    // A passwordless (OIDC) demo user has no vault yet, so the SPA shows the
-    // passphrase-create banner; a password demo user keeps the existing behavior.
-    vault: oidcDemo().passwordless
-      ? { unlocked: false, exists: false }
-      : { unlocked: state.vaultUnlocked, exists: true },
+    vault: mockVaultStatus(),
     has_password: !oidcDemo().passwordless,
     // Judge consent (PRD #69 M4), resolved exactly like the server: enforced only when
     // BOTH the kill-switch and enforce-all are on (Gate-2-wins), and the effective model
@@ -657,6 +716,20 @@ export function sessionBody() {
 }
 
 export const settingsApi = {
+  vaultStatus: async () => delay(mockVaultStatus(), 40),
+  vaultDisable: async (): Promise<VaultDisableResponse> => {
+    const vault = mockVaultStatus();
+    if (vault.policy === "required") throw new ApiError(403, "instance policy requires credential protection");
+    if (vault.mode === "protected") {
+      if (!vault.exists) throw new ApiError(409, "vault is not set up; enable it before disabling protection");
+      if (!vault.unlocked) throw new ApiError(409, "vault is locked; unlock before disabling protection");
+    }
+    state.vaultMode = "unprotected";
+    state.vaultExists = false;
+    state.vaultUnlocked = false;
+    return delay({ mode: "unprotected" }, 150);
+  },
+
   // PRD #685: public branding read. Coerces the string-space settings to the typed
   // (bool) chrome shape and derives the two *_present flags from the tracked assets.
   branding: async () =>
@@ -731,6 +804,18 @@ export const settingsApi = {
     const nonSecret: Partial<AppSettings> = {};
     for (const [key, raw] of Object.entries(updates)) {
       const value = raw ?? "";
+      if (key === "vault_reunlock_days") {
+        if (!/^(?:[1-9]|[12][0-9]|30)$/.test(value)) throw new ApiError(400, "vault_reunlock_days must be a canonical integer from 1 to 30");
+        nonSecret.vault_reunlock_days = value;
+        continue;
+      }
+      if (key === "vault_policy") {
+        if (value !== "optional" && value !== "required") {
+          throw new ApiError(400, "vault_policy must be optional or required");
+        }
+        nonSecret.vault_policy = value;
+        continue;
+      }
       if (key === "slack_bot_token" || key === "slack_app_token") {
         const prefix = key === "slack_bot_token" ? "xoxb-" : "xapp-";
         if (!value.startsWith(prefix)) {
@@ -1128,6 +1213,29 @@ export const settingsApi = {
     return delay({ user: { ...u } }, 200);
   },
 
+  // ── Weekly usage reserve (PRD #3522 M1) ──────────────────────────────────────
+  // Mirrors PUT /api/me/usage-reserve (handler/usage_reserve.go): both fields are
+  // required, the threshold is an integer 1..100 or null (off), pause_running a boolean,
+  // and the write lands on the session user, never a body id. 400 messages match the server.
+  setUsageReserve: async (thresholdPct: number | null, pauseRunning: boolean) => {
+    const u = requireSession();
+    if (thresholdPct === undefined) {
+      throw new ApiError(400, "threshold_pct is required (an integer 1..100, or null to turn the reserve off)");
+    }
+    if (pauseRunning === undefined) {
+      throw new ApiError(400, "pause_running is required (true or false)");
+    }
+    if (thresholdPct !== null && (!Number.isInteger(thresholdPct) || thresholdPct < 1 || thresholdPct > 100)) {
+      throw new ApiError(400, "threshold_pct must be an integer from 1 to 100, or null");
+    }
+    if (typeof pauseRunning !== "boolean") {
+      throw new ApiError(400, "pause_running must be true or false");
+    }
+    u.weekly_reserve_pct = thresholdPct;
+    u.weekly_reserve_pause_running = pauseRunning;
+    return delay({ user: { ...u } }, 200);
+  },
+
   // ── Early-limit-reset Slack alert opt-in (PRD #1020 M4/M5) ────────────────────
   // Own-user (session identity, never a body id, mirroring the server). Default true.
   setNotifyEarlyReset: async (enabled: boolean) => {
@@ -1229,6 +1337,10 @@ export const settingsApi = {
     // + light_theme:"ember") returns 400 without half-applying — matching the real
     // handler's validate-all-then-write ordering.
     let next = { ...userSettings };
+    if ("vault_auto_reunlock" in patch) {
+      if (typeof patch.vault_auto_reunlock !== "boolean") throw new ApiError(400, "vault_auto_reunlock must be boolean");
+      next.vault_auto_reunlock = patch.vault_auto_reunlock;
+    }
     if ("cross_check_pins" in patch) {
       const list: unknown = patch.cross_check_pins;
       if (!Array.isArray(list) || list.length > 4) throw new ApiError(400, "cross_check_pins: expected at most four cells");
@@ -1282,7 +1394,7 @@ export const settingsApi = {
         }
         next = { ...next, default_codex_model: val };
       } else {
-        if (val !== null && CODEX_CURATED_MODELS.includes(val)) {
+        if (val !== null && CODEX_ROLE_MODELS.includes(val)) {
           throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
         }
         if (patch.default_claude_model !== undefined && (patch.default_claude_model?.trim() || null) !== val) {
@@ -1292,12 +1404,11 @@ export const settingsApi = {
       }
     }
     if (patch.default_claude_model !== undefined) {
-      // PRD #1551 M1/D3: blank clears to inherit (null); a curated Codex id is rejected
-      // here (cross-vocabulary 400). The Claude lane otherwise keeps its curated-plus-custom
-      // freedom, so any other id is stored as given.
+      // Blank clears to inherit (null); every known Codex role id is rejected here
+      // (cross-vocabulary 400). Other custom Claude ids remain accepted.
       const trimmed = patch.default_claude_model?.trim() ?? "";
       const val = trimmed === "" ? null : trimmed;
-      if (val !== null && CODEX_CURATED_MODELS.includes(val)) {
+      if (val !== null && CODEX_ROLE_MODELS.includes(val)) {
         throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
       }
       next = { ...next, default_claude_model: val };
@@ -1314,22 +1425,10 @@ export const settingsApi = {
       next = { ...next, default_codex_model: val };
     }
     if (patch.default_effort !== undefined) {
-      // Closed enum (PRD #617 M5): blank clears to inherit; any other value must be one
-      // of the five SDK levels, mirroring the server's ValidateEffort.
-      const trimmed = patch.default_effort?.trim() ?? "";
-      if (trimmed !== "" && !["low", "medium", "high", "xhigh", "max"].includes(trimmed)) {
-        throw new ApiError(400, "effort must be one of low, medium, high, xhigh, max");
-      }
-      next = { ...next, default_effort: trimmed === "" ? null : trimmed };
+      next = { ...next, default_effort: mockDefaultEffort(patch.default_effort) };
     }
     if (patch.default_codex_effort !== undefined) {
-      // Closed enum (PRD #617 M5): blank clears to inherit; any other value must be one
-      // of the five SDK levels, mirroring the server's ValidateEffort.
-      const trimmed = patch.default_codex_effort?.trim() ?? "";
-      if (trimmed !== "" && !["low", "medium", "high", "xhigh", "max"].includes(trimmed)) {
-        throw new ApiError(400, "effort must be one of low, medium, high, xhigh, max");
-      }
-      next = { ...next, default_codex_effort: trimmed === "" ? null : trimmed };
+      next = { ...next, default_codex_effort: mockDefaultEffort(patch.default_codex_effort) };
     }
     if (patch.judge_model !== undefined) {
       // Same rules as default_model (PRD #69 M2): blank clears to inherit, a value with

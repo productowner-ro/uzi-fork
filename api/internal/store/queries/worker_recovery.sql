@@ -94,7 +94,16 @@ ON CONFLICT (worker_id, run_id) DO UPDATE SET
     terminal_pending_until = EXCLUDED.terminal_pending_until,
     terminal_pending_since = EXCLUDED.terminal_pending_since,
     snapshot_epoch         = EXCLUDED.snapshot_epoch,
-    reported_at            = EXCLUDED.reported_at;
+    reported_at            = EXCLUDED.reported_at,
+    -- Clear before the optional projection savepoint so its rollback leaves no
+    -- stale display metadata. Projection failure preserves valid custody except
+    -- on savepoint management failure, when the outer transaction may be unusable.
+    cooldown_operation     = NULL,
+    cooldown_class         = NULL,
+    cooldown_episode_id    = NULL,
+    cooldown_eligible_at   = NULL,
+    cooldown_observed_at   = NULL,
+    cooldown_until         = NULL;
 
 -- Frozen recovery phases ---------------------------------------------------
 -- Internal transaction methods: FrozenTargets and LockedParentIds are mandatory
@@ -119,6 +128,10 @@ WITH candidates AS MATERIALIZED (
     WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
+  AND (r.checkpoint_coordinates IS NULL OR EXISTS (
+      SELECT 1 FROM workers coordinate_worker
+      WHERE coordinate_worker.id = @worker_id AND coordinate_worker.user_id = r.user_id
+        AND 'task_checkpoint_coordinates_v1' = ANY(coordinate_worker.protocol_capabilities)))
   AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
@@ -233,6 +246,10 @@ FROM worker_active_runs a
 WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
+  AND (r.checkpoint_coordinates IS NULL OR EXISTS (
+      SELECT 1 FROM workers coordinate_worker
+      WHERE coordinate_worker.id = @worker_id AND coordinate_worker.user_id = r.user_id
+        AND 'task_checkpoint_coordinates_v1' = ANY(coordinate_worker.protocol_capabilities)))
   AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation

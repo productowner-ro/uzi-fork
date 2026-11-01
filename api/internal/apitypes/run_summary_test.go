@@ -11,6 +11,7 @@ import (
 // summaryOmitted is the exact set of RunListItemDTO keys the ?view=summary projection drops
 // (issue #2661). Adding a key here is a deliberate wire decision, never a side effect.
 var summaryOmitted = map[string]bool{
+	"capability_provenance":     true,
 	"completion_pending":        true, // Full owner/worker publication only.
 	"semantic_gate":             true, // Owner detail only; no raw snapshots in summaries.
 	"semantic_drift":            true, // Owner detail only (PRD #1230 D5); never on a list or summary.
@@ -21,6 +22,7 @@ var summaryOmitted = map[string]bool{
 	"repo_agents":       true,
 	"issue_description": true,
 	"preserved_patch":   true,
+	"lead_config":       true, // GetRun-only overlay (PRD #3244); never on a list or summary.
 }
 
 // TestRunSummaryItemDTOKeys pins the summary key set to the list item's key set minus
@@ -64,6 +66,9 @@ func TestRunSummaryItemRoundTrip(t *testing.T) {
 	want.IssueDescription = ""
 	want.PreservedPatch = nil
 	want.RunDTO.WorkerName = nil
+	want.RunDTO.RepoPath = "" // detail-only; the list carries its own shadowing RepoPath
+	want.CapabilityProvenance = nil
+	want.LeadConfig = nil
 
 	got := RunSummaryOf(full).ListItem()
 	if !reflect.DeepEqual(got, want) {

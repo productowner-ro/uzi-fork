@@ -190,7 +190,8 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 	}
 	initial := request("{}", 200)
 	if initial[0].Harness != "claude" || !initial[0].Active || !initial[1].Active || initial[1].ResolvedModel == nil ||
-		*initial[1].ResolvedModel != "gpt-6.1-sol" || initial[1].ResolvedEffort != "medium" || initial[1].Model != nil {
+		*initial[1].ResolvedModel != "gpt-6.1-sol" || initial[1].ResolvedEffort != "high" || initial[1].Model != nil ||
+		initial[1].EffortSource != "cross-check default" || initial[0].ResolvedEffort != "high" {
 		t.Fatalf("defaults/both-cells-active: %+v", initial)
 	}
 	exec("UPDATE users SET default_codex_model='gpt-6-sol',default_codex_effort='high' WHERE id=$1", user)
@@ -217,9 +218,30 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 	}
 	exec("UPDATE users SET default_codex_model='gpt-6.1-sol',default_codex_effort='low' WHERE id=$1", user)
 	got = request(`{"cross_check_pins":[{"stage":"plan","harness":"codex","effort":"  "}]}`, 200)
-	if *got[1].ResolvedModel != "gpt-6.1-sol" || got[1].Effort != nil || got[1].ResolvedEffort != "low" {
+	// The model Default follows the updated lane; the effort Default stays the cross-check
+	// default, so an explicit worker low does not lower the checker.
+	if *got[1].ResolvedModel != "gpt-6.1-sol" || got[1].Effort != nil || got[1].ResolvedEffort != "high" ||
+		got[1].EffortSource != "cross-check default" {
 		t.Fatal("Default did not follow updated lane")
 	}
+	// PRD #3247: an ordinary Runtime default preference never changes any unpinned checker
+	// cell (plan and code, both families): it stays high / cross-check default.
+	exec("UPDATE users SET default_effort='runtime',default_codex_effort='runtime' WHERE id=$1", user)
+	got = request("{}", 200)
+	unpinned := 0
+	for _, cell := range got {
+		if cell.Effort != nil {
+			continue
+		}
+		unpinned++
+		if cell.ResolvedEffort != "high" || cell.EffortSource != "cross-check default" {
+			t.Fatalf("ordinary runtime changed %s/%s checker effort: %+v", cell.Stage, cell.Harness, cell)
+		}
+	}
+	if unpinned < 3 {
+		t.Fatalf("expected the code cells and an unpinned plan cell, got %d unpinned in %+v", unpinned, got)
+	}
+	exec("UPDATE users SET default_effort=NULL,default_codex_effort='low' WHERE id=$1", user)
 	for _, body := range []string{
 		`{"cross_check_pins":[{"stage":"plan","harness":"claude","worker_default_model":null}]}`,
 		`{"cross_check_pins":null}`, `{"cross_check_pins":{}}`,

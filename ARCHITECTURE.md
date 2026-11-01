@@ -33,7 +33,7 @@ uzi's current MVP is a docker-compose stack of three always-on services (`web`, 
 - **`web`** (`web/Dockerfile`) — a Vite/React SPA built at image build time and served by `nginxinc/nginx-unprivileged`. Its `nginx.conf` does two jobs: serve the built static assets, and reverse-proxy `/api/*` to `api:8080`. The SPA and API therefore share one origin (`http://127.0.0.1:8080`) — no CORS configuration exists anywhere in the stack.
 - **`api`** (`api/Dockerfile`) — a statically linked Go binary (`chi` router) on `gcr.io/distroless/static-debian12`, running as `nonroot`. Serves `/api/auth/*`, `/api/admin/*`, `/api/agent-templates/*`, `/api/me/secrets/*`, `/api/worker/*` (the worker protocol, PRD #4), `/api/ws`, `/api/health`, `/api/version` (unauthenticated build info — version, founding date, uptime, plus the source commit, build time and commit count on a release image; read by the SPA footer and by the `uzi` CLI, [PRD #175](prds/done/175-build-info-popover.md)), among others. Runs its own DB migrations and builtin-template reconciliation at startup before it starts accepting traffic (see below).
 - **`db`** — stock `postgres:17`, digest-pinned in `docker-compose.yml`. Data lives in the named volume `pgdata`; it is not a bind mount, so it survives container recreation but is bound to the Docker volume store on this host.
-- **`agent`** (`agent/templates/<name>/Dockerfile`, opt-in via `docker compose --profile agent up`) — one worker per user: a Node 24 + git + bash container (not distroless — the Claude Agent SDK's Bash tool needs a real shell) that connects *outbound only* and executes runs. The image is built from a curated **template** selected by `WORKER_TEMPLATE` (PRD #18: `base`, or heavy-dep variants like `jvm`). Its outbound reach is `api`, the forge (git clone/fetch/push over HTTPS, the PAT injected as a Basic-auth header, not a session), **plus**, when a run has tier-1 tool packages to provision, the **nix substituters** the devbox engine fetches from (`cache.nixos.org` and any configured extras) — provisioning runs before the SDK in a secret-scrubbed subprocess (PRD #18 M3, [docs/worker-setup.md](docs/worker-setup.md#tool-provisioning)). The substituters are the one NEW egress PRD #18 adds to that set; the nix store lives on its own `agentnix` volume (at `/nix`) so it is a first-run-only fetch. Every worker also ships the `docker` CLI on `PATH` (PRD #83: `docker-cli`/`-compose`/`-buildx` baked into every template; no `dockerd`, no host `docker.sock`, anywhere in the image) — inert until an optional **docker-capable** worker adds a rootless Docker-in-Docker sidecar: its own container (compose) or pod sidecar (k8s), sharing only the daemon socket. The sidecar mounts none of the worker's join token, `/data`, or `/nix`, so a container the agent launches (`docker run -v ...`) can bind-mount none of them — the universal separate-mount-namespace invariant that holds on every track. Standing the sidecar up opens one genuinely new outbound set, pulled container images from a registry, which this PRD does not filter — that is [PRD #50](prds/50-llm-egress-proxy.md)'s job. See [Agent runtime](#agent-runtime-workers-runs-live-view) below, [docs/worker-setup.md](docs/worker-setup.md) for the operator procedure, and [docs/worker-docker.md](docs/worker-docker.md) for the docker sidecar.
+- **`agent`** (`agent/templates/<name>/Dockerfile`, opt-in via `docker compose --profile agent up`) — one worker per user: a Node 26 + git + bash container (not distroless — the Claude Agent SDK's Bash tool needs a real shell) that connects *outbound only* and executes runs. The image is built from a curated **template** selected by `WORKER_TEMPLATE` (PRD #18: `base`, or heavy-dep variants like `jvm`). Its outbound reach is `api`, the forge (git clone/fetch/push over HTTPS, the PAT injected as a Basic-auth header, not a session), **plus**, when a run has tier-1 tool packages to provision, the **nix substituters** the devbox engine fetches from (`cache.nixos.org` and any configured extras) — provisioning runs before the SDK in a secret-scrubbed subprocess (PRD #18 M3, [docs/worker-setup.md](docs/worker-setup.md#tool-provisioning)). The substituters are the one NEW egress PRD #18 adds to that set; the nix store lives on its own `agentnix` volume (at `/nix`) so it is a first-run-only fetch. Every worker also ships the `docker` CLI on `PATH` (PRD #83: `docker-cli`/`-compose`/`-buildx` baked into every template; no `dockerd`, no host `docker.sock`, anywhere in the image) — inert until an optional **docker-capable** worker adds a rootless Docker-in-Docker sidecar: its own container (compose) or pod sidecar (k8s), sharing only the daemon socket. The sidecar mounts none of the worker's join token, `/data`, or `/nix`, so a container the agent launches (`docker run -v ...`) can bind-mount none of them — the universal separate-mount-namespace invariant that holds on every track. Standing the sidecar up opens one genuinely new outbound set, pulled container images from a registry, which this PRD does not filter — that is [PRD #50](prds/50-llm-egress-proxy.md)'s job. See [Agent runtime](#agent-runtime-workers-runs-live-view) below, [docs/worker-setup.md](docs/worker-setup.md) for the operator procedure, and [docs/worker-docker.md](docs/worker-docker.md) for the docker sidecar.
 
 All images are pulled/built by digest or pinned tag in `docker-compose.yml`, not floating `latest`.
 
@@ -353,10 +353,12 @@ model); this section is the map. User-facing usage is
   `.agents`), since `lstat` follows a symlinked parent (issue #1205 follow-up). Repo
   skills carry no allocation, so a surviving one attaches to **every** template;
   they rank lowest (a name collision with any delivered skill drops the repo skill)
-  and are first evicted if the set exceeds `skills_max_per_run`. These two roots are
-  the **only** clone-borne configuration the worker reads (no hooks, settings,
-  commands, or `CLAUDE.md`), and it reads them through its OWN enumeration, not the
-  SDK: `settingSources: []` keeps the SDK from auto-loading the clone's `.claude/`
+  and are first evicted if the set exceeds `skills_max_per_run`. The repo-skills
+  channel reads only these two roots (no hooks, settings, commands, or `CLAUDE.md`)
+  through its OWN enumeration. A separate owner opt-in supplies root `CLAUDE.md`
+  as advisory context to Claude and Codex leads ([ADR-246](adr/0246-trusted-repo-instructions.md)).
+  Neither channel uses native project loading; for Claude, `settingSources: []`
+  keeps the SDK from auto-loading the clone's `.claude/`
   config class (settings, hooks, commands, subagents, `CLAUDE.md`), and `.agents/`
   is not an SDK setting source at all. The opt-in deliberately re-opens one narrow,
   skills-only slice of that otherwise-closed clone-config class, which is why the
@@ -383,16 +385,63 @@ one every unbound consumer resolves (PRD #104). The
 single 32-byte key that `config.Load` validates from `UZI_SECRET_KEY` at boot
 (refusing to start if it is missing, malformed, or a low-entropy placeholder)
 and then builds, already validated, into one `*secretbox.Box` shared by every
-handler (see [docs/configuration.md](docs/configuration.md)). **Since the
-per-user vault (PRD #32), this master box is no longer the normal sealing
-path**: a secret is sealed under the owner's own 256-bit DEK once their vault
-has been unlocked once, and the master box is reserved for a row that has
-never been rewrapped plus one narrow Codex exception — a refresh's *recovery*
-copy is sealed under the master box only while the owner's vault happens to
-be locked at that exact moment, then re-sealed under the DEK on the next
-reconcile pass. See [docs/vault-threat-model.md](docs/vault-threat-model.md)
-for the full model. Either way, rotating `UZI_SECRET_KEY` invalidates every
-row still master-sealed, across every feature at once, not just one.
+handler (see [docs/configuration.md](docs/configuration.md)). Personal
+credentials have explicit **protected** and **unprotected** modes. Protected
+users seal with a per-user 256-bit DEK wrapped by a password-derived KEK;
+login/unlock caches that DEK until explicit lock or API restart. Eligible
+HTTPS browsers also hold a cookie wrapping key for a second DEK wrapper in
+`vault_browser_slots`. A valid session plus incoming JWT-bound CSRF header
+can restore the cache on foreground requests after restart, including safe
+reads; missing/invalid CSRF leaves normal safe reads unchanged without slot
+access or unlock-budget consumption. Hidden/passive requests and WebSockets
+do not restore. Off users
+have no wrapper or unlock dependency and seal under the master key using
+`master_aad`. The protected Codex refresh recovery-slot exception also uses
+`master_aad` while locked, then re-seals under the DEK during reconciliation.
+AAD binds to the raw user UUID, a zero byte and credential kind; legacy
+`master` (nil AAD) stays readable and unknown markers fail closed.
+
+Mode changes atomically convert personal secrets and both Codex account
+slots behind the per-user lifecycle mutex and transactional mode/monotonic
+epoch fences. Keys publish after commit; the cache mutex does not span I/O.
+Ordinary writers check mode and epoch in their transaction, including provider
+result persistence without a second exchange. Enrollment/disable take shared
+settings admission before the user-secret advisory guard and owner state;
+admin policy edits take exclusive admission. Claim finishers retain their
+run/alias/account NOWAIT exception without waiting for lifecycle/advisory
+locks. Promotions and poller pokes follow commit and lifecycle-mutex release.
+
+The database-only policy chooses new-user mode; it does not convert existing
+users. An empty database starts Optional before seed-admin creation; a database
+with any users starts Required, marking existing users protected without
+rewriting ciphertext. Required leaves existing Off users runnable with an
+enrollment prompt. The supported API boundary is **singleton/Recreate**, with
+no mixed-version API operation. See
+[ADR-3507](adr/3507-optional-credential-vault.md) for lock order, bounded
+conversion, uncertain commits and rollback restrictions, and
+[the vault threat model](docs/vault-threat-model.md) for residual risks.
+Browser grants use a Secure, HttpOnly, Strict, host-only /api cookie, owner/slot
+AAD, signed browser identity stable across session refresh, and a serialized
+slot-generation fence separate from the mode epoch. Default-on
+**Re-unlock automatically in this browser** is account-wide permission;
+disabling it revokes every browser, and enabling it alone does not mint.
+Verified interactive password login/unlock/enrollment can mint on HTTPS;
+CLI, seed/boot, OIDC callback and restore cannot. HTTP stays manual.
+The admin lifetime defaults to 7 days (1–30), bounded by minting-session
+expiry, with a 32-browser cap. Fixed expiry does not evict a cached DEK;
+lowering the lifetime affects new slots.
+
+Explicit lock revokes slots and evicts the DEK; global logout revokes sessions
+and slots but retains a cached DEK. Password/off/recreate/deactivation changes
+also revoke. The cookie key is absent from server-at-rest material, but cookie
+theft plus a matching DB snapshot allows offline DEK recovery without session
+authentication. Foreground restore best-effort promotes vault-locked parks;
+unattended continuity remains outside this feature.
+[ADR-3508](adr/3508-browser-vault-reunlock.md) records the protocol, security
+analysis and pre-keyslot rollback requirement: stop the keyslot-aware API
+and drain requests, then delete/invalidate slots, before starting an older binary. Migration 00379 CHECK validation and ACCESS EXCLUSIVE
+duration/availability costs are production-dependent and unmeasured.
+Rotating `UZI_SECRET_KEY` invalidates rows still master-sealed across features.
 
 The API around it is deliberately minimal, and **every read is metadata only**:
 `GET /api/me/secrets` returns `id`, `kind`, `label`, `is_default` and
@@ -443,7 +492,7 @@ rule and the failure/backoff semantics; user-facing behavior is in
 A sibling background engine (`api/internal/codexusagepoller`) does the same
 job for a linked Codex **subscription** account, entirely idle (no worker,
 run, or model call): it opens the account's committed login through the same
-vault-then-master path above, reads its rate-limit buckets from the fixed
+mode/epoch-aware opening path above, reads its rate-limit buckets from the fixed
 Codex usage host (redirects refused, response body size-bounded), and
 upserts one JSONB snapshot per **canonical account**
 (`codex_account_rate_limits`, keyed `(user_id, provider_account_id)` against
@@ -462,6 +511,17 @@ durable design decisions and
 [docs/rate-limits.md](docs/rate-limits.md#codex-account-limits) for
 user-facing behavior.
 
+A separate survivor path can retry an original non-rejection refresh error once
+when its durable receipt authorizes reuse. Admission consumes the retry under
+user secret mutation/account/intent locks with a fresh database clock and an
+enabled linked alias; local vault/login failures defer without consumption.
+Recovered material stays quarantined until identity-verified promotion. The
+survivor and account-action display share an 832.14-second in-flight policy bound;
+owner restore advances the generation and fences stale installs. Mixed API
+versions are unsupported for receipt-aware resolution/display. See
+[ADR-3523](adr/3523-codex-refresh-provider-error-reuse.md) for the fixed 30-minute
+eligibility window, terminal fences, provider-overlap risk and evidence limits.
+
 ## Agent runtime: workers, runs, live view
 
 uzi's third surface is the one that acts: a per-user worker container claims
@@ -474,6 +534,9 @@ especially its Decision Log); this section is the map. See
 [docs/run-cost.md](docs/run-cost.md) for why a run on this runtime costs less
 than the same task worked by a local Claude Code agent-team session, and
 whether the cheaper run is as good.
+The lead agent's requested and runtime-reported model and effort are recorded
+per claim attempt and phase, worker-attested and display-only; see
+[PRD #3244](prds/3244-lead-config-per-claim.md).
 
 ```
 browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTP (compose) / HTTPS (k8s), poll/claim/report── agent (worker, per user)
@@ -1143,7 +1206,12 @@ chain in the diagram above, with no intervening `running`.
   **pre-clone forge-unreachable park** (issue #1392): a transient forge
   failure at clone or fetch parks here too, cause `forge_unreachable`, capped
   by `RUN_FORGE_UNREACHABLE_MAX_PARKS` (unlike the empty-turn cause, which has
-  no lifetime cap). See
+  no lifetime cap). Exhaustion holds for owner Resume/Cancel with a NULL retry
+  rather than failing. An owner/worker/actual-Git-origin cooldown filters new
+  claims until due, then serializes one ordinary recovery trial. Expiry is
+  unverified; safe early affinity escape requires complete guarded source
+  disposition evidence. These placement hints grant no execution or custody
+  authority. See
   [adr/1197-transient-recovery-park.md](adr/1197-transient-recovery-park.md),
   [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (the
   2026-09-14 PRD #1349 amendment),
@@ -1221,7 +1289,9 @@ chain in the diagram above, with no intervening `running`.
   provider-context durability is honestly `same_worker_only`. An admin can turn
   the switch off from Admin → Instance → **Completion check**; a run created
   before the default changed is unaffected, since the switch is read once, at
-  create. See
+  create. Semantic completion auditing did not ship (#1231 was closed not
+  planned); #1230's semantic contract is merged but dormant, with no production
+  enrollment. See
   [docs/run-completion-hold.md](docs/run-completion-hold.md) and
   [adr/1225-structural-completion-interlock-invariants.md](adr/1225-structural-completion-interlock-invariants.md)
   for the negative-space invariants a future edit could break silently.
@@ -1522,13 +1592,24 @@ chain in the diagram above, with no intervening `running`.
   and blocks the worker's teardown. Admission counts open holds except at most
   one per run backing a healthy current claim without an owner decision;
   total custody remains protected. After discarded/released precedence, an OPEN
-  hold at `recovery_wait` for `worker_requeue_exhausted` or
-  `worker_memory_pressure` reports `needs_action` after failed latest capture,
+  hold at `recovery_wait` for `worker_requeue_exhausted`,
+  `worker_memory_pressure`, `retained_recovery_exhausted`, or
+  `retained_recovery_adoption_failed` reports
+  `needs_action` after failed latest capture,
   otherwise `source_only`, before available unguarded archives or capture
-  progress. Archive availability remains independent of attention and does not
-  release owner-held custody; other classifier decisions remain unchanged.
-  See [ADR-2445](adr/2445-custody-admission-accounting.md) and
-  [ADR-2396](adr/2396-worker-memory-guard.md).
+  progress. Retained-recovery exhaustion keeps this conservative protection
+  for both timed retries and NULL-stamp owner holds throughout `recovery_wait`.
+  Adoption failure is owner-held with no automatic retry. Its renewal requires
+  a fresh owned claim and unconsumed raw owner grant; the external bare-config
+  `uzi-recoveryowner.<runId>.record` precharges accounting outside the strict
+  recovery journal and inventory schemas. It grants no custody or deletion authority.
+  After timer promotion or owner Resume, existing proof-based release rules
+  apply again; execution-claim release alone never permits source deletion.
+  Archive availability remains independent of attention and does not release
+  these causes' custody; other classifier decisions remain unchanged.
+  See [ADR-2445](adr/2445-custody-admission-accounting.md),
+  [ADR-2396](adr/2396-worker-memory-guard.md), and the #3495 and #3527 amendments in
+  [ADR-1197](adr/1197-transient-recovery-park.md).
   The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
   lifecycle: reserve/release now key on the **exact `runs.claim_generation`**
@@ -1620,6 +1701,24 @@ chain in the diagram above, with no intervening `running`.
   nonclosing. See [ADR-2506](adr/2506-merged-predecessor-discard.md) for cursors,
   accepted tick coalescing, inherited response-byte risk, migration CHECK scans
   under ACCESS EXCLUSIVE and rollback refusal to erase audit evidence.
+  The approved 2026-10-30 #3654 policy adds cross-run `basis = same_issue_witness`
+  using that same evidence and phase. Eligible failed/cancelled issue custody
+  without a recorded MR may be discarded using a distinct later same-owner/repo/
+  own-issue completed run's freshly verified merged MR. Locked live-run,
+  dependency and publication vetoes apply; unique work may be lost intentionally.
+  Available archives keep their existing TTL; this adds no worker authority or
+  source/PVC guarantee. Same-run Option D remains unchanged, including issue-less
+  completions. See the [ADR-2506 amendment](adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
+  for the complete policy, shared bounds and accepted races. Recovery locks
+  all-state A inventory in generation/id order with NO KEY UPDATE, then
+  publications, then non-ready
+  captures; only qualifying OPEN holds through A's terminal generation discard.
+  The 1000-row inventories plus overflow probes bound fetched work, not all SQL
+  scans: generic issue-history filtering and shared-FINAL global history scans
+  remain cost boundaries. Migration 00386 extends only the universal binding
+  guard with the 19-field witness audit; the evidence CHECK and current 00340
+  inventory guard stay unchanged. No DTO, route, CLI or worker protocol changes.
+  #3031/#2969/#2884 retain their scope.
   A completed run's guarded archive can expire early as `published_redundant`
   when the API proves through the forge that the run's published branch already
   contains everything it retains (#2625; worker claim, API proof, bytes and
@@ -1653,6 +1752,30 @@ chain in the diagram above, with no intervening `running`.
   when even reclaiming them all would not fit); the reclaim itself, of expired
   then oldest finished-job files, runs when the verified upload is recorded
   (see [adr/1909-stored-file-budget.md](adr/1909-stored-file-budget.md)).
+- **Prerequisite closure pins (C1b, #3591)** — API-only lifecycle for new
+  qualifying guarded thin captures, not thin archive custody release.
+  Recovery upload commits S0 with availability using the original authenticated
+  worker's registered capability and the reviewed GitHub.com strategy; receipts
+  and sweeps do not backfill. The worker-service lane reads fresh default D,
+  proves every declared P ancestor/equal to D, freezes binding under DB locks,
+  then creates `refs/uzi-prereq/<capture-id>` at D with an empty pack outside
+  transactions. This adds no worker credential or server bundle parser.
+  Unknown creation is listing-only indefinitely, never resent or rebound.
+  Capture-locked S7 requires expired/discarded, exact-tip CAS and confirmed
+  absence; eight exhausted cleanup attempts retain the live removal blocker
+  and continue listings with at most one-hour backoff. Unknowns, leaked pins
+  and tombstones have no total inventory bound under O10; active capture quotas
+  do not bound them. Knob-off contains incoming S0 while existing rows continue
+  through the always-registered bounded pass (one I/O slot/process, ten-second
+  pass plus absolute outcome tail up to five seconds).
+  T1–T5 is a conditional trusted-worker preservation proof; native omission
+  negatives demonstrate that pinning does not verify bundle validity.
+  External pin deletion/history rewrite remains ADR-1296's accepted residual.
+  C1b advertises no feature, changes no agent and still refuses pinned thin
+  FINALs. C2 release, C3 visibility and hosted exact-head/timing acceptance
+  remain pending. See [ADR-3591](adr/3591-prerequisite-closure.md),
+  [PRD-2506 current execution](prds/2506-prerequisite-closure.md#c1b-current-execution-2026-10-29-child-3591)
+  and the [O10 runbook](docs/run-recovery.md#operating-an-o10-backlog).
 - **Milestone tracker reconciliation** (PRD #122/#265/#390) — a milestone-structured
   `issue` run shows a *reported-complete* tracker (`runs.milestones_completed`,
   monotone union, never "verified"), fed by mid-run `report_progress` and the lead's
@@ -1830,6 +1953,24 @@ Four independent layers, any one of which failing still leaves the others:
    the `disallowedTools` list and the deny-hook above. See the Repo agents docs
    page and `specs/ai.md` "PRD #37".
 
+   **Verbatim prompts (issue #1563).** Every Claude query options object that
+   carries `settingSources: []` also sets `verbatimPrompts: true`, so the bundled
+   CLI delivers each user turn as written. Without it the CLI preprocesses a turn
+   before any tool runs: an `@<path>` mention is expanded by a CLI-synthesized
+   Read that no `PreToolUse` hook sees (so neither the path guard's deny list nor
+   its worktree confinement applies), and a leading `/<command>` is dispatched.
+   uzi assembles prompts from issue text, MR review comments, CI log tails and
+   chat turns, so the mention is attacker-reachable. This closes that one
+   preprocessing step only: it is not a sandbox, it does not change tool
+   guards, and Codex is unaffected. The SDK documents a tradeoff, that a
+   verbatim turn also skips the CLI's turn-start attachment pass (skill and
+   tool listings, nested instruction files, per-turn reminders), with most of
+   that context arriving after the first tool call; on the pinned CLI 2.1.302
+   the skill listing and the granted tools were still present on the first
+   request. Real-CLI tests against a local fake
+   provider pin both the non-expansion and that first-turn behaviour
+   (`agent/test/sdk-verbatim-prompts*.ts`).
+
 Permission mode is explicitly `bypassPermissions` (allow-by-default) **plus**
 the deny-hook and a `disallowedTools` list — not `default` (which hangs
 headless waiting for an approval that will never come in an unattended
@@ -1837,6 +1978,62 @@ worker) and not a deny-by-default allowlist (too narrow for the coder
 subagent's legitimate file/bash needs). Read-only roles (reviewer, tester)
 are constrained per-subagent via their `tools` allowlist instead, since
 subagents inherit the parent's permission mode and cannot loosen it.
+
+### Worker-private completion authority (#3404)
+
+Whether a worker may delete a completed run's retained source (the attempt clone,
+its bare journal, paired skills, bundles and cohort records) after a restart is
+decided by state only the worker can write, never by the api, a process scan or a
+Docker listing. This sits beside the guardrail layers above: it protects
+worker-only work from being retired on a guess. Rationale, write ordering and
+costs are in the
+[#3404 amendment to ADR-1783](adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement);
+this section is the map.
+
+- **Locks** (`agent/src/authority-lock.ts`). The worker takes a lifetime lock W
+  (util-linux `flock` on a private file under `<dataDir>/.uzi-authority`) in
+  `main.ts` before `ensureRunnerTmpdir`, registration, sweeps or admission (with
+  `UZI_EPOCH_LOCK=1` the pod-epoch bootstrap P runs first) and never releases it,
+  so a second current worker on the same volume refuses to start (a pre-#3404
+  worker takes no lock). It refuses non-normalized data-dir spellings and a
+  final-component symlink; the authority store separately refuses an aliased
+  spelling, so such a worker starts but refuses protected source operations. A per-transaction lock A
+  in the same directory serializes authority changes. Order:
+  `P -> W -> A -> C -> S -> J -> B -> O`.
+- **Authenticated slots** (`agent/src/completion-authority.ts`). Each source path
+  has one MAC-authenticated slot under `<dataDir>/.uzi-authority`
+  (`active`, `claude_ready`, `sealed`, `ineligible`, `retiring`, `retired`); the
+  MAC key is derived from the worker join token. Before a source is used, a fresh
+  epoch is installed in an `active` slot, so a successor process cannot adopt a
+  foreign epoch.
+- **Codex lifetime seal** (`agent/src/codex/executor-lifetime.ts`). A Codex
+  executor's admission fence is monotonic and irreversible; Codex eligibility
+  requires `sealed`. A fresh Claude source uses `claude_ready`, which carries no
+  seal.
+- **Publication and the bare-journal fence.** When a flight ends
+  (`endFlightSourceUse` in `agent/src/runner.ts`) the worker certifies the source,
+  writes a fence `{version, sourceUseEpoch, sourceCoreDigest}` as the last key of
+  the completing bare journal, rewrites the cohort records, and publishes the slot
+  transition last. A failure at any step leaves the slot unpublished. A journal
+  carrying the fence is rejected by an older worker's parser (the accepted
+  rollback fence).
+- **Restart retirement** (`forgetCompletedGeneration` and
+  `verifyDurableRetirement` in `agent/src/recovery.ts`). A persisted completed
+  source is released only when the slot is published, the cohort and fence match
+  the certified source, and the existing receipt, custody and liveness checks pass.
+  Destruction is a `retiring` transaction with a manifest in deletion order,
+  ending in a never-collected `retired` tombstone. The guarded operator discard is
+  the only takeover. Legacy, unauthenticated, partial, corrupt, unproven and
+  crashed-`active` sources are retained.
+
+Residuals, none closed here (#2852 is not completed): Docker
+accepted-but-invisible creates (#1860) and unregistered or sibling writers; Claude
+terminal proof (`claude_ready` rests on the existing quiescence checks); the
+custody reclaim and SETTLE/CLEANUP separation (#2746), automatic reclaim (#1858)
+and per-attempt cgroups (#1862); and unbounded retention, since there is no TTL,
+cap or disk-pressure reclaim and capacity cost is unknown. Hosted and
+multi-worker acceptance of the crash behavior is a separate human step and is not
+claimed.
 
 ### Live message stream
 
@@ -2047,7 +2244,12 @@ token's server-enforced scope. See
   else (`POST /api/workers`, `/api/me/cli-tokens`, `/api/vault/*`, `/api/forge/*`,
   `/api/me/secrets/*`, every admin write) stayed cookie-only, since swapping whole
   groups would have widened what a stolen CLI token could do. See the PRD's
-  route-disposition table.
+  route-disposition table. Issue #3504 later adds `GET /api/vault/status` and
+  `POST /api/vault/unlock` to `RequireUser` for `uzi vault status` and
+  `uzi vault unlock`; lock and passphrase creation remain cookie-only. Unlock
+  retains the authenticated per-user limiter shared by cookies and CLI tokens.
+  See [the vault threat model](docs/vault-threat-model.md#cli-unlock-authenticated-guessing-and-key-custody)
+  for the accepted guessing surface.
 - **`scope` is a ceiling, enforced in the middleware, not just at `/api/admin/*`.**
   `RequireAdminRO` is a plain `user.IsAdmin` check; the real control is upstream in
   `RequireUser`, which gives a CLI token whose `scope != 'admin_ro'` a **copy** of
@@ -2112,8 +2314,8 @@ rationale.
   broken relative link (doc→doc or doc→img), reference-style links, or an
   oversized `docs/img/*` file; it warns (without failing) on a `user` page over
   the 60-line house-style budget.
-  It runs both locally (ahead of `npm run build`) and in CI (`validate:web`
-  runs `npm run check-docs` too, PRD #52), so a broken doc fails the pipeline as
+  It runs both locally (ahead of `npm run build`) and in CI (`validate-web`
+  runs `task check-docs:web` too, PRD #52), so a broken doc fails the pipeline as
   well as the local build.
 
 ## Deployment: compose (laptop) and k8s
@@ -2501,6 +2703,52 @@ Admitted image turns and eligible custody-held layout migrations receive an
 `image_roll` cordon over the authenticated
 `POST /api/controller/workers/{id}/drain` control-write channel. The API's
 `draining_since` and reason remain separate from heartbeat-derived status.
+
+Owner manual cordon is an independent persistent-worker intake boundary
+(scope amendment 2026-10-22, implementation recorded 2026-10-24).
+`POST`/`DELETE /api/workers/{id}/cordon` use existing `RequireUser` session
+plus CSRF or user CLI-token authentication and strict ownership even for admins.
+Persistent hosted/external workers (`ephemeral=false`) support it; ownership
+is checked before the ephemeral HTTP 409 refusal. The web Workers controls and
+`uzi worker cordon <id> [-m <reason>]` / `uzi worker uncordon <id>`
+(both `--json`) share this owner API. Health/admin surfaces remain read-only.
+
+Manual timestamp, actor UUID/label snapshot and optional reason are separate
+from automatic drains and maintenance. Transition plus audit event commits in
+one READ COMMITTED transaction under the owner-qualified worker lock;
+compatible claims re-read combined intake state after the same worker lock.
+Idempotent repeats preserve original metadata without another event.
+Registration, roll, restart, deadlines, ForceRoll and reason-owned automatic
+release preserve manual intent; explicit owner uncordon or deletion ends it.
+Held continuations/checkers/chat remain subject to existing fences; cordon
+cancels no run, ends no chat and adds no continuation affinity.
+
+Manual workers supply no serving/replacement coverage. Incarnation proof and
+reservation completion remain distinct from serving eligibility, so an idle
+manual worker can roll and return cordoned; busy drift still waits under #3103.
+An all-manual multi-worker pool may remain held, without a zero-coverage bypass.
+Custody/migration (#3153/#3307) and DinD/pressure/maintenance guards remain
+independent. Earlier poll decisions may finish. After migration 00355, older
+ClaimRun SQL with the previous explicit worker projection fails with SQLSTATE
+42846, including ordinary candidates; rollback can prolong this claim outage.
+Older chat claims can still admit work and ignore manual intent. Deploy every
+compatible serving API before relying on enforcement. Older controllers may
+miscount manual coverage,
+so ordinary coverage guarantees require compatible controllers. No worker-image
+protocol requirement or activation flag is added. Contract and rationale:
+[ADR-422 D5a](adr/0422-decouple-worker-version.md#d5a--owner-manual-cordon-is-persistent-intent-scope-amendment-2026-10-22);
+user lifecycle: [manual cordon](docs/hosted-workers.md#pause-new-work-with-a-manual-cordon).
+
+Instance maintenance mode ([PRD #3454](prds/done/3454-instance-maintenance-mode.md))
+is a separate instance-wide intake pause: a singleton `instance_intake_pause` row
+read by SQL function `fn_instance_intake_paused()`. Its conjunct sits in exactly
+the two claim statements, `ClaimRun` and `ClaimChatRun`, and admits only runs with
+`claim_generation > 0` or `cross_check` children; it is deliberately not folded
+into `fn_worker_accepts_new_intake`, so capacity, capability and roll projections
+stay truthful. The ephemeral provisioner rechecks it in SQL per candidate and
+inside all three demand queries. The controller is unchanged. Web-only writer;
+operator guide: [instance maintenance](docs/instance-maintenance.md).
+
 Under #3103, actual spec-hash/generation drift (image pin, template or size) and
 associated recycle wait indefinitely for genuine idle, including run-bound
 workers outside pacing and calls with no pacing entry or a plain drain reason.
@@ -2554,7 +2802,7 @@ holds its tier's ResourceQuota indefinitely (issue #360). The requeue-then-manua
 interrupted — by independent nondrifted maintenance expiry, global force-roll,
 or an uncontrolled pod loss)
 is unchanged by this PRD. Full rationale, the Decision Log, and what remains
-open (a CLI drain verb, live-cluster validation) are in
+open (live-cluster validation; the owner CLI manual-cordon deferral is superseded) are in
 [adr/0422-decouple-worker-version.md](adr/0422-decouple-worker-version.md).
 
 ### Worker disk: observed on the heartbeat, self-healed by the controller (PRD #837)
@@ -2635,12 +2883,29 @@ The health registry supplies each check's `scope` (#2293): `db`,
 the rest are `owner`. `fleet.roll` remains instance infrastructure even for a single owner.
 The server emits `blocking` on every document, true exactly when an instance
 check is danger. Overall status, counts, attention pips, history and CLI exit
-status still cover the full registry. Episodes, admin Slack notices, banner
+status still cover the full registry. Episodes, admin Slack notices, Danger banner
 and snooze follow `blocking`, superseding #2271's overall-episode timing:
 the opening tick sends nothing; the next still-blocking tick claims a notice
 per admin with instance-danger checks. Clearing instance danger closes and
 rearms even if owner danger remains. Owner-only danger opens no episode,
-sends no admin DM and raises no banner; owner run-health routing is unchanged.
+sends no admin DM and raises no Danger banner; owner run-health routing is unchanged.
+
+A separate owner-Warn attention banner (#3589) requires the optional per-check
+`attention_banner: true`, `scope: owner` and `severity: warn`; it preserves server
+order. `recovery.storage` is the sole producer, opting in from its final
+owner/Warn result. False flags are omitted. This metadata
+does not affect severity, counts, status, blocking, episodes, Slack or CLI exits.
+The admin-only `HealthAttentionBanner`, keyed by `user.id`, mounts after Danger
+inside the shared `HealthStatusProvider` (one visible-tab 10-second poll).
+It renders React text in one polite status surface with Open health and per-check
+Dismiss. Dismissals are React state keyed by check ID, independent of episodes,
+navigation, summaries, counts and flags. Missing checks/flags and loading or failed
+polls retain dismissals; the provider keeps the last-good document on failure. An explicitly observed
+`ok`/`unknown`/`danger`/`na` in a successful document clears that ID even without
+a flag. Remount, reload or admin identity changes reset state. No browser storage,
+timer, write or snooze is added; Danger's per-admin, per-episode 1h snooze stays
+unchanged. See [attention banner](docs/admin-health.md#attention-banner) and
+[PRD #1484's decision log](prds/done/1484-admin-health-tab.md#scope-and-decision-log).
 
 Database storage has two signals, both from inside the api (no volume or
 Kubernetes access). A pgx query tracer on the pool
@@ -2743,3 +3008,7 @@ deliberately deferred — see [plan.md](prds/done/initial-plan.md), the PRDs' Ri
 `prds/done/4-agent-runtime-workers.md`'s "Out of scope". This document will grow
 new sections (additional services, data flows, trust boundaries) as those
 land.
+
+## Release authorization
+
+The release workflow (manual dispatch and opt-in nightly RCs) isolates App credentials from repository code: preparation uses the shared cutter and coverage policy, then a separate job validates a bundle and atomically pushes permitted refs. RC and stable use separate principals; stable requires an Environment reviewer. The local fallback remains. [ADR-3512](adr/3512-release-automation.md) records the accepted main-write trust boundary, staged rollout and deferred recovery work.

@@ -15,11 +15,14 @@ import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
 import { CountPill, cx, type CountPillTone } from "./ui";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
-import { VaultBadge, VaultLockedBanner } from "./VaultControls";
+import { VaultBadge, VaultLockedBanner, VaultRequiredPrompt } from "./VaultControls";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { HealthDangerBanner } from "./HealthDangerBanner";
+import { HealthAttentionBanner } from "./HealthAttentionBanner";
 import { healthPipLabel } from "../lib/healthView";
 import { HealthStatusProvider, useHealthStatus } from "../lib/useAdminHealth";
+import { MaintenanceProvider } from "../lib/useMaintenance";
+import { MaintenanceBanner } from "./MaintenanceBanner";
 import { RateLimitAnnouncer } from "./RateLimitMeters";
 import { SidebarUsageLimits } from "./SidebarUsageLimits";
 import { useFavicon } from "../lib/useFavicon";
@@ -781,8 +784,8 @@ function SidebarContent({
         </div>
 
         <NavGroup label="Work" collapsed={collapsed}>
-          <NavItem to="/repos" icon={<BoardIcon />} label="Boards" exactOnly onNavigate={onNavigate} collapsed={collapsed} />
-          {/* Board children collapse into the "Boards" parent: on the rail every
+          <NavItem to="/repos" icon={<BoardIcon />} label="Repos" exactOnly onNavigate={onNavigate} collapsed={collapsed} />
+          {/* Board children collapse into the "Repos" parent: on the rail every
               repo would render as an identical forge glyph, so hide them and let
               /repos stand in (Decision: reviewer #7). */}
           {!collapsed &&
@@ -1309,6 +1312,9 @@ export function AppShell({ children }: { children: ReactNode }) {
     // Health page), so every consumer reads one provider and the isAdmin gate lives in one
     // place. A non-admin session never fetches the admin endpoint.
     <HealthStatusProvider>
+      {/* The ONE GET /api/maintenance poll (PRD #3454), for every signed-in user: feeds the
+          maintenance banner, the queue-reason labels and the admin card's reload. */}
+      <MaintenanceProvider>
       {/* Width/padding are literal class strings in the ternary so Tailwind's JIT
           emits both — an interpolated `lg:pl-${n}` would never be scanned. */}
       <div className={cx("min-h-screen", collapsed ? "lg:pl-14" : "lg:pl-60")}>
@@ -1391,7 +1397,11 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className={cx(!fullBleed && "mx-auto w-full max-w-[68rem]")}>
           {/* Vault locked banner (PRD #32): app-wide so the user can unlock from
               any page. Self-gates — renders nothing while unlocked. */}
+          <VaultRequiredPrompt />
           <VaultLockedBanner />
+          {/* Maintenance mode (PRD #3454): app-wide, every signed-in user, info tone, self-gating
+              — renders nothing unless an admin has paused intake. */}
+          <MaintenanceBanner />
           {/* Update escalation banner (PRD #836 M6): app-wide, admin-only, self-gating —
               renders nothing unless the server says the instance is far behind and the
               banner is enabled and not snoozed for the current release. */}
@@ -1400,6 +1410,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               self-gating, with a 1 h per-episode snooze. Reads the shared HealthStatusProvider,
               so a non-admin never fetches the admin endpoint. */}
           <HealthDangerBanner />
+          {user?.is_admin === true && <HealthAttentionBanner key={user.id} />}
           {/* The publisher for the one canonical to-triage number (PRD #98): how the Judge
               page keeps the nav badge fresh after a dispose. */}
           {/* Findings' twin of the judge channel (PRD #1183 M4): the setter lets the Findings
@@ -1425,6 +1436,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         />
       )}
       </div>
+      </MaintenanceProvider>
     </HealthStatusProvider>
   );
 }

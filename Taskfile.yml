@@ -138,21 +138,22 @@
 # THE npm TARGETS DELEGATE TO THE EXISTING SCRIPT AND MUST KEEP DOING SO. A target
 # written `npm test` inherits whatever flags `package.json` already encodes; a
 # target that reimplements the command drops them SILENTLY. The live instance is
-# `test:agent`: `agent/package.json`'s test script carries `--test-timeout=120000`
-# and node's own default is NO timeout. A target that reimplements the command
+# `test:agent`: `agent/package.json`'s test script invokes
+# `agent/test/run-unit-tests.ts`, which passes `--test-timeout=120000`;
+# node's own default is NO timeout. A target that reimplements the command
 # drops the flag silently. See `test:agent` below for why the cap is 120000 and
 # not the 30000 it shipped with -- and for why what that number GOVERNS is
 # different on the CI node major than on the dev laptop's. This is the same "a future simplify-the-gate edit"
 # hazard as `-race`/`-count=1`, arriving through `package.json` instead of
-# .github/workflows/ci.yml. Before wrapping any npm script, read it for flags first; if you
+# .github/workflows/ci.yml. Before wrapping any npm script, read it and its launcher for flags; if you
 # must spell out the underlying command, re-add every flag the script carried and
 # say in the comment that you are re-adding it because the target bypassed the
 # script, not that the script never had it.
 #
 # NOT SILENT, DELIBERATELY. Task echoes each command before running it, so the
-# gate's own output shows `-race`, `-count=1` and `--test-timeout=120000` actually
-# being passed. That echo is how a teammate notices a load-bearing flag going
-# missing, which is the failure mode this milestone is most exposed to.
+# gate's own output shows `-race` and `-count=1` actually being passed.
+# The agent unit command echoes only `npm test`; inspect
+# `agent/test/run-unit-tests.ts` for its load-bearing timeout flag.
 #
 # NO `-buildvcs=false` HERE. It is a local-only workaround for VCS stamping in a
 # linked git worktree and must not be committed. If you hit it, export
@@ -169,12 +170,12 @@ vars:
   # renovate: datasource=github-releases depName=gitleaks/gitleaks
   GITLEAKS_VERSION: "v8.30.1"
   # renovate: datasource=github-releases depName=golangci-lint-taskfile packageName=golangci/golangci-lint
-  GOLANGCI_LINT_VERSION: v2.14.0
+  GOLANGCI_LINT_VERSION: v2.15.0
   # The pinned OpenAPI diff tool behind check:api-v1-compat (PRD #1908 Decision 11). Passed to
   # scripts/oasdiff.sh as an ARGUMENT, like the golangci-lint pin above, so `task`'s echo shows the
   # resolved version. The wrapper carries the per-arch sha256 pins and refuses any other version.
   # renovate: datasource=github-releases depName=oasdiff-taskfile packageName=oasdiff/oasdiff
-  OASDIFF_VERSION: v1.33.0
+  OASDIFF_VERSION: v1.34.1
 
 # THE TWO SANCTIONED INCLUDES (rule 3), and they are LOCAL, not remote. Both reuse
 # `./homebrew-tap.yml`, a VENDORED copy of vtmocanu/task's reusable brew mechanic (see its
@@ -290,6 +291,7 @@ tasks:
       - task: check:uxlab-freeze
       - task: test:uxlab-freeze
       - task: test:uxlab-build
+      - task: test:uxlab-pty
       - task: check:skill-triage-render
       # A web test importing an uncopied fixture passes gate:web but breaks the web image build (#2602).
       - task: test:web-docker-fixtures
@@ -309,6 +311,8 @@ tasks:
       # build-Go guard: no network and no real release binary. It protects the
       # archive-cache trust boundary and the go/toolchain compatibility seam.
       - task: test:golangci-wrapper
+      # Best-effort deadcode diagnostics and gate verdicts, with fake Go only.
+      - task: test:deadcode-gate
       # Hermetic tests of the oasdiff wrapper's verified-archive cache (PRD #1908 M5): fake
       # curl/uname, a real fixture tarball, no network. Same protection as the line above.
       - task: test:oasdiff-wrapper
@@ -337,6 +341,7 @@ tasks:
       - task: test:renovate-go-toolchain
       - task: test:renovate-codex-runtime
       - task: test:renovate-postgres
+      - task: test:renovate-schedule-groups
       - task: test:forge-fake
       - task: test:forge-fake-contract
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
@@ -436,8 +441,8 @@ tasks:
       # make fails the gate closed. Before `scan:secrets`, which is deliberately last.
       - task: check:api-v1-compat
       # PR-time entry gate: a branch changing shipping paths adds a valid new fragment or
-      # legacy Unreleased line, carries `Changelog: none`, is docs-typed, or touches dependency
-      # manifests (the release oracle's rules, moved to the PR). Needs a merge-base with
+      # legacy Unreleased line, carries `Changelog: none`, or touches dependency
+      # manifests (see the script's exact predicates). Needs a merge-base with
       # origin/main, so CI's lint-repo job checks out full history; fails closed (exit 2)
       # without one. Its hermetic suite runs first so a gutted check cannot read green.
       - task: test:changelog-fragments
@@ -646,6 +651,12 @@ tasks:
   gate:agent:
     desc: agent - deps-check, lint, deadcode, typecheck, test
     cmds:
+      - task: check:agent
+      - task: test:agent
+
+  check:agent:
+    desc: agent - deps-check, lint, deadcode, typecheck
+    cmds:
       # deps-check first, same placement and the same reasons as gate:web above -
       # read that target's comment, including the two limits and the one state in
       # which `npm ls` lies. This package is the one where the standing remedy for a
@@ -659,7 +670,6 @@ tasks:
       # knip second, same reason as gate:web (~1-3s wall here too).
       - task: deadcode:agent
       - task: typecheck:agent
-      - task: test:agent
 
   fmt-check:
     # COMPOSES THE TWO PER-MODULE TARGETS; IT DOES NOT RE-SCOPE THEM. There must
@@ -990,6 +1000,11 @@ tasks:
       - ./scripts/lint-formula.sh Formula/uzi-cli.rb
       - ./scripts/lint-formula.sh Formula/uzi-cli-rc.rb
 
+  test:deadcode-gate:
+    desc: hermetic deadcode verdict and optional diagnostic contracts (fake Go)
+    cmds:
+      - ./scripts/deadcode-gate.test.sh
+
   test:golangci-wrapper:
     desc: hermetic tests of the verified golangci-lint archive cache and build-Go guard
     cmds:
@@ -1089,6 +1104,11 @@ tasks:
     cmds:
       - bash ./scripts/uxlab-build.test.sh
 
+  test:uxlab-pty:
+    desc: hermetic terminal interpreter regression controls
+    cmds:
+      - python3 -B -m unittest discover -s api/cmd/uzi/uxlab -p demo_pty_test.py -v
+
   test:renovate-go-toolchain:
     desc: hermetic Go-toolchain grouping and worker Go flake extraction contract
     cmds:
@@ -1103,6 +1123,11 @@ tasks:
     desc: hermetic CI Postgres pin extraction, digest updates and grouping
     cmds:
       - node ./scripts/renovate-postgres.test.mjs
+
+  test:renovate-schedule-groups:
+    desc: hermetic weekly Renovate window and oasdiff / npm lint-tooling grouping
+    cmds:
+      - node ./scripts/renovate-schedule-groups.test.mjs
 
   test:renovate-codex-runtime:
     desc: hermetic Codex pin extraction, grouping and partial-update rejection
@@ -1242,13 +1267,14 @@ tasks:
       - bash ./e2e/codex-meter-fixture.test.sh
 
   test:uzi-watcher-backups:
-    desc: hermetic tests of uzi-watcher live-clone/bare-ref backups, retention, detached loop and the label-sync create retry
+    desc: hermetic tests of uzi-watcher backups, retention, detached loop, label-sync create retry and run discovery/watching
     cmds:
       - python3 -B ./.agents/skills/uzi-watcher/scripts/backup-directory.test.py
       - ./.agents/skills/uzi-watcher/scripts/backup-runs.test.sh
       - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
       - ./.agents/skills/uzi-watcher/scripts/create-run.test.sh
       - ./.agents/skills/uzi-watcher/scripts/watch-run.test.sh
+      - ./.agents/skills/uzi-watcher/scripts/watch-issue.test.sh
 
   test:brew-tap-guard:
     desc: hermetic tests of stable/RC tap version ordering and fail-closed formula parsing
@@ -1341,6 +1367,25 @@ tasks:
       # script header.
       - ./scripts/release-scripts-test.sh
       - ./scripts/worker-roll-target.test.sh
+      - task: test:release-ci-coverage
+      - task: test:release-auto
+      - task: test:release-watch
+
+  test:release-watch:
+    desc: offline publication watcher parity and bounded recovery journal regressions
+    cmds:
+      - python3 -I -B scripts/release-watch.test.py
+      - python3 -I -B scripts/release-journal.test.py
+      - python3 -I -B scripts/release-smoke-recovery.test.py
+
+  test:release-auto:
+    desc: offline release automation orchestration regressions
+    cmds:
+      - python3 -I -B scripts/release-auto.test.py
+
+  test:release-ci-coverage:
+    desc: offline release evidence, metadata and publication polling regressions
+    cmds:
       - python3 -I -B scripts/release-ci-coverage.test.py
 
   test:worker-roll-target-package:
@@ -1491,7 +1536,7 @@ tasks:
       - ./scripts/check-mktemp-portability.sh scripts/mktemp-portability-canary.txt
 
   check:changelog-entry:
-    desc: a shipping branch adds a valid new fragment or legacy Unreleased line, or is exempt (Changelog none, docs-typed, manifests only)
+    desc: a shipping branch adds a valid new fragment or legacy Unreleased line, or is exempt (Changelog none, manifests only)
     cmds:
       # See the script header for the exemptions and why each matches the release oracle
       # (scripts/assert-changelog-covers-release.sh), which stays the final check at cut time.
@@ -1603,6 +1648,13 @@ tasks:
       # helm-render job is a maintainer hand-off (M7). Offline + non-vacuous — see the
       # script header.
       - ./scripts/assert-drain-knobs-render.sh
+
+  render:node-selector-check:
+    desc: assert the controller Deployment renders workers.nodeSelector (default, override, null, {}) and refuses a non-map value
+    cmds:
+      # Not in gate:repo (the lint job lacks helm); CI's helm-chart job runs it. Offline +
+      # non-vacuous, see the script header.
+      - ./scripts/assert-worker-node-selector-render.sh
 
   render:ephemeral-docker-check:
     desc: assert effective Docker tier availability reaches the api Deployment
@@ -2098,14 +2150,42 @@ tasks:
       # measured independently on this tree and gave IDENTICAL counts (1 for api,
       # 0 for controller), which is worth more than a figure from one version.
       #
-      # COST, measured 2026-08-02 on go1.26.5 darwin/arm64: 2.7-3.2s warm, ~25s
-      # on a cold GOCACHE (x/tools' own dependency tree). deadcode has NO result
+      # COST, a HISTORICAL figure measured 2026-08-02 on go1.26.5 darwin/arm64:
+      # 2.7-3.2s warm, ~25s on a cold GOCACHE (x/tools' own dependency tree). A
+      # 2026-10-26 worker sample (table below) took ~278 s, so do not read this
+      # figure as current. deadcode has NO result
       # cache of its own - checked for one, and cold and warm runs were
       # byte-identical - so carry-forward item 4's poisoned-cache hazard, where
       # golangci-lint replays a sibling worktree's absolute paths, has no analogue
       # here. Neither does its host-global LOCK: three concurrent runs, no
       # contention.
-      - ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0
+      #
+      # GOMEMLIMIT=12GiB (issue #3433). GitHub-hosted lint-api runners were
+      # killed during this step. Comment [3] on the issue measured the runner at
+      # 16.76 GB total and 14.78 GB available at step start, with a 15.64 GB peak
+      # RSS: 0.86 GB above the available memory and 1.1 GB below the total.
+      #
+      # SINGLE worker samples, measured 2026-10-26 (Linux amd64, 4 CPUs,
+      # go1.27.3; peak = max individual-process RSS across descendants):
+      #
+      #   setting            peak RSS   elapsed
+      #   none               17.20 GB   278 s
+      #   GOGC=50            16.61 GB   251 s
+      #   GOMEMLIMIT=12GiB   14.94 GB   314 s
+      #   GOMEMLIMIT=8GiB    15.04 GB   363 s
+      #   GOMEMLIMIT=2GiB    14.53 GB   452 s
+      #
+      # On that worker, among the GOMEMLIMIT rows, 12GiB gave most of the observed
+      # reduction for the smallest observed time increase. Runner results are
+      # unmeasured until CI.
+      #
+      # The value is fixed on purpose: `env GOMEMLIMIT=...` overrides an inherited
+      # GOMEMLIMIT, so the limit is identical locally and in CI (GOGC and hardware
+      # still vary). A malformed value (e.g.
+      # `12GB`) makes `go` itself die with `malformed GOMEMLIMIT`, exit 2, which
+      # the gate reports as a load error. The hand-run `--write` command in
+      # api/.deadcode-baseline's header does not carry the limit.
+      - env GOMEMLIMIT=12GiB ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0
 
   deadcode:api:all:
     desc: api - unreachable funcs WITHOUT -test; reported, never gating, ALWAYS EXITS 0
@@ -2175,7 +2255,7 @@ tasks:
       # carry per-arch aliases. The generic version-only customManager in
       # renovate.json matches the annotation; go datasource, semver.
       # renovate: datasource=go depName=govulncheck-api packageName=golang.org/x/vuln
-      - ./scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - ./scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.9.0
 
   test:api:
     desc: api unit tests (-race -count=1; live-DB tests self-skip)
@@ -2354,6 +2434,9 @@ tasks:
       # invocation when M4 landed, so nothing was deleted to reach zero here; the
       # target exists to keep it there. An empty backlog is not the same thing as
       # a no-op (fmt-check:controller shipped under the same argument).
+      #
+      # The GOMEMLIMIT in deadcode:api is api-only, per #3433's scope ("for that
+      # one command"), so this target keeps its inherited environment.
       - ./scripts/deadcode-gate.sh controller golang.org/x/tools/cmd/deadcode@v0.48.0
 
   deadcode:controller:all:
@@ -2378,7 +2461,7 @@ tasks:
       # `gate:controller` - read vulncheck:api's comment before editing either.
       # Renovate-tracked too (alias -controller, shared packageName); see vulncheck:api.
       # renovate: datasource=go depName=govulncheck-controller packageName=golang.org/x/vuln
-      - ./scripts/govulncheck-gate.sh controller golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - ./scripts/govulncheck-gate.sh controller golang.org/x/vuln/cmd/govulncheck@v1.9.0
 
   test:controller:
     desc: controller unit tests (-race -count=1)
@@ -2830,6 +2913,7 @@ tasks:
     desc: Docker-free worker UID report checker and shell wrapper regressions
     cmds:
       - python3 e2e/worker-uid/check_test.py
+      - python3 -B e2e/worker-uid/pod_epoch_proof_test.py
       - python3 e2e/worker-uid/run_test.py
       - python3 e2e/worker-uid/gate_test.py
       - python3 -B e2e/worker-uid/calibration_check_test.py
@@ -2882,7 +2966,8 @@ tasks:
         msg: 'UZI_AGENT_TEST_STALL_MS / UZI_AGENT_TEST_STALL_TESTONLY are for the launcher tests only; unset them'
     cmds:
       # `npm test` and NOT a bare `node --test`: agent/package.json's test script
-      # carries `--test-timeout=120000`, and node's own default is NO timeout at
+      # invokes test/run-unit-tests.ts, which passes `--test-timeout=120000`.
+      # Node's own default is NO timeout at
       # all. Rewriting this line as a direct node call drops the flag silently,
       # which is the reason to delegate regardless.
       #

@@ -1,3 +1,4 @@
+import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
@@ -884,11 +885,13 @@ export class Worker {
         // OUTSIDE required_capabilities and the capability_aware kill-switch, so an old
         // image that omits it can never claim an interlocked run or open a custody hold.
         const protocolCapabilities = [
+          TASK_CHECKPOINT_COORDINATES_CAPABILITY,
           "completion_interlock_v1",
           "recovery_archive_v1",
           "recovery_archive_v2",
           "recovery_inventory_v1",
           "recovery_completed_publication_v1",
+          "forge_clone_success_v1",
           "recovery_held_publication_v1",
           "recovery_held_publication_v2",
           // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
@@ -1450,9 +1453,9 @@ export class Worker {
               ? this.jobRunner.execute(claim)
               : this.executeIsolated(claim)
             : claim.review_target_run_id
-            ? this.reviewRunner.execute(claim)
+            ? this.reviewRunner.execute(claim, signal)
             : claim.kind === "judge"
-              ? this.judgeRunner.execute(claim)
+              ? this.judgeRunner.execute(claim, signal)
               : claim.kind === "job" ? this.jobRunner.execute(claim)
               : this.runner.execute(claim);
           } catch (err) {

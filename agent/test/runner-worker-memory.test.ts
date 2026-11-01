@@ -40,6 +40,20 @@ async function until(predicate: () => boolean, timeoutMs = 3000) {
   }
 }
 
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function setup(count = 0, configured = settings) {
   api.memoryRegisterNonce = "original-memory-registration";
   api.setRegisterProtocolFeatures(["worker_memory_pressure_v1", "claim_generation_fence"]);
@@ -77,7 +91,7 @@ async function setup(count = 0, configured = settings) {
       const time = performance.now();
       return { available: true, sampleId: ++sampleId, startedAtMs: time, completedAtMs: time,
         currentBytes: usage, limitBytes: 1000,
-        stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+        stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
         pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
           full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
     } },
@@ -508,11 +522,12 @@ test("memory owned flush cancellation joins original settlement and preserves re
   }
 });
 
-function memoryOutbox(root: string, fail = false) {
+function memoryOutbox(root: string, fail = false, gate?: (context: { kind: string }) => Promise<void>) {
   return new Outbox({ root, log: nullLogger(), runMaxBytes: 64 * 1024 * 1024,
     maxBytes: 128 * 1024 * 1024, retentionMs: 86400000,
     rawWrite: async (write, context) => {
       if (fail && context.kind === "segment") throw new Error("fixture disk failure");
+      await gate?.(context);
       await write();
     } });
 }
@@ -614,54 +629,116 @@ for (const store of ["missing", "disabled", "write_failure", "refused"] as const
   });
 }
 
+// Real fsync'd outbox spill can exceed a 200 ms cleanup budget under CI load (#3681).
+const memoryCloseBudgetMs = 5000;
+
+// Probe: expiry timers are captured instead of armed, and a held tail-segment write is released only after a
+// SIMULATED elapsed point (not a real delay) so the budget outcome is deterministic.
+type TailProbe = { simulatedMs: number; expectDurable: boolean };
+
+async function runMemoryCloseTail(fail: boolean, budget: number, probe?: TailProbe) {
+  const root = memoryOutboxRoot();
+  const timers: { ms: number; controller: AbortController }[] = [];
+  let gateHits = 0, reached!: () => void, release!: () => void;
+  const gateReached = new Promise<void>(resolve => { reached = resolve; });
+  const gateOpen = new Promise<void>(resolve => { release = resolve; });
+  const outbox = memoryOutbox(root, fail, probe ? async context => {
+    if (context.kind !== "segment") return;
+    gateHits++;
+    reached();
+    await gateOpen;
+  } : undefined);
+  await outbox.init();
+  const f = await setup(1);
+  const monitoring = f.memory.run();
+  let original: { workerMemory?: { feedback: Map<string, { operation?: Promise<boolean> }>;
+    tailPreservation?: Promise<boolean>; tailDurable?: boolean; closing?: Promise<void> };
+    retainedLocalCustody?: boolean; batcher: MessageBatcher } | undefined;
+  const executor: Executor = { run: async ctx => {
+    const command = enroll(ctx);
+    original = command.captured.flight as typeof original;
+    client.postMessages = async () => { throw new Error("offline before spill threshold"); };
+    f.pressure(950);
+    await command.captured.commands.watchOutcome(command.entry);
+    // The feedback/capture signal may already be expired: cleanup gets its own budget.
+    const closeOriginal = () => original!.batcher.close(AbortSignal.abort(new Error("prior boundary expired")));
+    let closed: Promise<void>;
+    if (!probe) closed = closeOriginal();
+    else {
+      // The runner arms its expiry synchronously inside close(): capture it and freeze the clock for that window only.
+      const realTimeout = AbortSignal.timeout, realNow = Date.now, fixed = realNow();
+      (AbortSignal as { timeout: (ms: number) => AbortSignal }).timeout = ms => {
+        const controller = new AbortController();
+        timers.push({ ms, controller });
+        return controller.signal;
+      };
+      Date.now = () => fixed;
+      try { closed = closeOriginal(); } finally {
+        AbortSignal.timeout = realTimeout;
+        Date.now = realNow;
+      }
+    }
+    await closed;
+    throw new Error("quiet retained stop");
+  } };
+  const bounded = <T,>(operation: Promise<T>, label: string) => probe ? withTimeout(operation, 6000, label) : operation;
+  const driver = probe ? withTimeout(gateReached, 6000, "tail segment write gate").then(() => {
+    for (const timer of timers) if (timer.ms <= probe.simulatedMs) timer.controller.abort();
+    release();
+  }) : undefined;
+  try {
+    await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, outbox, codexBoundaryDeadlineMs: budget }).execute(f.claim);
+    await driver;
+    const memory = original!.workerMemory!;
+    await bounded(memory.closing as Promise<void>, "memory closing");
+    assert.ok(memory.tailPreservation, "original operation stays explicitly owned");
+    if (probe) {
+      assert.equal(timers.length, 1, "exactly one expiry timer is armed");
+      assert.equal(timers[0]!.ms, budget);
+      assert.equal(gateHits, 1, "exactly one tail segment write");
+    }
+    if (probe && !probe.expectDurable) {
+      assert.equal(await bounded(memory.tailPreservation, "tail preservation"), false);
+      assert.equal(memory.tailDurable, false);
+      assert.equal(original!.retainedLocalCustody, true);
+      return;
+    }
+    assert.equal(await bounded(memory.tailPreservation, "tail preservation"), !fail);
+    assert.equal(memory.tailDurable, !fail);
+    assert.equal(original!.retainedLocalCustody, true);
+    assert.equal(memory.feedback.size, 1, "disk writes never delete ACK-only intent");
+    assert.ok([...memory.feedback.values()][0]!.operation, "original feedback send promise stays owned");
+    assert.equal(api.states.some(s => s.body.recovery_cause === "worker_memory_pressure"), false);
+    if (!fail) {
+      const reopened = memoryOutbox(root);
+      await reopened.init();
+      const feedback: { seq: number; generation: number; intervention_id: unknown }[] = [];
+      await reopened.drainRun(f.claim.run_id, async (messages, generation) => {
+        for (const message of messages) if (message.payload.event === "worker_memory_pressure")
+          feedback.push({ seq: message.seq, generation, intervention_id: message.payload.intervention_id });
+      });
+      assert.equal(feedback.length, 1);
+      assert.equal(feedback[0]!.generation, 7);
+      assert.equal(feedback[0]!.intervention_id, [...memory.feedback.keys()][0]);
+    } else assert.equal(outbox.hasUndrainedMessages(f.claim.run_id), false);
+  } finally {
+    release();
+    await f.memory.stop(); await monitoring;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 for (const fail of [false, true]) {
   test(`runner memory close preserves original feedback intent/custody with durable tail=${!fail}`, async () => {
-    const root = memoryOutboxRoot();
-    const outbox = memoryOutbox(root, fail);
-    await outbox.init();
-    const f = await setup(1);
-    const monitoring = f.memory.run();
-    let original: { workerMemory?: { feedback: Map<string, { operation?: Promise<boolean> }>;
-      tailPreservation?: Promise<boolean>; tailDurable?: boolean; closing?: Promise<void> };
-      retainedLocalCustody?: boolean; batcher: MessageBatcher } | undefined;
-    const executor: Executor = { run: async ctx => {
-      const command = enroll(ctx);
-      original = command.captured.flight as typeof original;
-      client.postMessages = async () => { throw new Error("offline before spill threshold"); };
-      f.pressure(950);
-      await command.captured.commands.watchOutcome(command.entry);
-      // The feedback/capture signal may already be expired: cleanup gets its own budget.
-      await original!.batcher.close(AbortSignal.abort(new Error("prior boundary expired")));
-      throw new Error("quiet retained stop");
-    } };
-    try {
-      await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
-        { memoryRuntime: f.memory, outbox, codexBoundaryDeadlineMs: 200 }).execute(f.claim);
-      const memory = original!.workerMemory!;
-      await memory.closing;
-      assert.ok(memory.tailPreservation, "original operation stays explicitly owned");
-      assert.equal(await memory.tailPreservation, !fail);
-      assert.equal(memory.tailDurable, !fail);
-      assert.equal(original!.retainedLocalCustody, true);
-      assert.equal(memory.feedback.size, 1, "disk writes never delete ACK-only intent");
-      assert.ok([...memory.feedback.values()][0]!.operation, "original feedback send promise stays owned");
-      assert.equal(api.states.some(s => s.body.recovery_cause === "worker_memory_pressure"), false);
-      if (!fail) {
-        const reopened = memoryOutbox(root);
-        await reopened.init();
-        const feedback: { seq: number; generation: number; intervention_id: unknown }[] = [];
-        await reopened.drainRun(f.claim.run_id, async (messages, generation) => {
-          for (const message of messages) if (message.payload.event === "worker_memory_pressure")
-            feedback.push({ seq: message.seq, generation, intervention_id: message.payload.intervention_id });
-        });
-        assert.equal(feedback.length, 1);
-        assert.equal(feedback[0]!.generation, 7);
-        assert.equal(feedback[0]!.intervention_id, [...memory.feedback.keys()][0]);
-      } else assert.equal(outbox.hasUndrainedMessages(f.claim.run_id), false);
-    } finally {
-      await f.memory.stop(); await monitoring;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+    await runMemoryCloseTail(fail, memoryCloseBudgetMs);
+  });
+}
+
+for (const { budget, expectDurable } of [{ budget: memoryCloseBudgetMs, expectDurable: true }, { budget: 200, expectDurable: false }]) {
+  test(`runner memory close tail probe: budget=${budget} at simulated 250 ms`, async () => {
+    // Simulated point between the old 200 ms budget and the 5000 ms fixture budget; only the 200 ms control expires.
+    await runMemoryCloseTail(false, budget, { simulatedMs: 250, expectDurable });
   });
 }
 
@@ -1413,7 +1490,18 @@ test("runtime freezes and validates configured policy; first null claim seeds it
     throw new Error("fixture end");
   } };
   try {
-    const r = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, { memoryRuntime: memory });
+    const r = runnerWith(() => {
+      // Each execution owns a fresh Codex epoch. A real closed/drained boundary
+      // permits normal teardown before this worker accepts the persisted claim.
+      const rig = codexRig();
+      return { executor: { ...executor, safety: rig.safety,
+        settleForCredentialFreeCapture: rig.settle, withCredentialFreeCapture: rig.capture,
+        run: async ctx => {
+          try { return await executor.run(ctx); }
+          finally { await rig.safety.withBoundary({ boundary: "checkpoint", deadlineMs: 1000 }, async () => {}); }
+        },
+      } };
+    }, fakeGitlab().gitlab, undefined, undefined, { memoryRuntime: memory });
     await r.execute({ ...f.claim, memory_policy: null });
     if (executorError) throw executorError;
     assert.equal(calls, 1, "first null-policy claim enters the actual runner");
@@ -1633,6 +1721,12 @@ for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "clai
           await until(() => entered);
           if (scenario === "unsettled") {
             assert.notEqual(captured.workerMemory?.settled, true);
+          } else if (scenario === "already-parked") {
+            // The owned capture has a five-second budget; a three-second poll can expire first.
+            const operation = captured.workerMemory?.operation;
+            assert.ok(operation, "already-parked capture keeps its owned operation");
+            await withTimeout(operation, 6000, "already-parked memory capture settlement");
+            assert.equal(captured.workerMemory?.settled, true);
           } else {
             await until(() => captured?.workerMemory?.settled === true);
           }

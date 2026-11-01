@@ -32,6 +32,18 @@ function okReading(
   };
 }
 
+// A reading for an account with no 5-hour window (plans where Anthropic removed it):
+// only the 7-day meter exists, so five_hour is absent and the UI shows one row.
+function sevenDayOnlyReading(pct7: number, in7: number, syncedMins = 2): MyRateLimits {
+  return {
+    status: "ok",
+    seven_day: { pct: pct7, resets_at: NOW_SECS + in7 },
+    source: "header_probe",
+    synced_at: minsAgo(syncedMins),
+    stale: false,
+  };
+}
+
 // The signed-in demo user's own readings (Settings card + sidebar). Since PRD #104
 // this is ONE READING PER TOKEN: the default matches mockup frame A (8% / 27%,
 // both green under the PRD #115 bands, "Live"), and the console key is busier so
@@ -119,6 +131,16 @@ export const mockMyTokenRateLimits: TokenRateLimits[] = [
     auto_status: "not_pooled" as const,
     limits: okReading(100, 35 * MIN, 40, 2 * D + 5 * H, 14, "limit_report"),
   },
+  {
+    // A 7-day-only account (no 5-hour window): the meter shows a single row.
+    // Non-pooled, matching its mockSecrets row token-for-token.
+    secret_id: "sec-seven-only",
+    label: "ultra-key",
+    is_default: false,
+    auto_eligible: false,
+    auto_status: "not_pooled" as const,
+    limits: sevenDayOnlyReading(31, 4 * D + 2 * H),
+  },
 ];
 
 // tokenised wraps a single reading as a one-token list, for the personas whose
@@ -164,14 +186,14 @@ export const mockMyRateLimitsByUser: Record<string, TokenRateLimits[]> = {
 // stale+vault-locked, unavailable, no_token.
 export const mockAdminRateLimits: AdminRateLimitUser[] = [
   // vlad holds TWO tokens, so the admin table's per-user grouping is demonstrable.
-  { id: "u-admin", email: "vlad@example.com", name: "vlad", vault_locked: false, tokens: mockMyTokenRateLimits },
-  { id: "u-radu", email: "radu@example.com", name: "radu", vault_locked: false, tokens: tokenised(okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3)) },
-  { id: "u-ana", email: "ana@example.com", name: "ana", vault_locked: false, tokens: tokenised(okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1)) },
+  { id: "u-admin", email: "vlad@example.com", name: "vlad", vault_mode: "protected", vault_locked: false, tokens: mockMyTokenRateLimits },
+  { id: "u-radu", email: "radu@example.com", name: "radu", vault_mode: "protected", vault_locked: false, tokens: tokenised(okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3)) },
+  { id: "u-ana", email: "ana@example.com", name: "ana", vault_mode: "protected", vault_locked: false, tokens: tokenised(okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1)) },
   // sorin demonstrates the new PRD #115 85–94 danger band: 5h at 88% paints a red
   // bar (danger tone ≥85) but the status pill stays a green "Live" because no
   // window has crossed 95 (the badge stays decoupled at ≥95).
-  { id: "u-sorin", email: "sorin@example.com", name: "sorin", vault_locked: false, tokens: tokenised(okReading(88, 3 * H + 5 * MIN, 76, 3 * D + 6 * H, 4)) },
-  { id: "u-mihai", email: "mihai@example.com", name: "mihai", vault_locked: true, tokens: tokenised(okReading(31, 0, 12, 0, 180, "header_probe", true)) },
-  { id: "u-dana", email: "dana@example.com", name: "dana", vault_locked: false, tokens: tokenised({ status: "unavailable" }) },
-  { id: "u-irina", email: "irina@example.com", name: "irina", vault_locked: false, tokens: [] },
+  { id: "u-sorin", email: "sorin@example.com", name: "sorin", vault_mode: "protected", vault_locked: false, tokens: tokenised(okReading(88, 3 * H + 5 * MIN, 76, 3 * D + 6 * H, 4)) },
+  { id: "u-mihai", email: "mihai@example.com", name: "mihai", vault_mode: "protected", vault_locked: true, tokens: tokenised(okReading(31, 0, 12, 0, 180, "header_probe", true)) },
+  { id: "u-dana", email: "dana@example.com", name: "dana", vault_mode: "protected", vault_locked: false, tokens: tokenised({ status: "unavailable" }) },
+  { id: "u-irina", email: "irina@example.com", name: "irina", vault_mode: "protected", vault_locked: false, tokens: [] },
 ];

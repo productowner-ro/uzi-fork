@@ -1,4 +1,32 @@
 {
+  "forge_origin_cooldown": {
+    "origin": "x",
+    "cooled_until": "2020-01-02T03:04:05Z",
+    "half_open_run_id": "x",
+    "state": "x",
+    "detail": "x"
+  },
+  "capability_provenance": {
+    "hints_known": true,
+    "inference_known": true,
+    "capabilities": [
+      {
+        "capability": "x",
+        "sources": [
+          "x"
+        ],
+        "required": true,
+        "inference_ignored": true,
+        "triggers": [
+          {
+            "path": "x",
+            "reason": "x"
+          }
+        ],
+        "truncated": true
+      }
+    ]
+  },
   "completion_pending": {
     "version": 1,
     "contract_revision": 1,
@@ -318,6 +346,7 @@
     "historical": true
   },
   "code_cross_check_summary": {
+    "coverage": {},
     "custom_guidance_applied": true,
     "guidance_digest": "x",
     "repo_instructions_commit": "x",
@@ -450,6 +479,13 @@
   "health_reason": "x",
   "health_since": "2020-01-02T03:04:05Z",
   "deadline_at": "2020-01-02T03:04:05Z",
+  "queue_reason": "x",
+  "reserve_hold_reason": "x",
+  "reserve_exempt_until": "2020-01-02T03:04:05Z",
+  "account_cooldown_class": "x",
+  "account_cooldown_eligible_at": "2020-01-02T03:04:05Z",
+  "codex_admission_class": "x",
+  "codex_admission_eligible_at": "2020-01-02T03:04:05Z",
   "plan_md": "x",
   "plan_source": "x",
   "gate_revision": 1,
@@ -663,10 +699,39 @@
   "home_bytes": 1,
   "cache_bytes": 1,
   "disk_truncated": true,
+  "lead_config": {
+    "applicable": true,
+    "claim_generation": 1,
+    "current": true,
+    "phases": [
+      {
+        "phase": "x",
+        "phase_entry": 1,
+        "seq": 1,
+        "harness": "x",
+        "requested_model": "x",
+        "requested_model_source": "x",
+        "requested_model_fixed_at": "x",
+        "requested_effort": "x",
+        "requested_effort_mode": "x",
+        "requested_effort_source": "x",
+        "requested_effort_fixed_at": "x",
+        "observed_model": "x",
+        "observed_model_evidence": "x",
+        "observed_effort": "x",
+        "observed_effort_evidence": "x",
+        "truncated": true,
+        "reported_at": "2020-01-02T03:04:05Z"
+      }
+    ]
+  },
   "model": "x",
   "override_subagent_model": true,
   "priority": "x",
   "required_capabilities": [
+    "x"
+  ],
+  "ignored_inferred_capabilities": [
     "x"
   ],
   "required_tools": [

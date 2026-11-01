@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 )
 
 // defaultMaxConcurrency bounds how many users are polled in parallel per tick.
@@ -56,7 +57,8 @@ const pokeBuffer = 64
 // Store is the query surface the engine needs. *store.Queries satisfies it.
 // ListAnthropicTokensToPoll returns each ENABLED TOKEN's id, owner, ciphertext +
 // sealed_with, owner opt-in, enablement revision and success generation so the tick opens them in one
-// pass (no per-row re-fetch); GetAnthropicTokenToPoll is its single-token sibling
+// pass; only an exact stale crypto epoch permits one same-ID refetch.
+// GetAnthropicTokenToPoll is its single-token sibling
 // for the poke path, which polls the token a save or re-enable just touched.
 type Store interface {
 	ListAnthropicTokensToPoll(ctx context.Context) ([]store.ListAnthropicTokensToPollRow, error)
@@ -90,7 +92,7 @@ type EarlyResetNotifier interface {
 // secretopen.ErrVaultLocked for a locked dek-sealed vault (skip, keep the last
 // reading) and ErrUndecryptable when the token is undecryptable.
 type TokenOpener interface {
-	OpenSealed(userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error)
+	OpenSealedAtEpoch(ctx context.Context, userID uuid.UUID, kind, sealedWith string, ciphertext []byte, epoch int64) ([]byte, error)
 }
 
 // Client reads rate-limit state from Anthropic. *anthropic.Client satisfies it.
@@ -238,7 +240,7 @@ func (e *Engine) tickAll(ctx context.Context) {
 			// The listing holds enabled tokens only (PRD #1732 D1) and carries the
 			// enablement revision this poll is fenced on (D13).
 			e.pollToken(tickCtx, row.UserID, row.ID, row.EnablementRev, row.AnthropicSuccessGeneration, false, row.NotifyEarlyLimitReset, func() ([]byte, error) {
-				return e.opener.OpenSealed(row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
+				return e.openToken(tickCtx, store.GetAnthropicTokenToPollRow(row))
 			})
 		}(row)
 	}
@@ -275,13 +277,37 @@ func (e *Engine) pokeUser(ctx context.Context, userID, secretID uuid.UUID) {
 		return
 	}
 	e.pollToken(ctx, row.UserID, row.ID, row.EnablementRev, row.AnthropicSuccessGeneration, true, row.NotifyEarlyLimitReset, func() ([]byte, error) {
-		return e.opener.OpenSealed(row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
+		return e.openToken(ctx, row)
 	})
+}
+
+// openToken permits one same-ID refetch only on exact crypto epoch mismatch.
+// Its caller keeps the original row for write and notification fences.
+func (e *Engine) openToken(ctx context.Context, row store.GetAnthropicTokenToPollRow) ([]byte, error) {
+	plain, err := e.opener.OpenSealedAtEpoch(ctx, row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext, row.VaultEpoch)
+	if err != store.ErrVaultSealStale {
+		return plain, err
+	}
+	fresh, err := e.store.GetAnthropicTokenToPoll(ctx, store.GetAnthropicTokenToPollParams{
+		UserID: row.UserID, SecretID: pgtype.UUID{Bytes: row.ID, Valid: true},
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrVaultSealStale
+	}
+	if err != nil {
+		return nil, err
+	}
+	if fresh.ID != row.ID || fresh.UserID != row.UserID ||
+		fresh.EnablementRev != row.EnablementRev ||
+		fresh.AnthropicSuccessGeneration != row.AnthropicSuccessGeneration {
+		return nil, store.ErrVaultSealStale
+	}
+	return e.opener.OpenSealedAtEpoch(ctx, fresh.UserID, store.KindAnthropicToken, fresh.SealedWith, fresh.Ciphertext, fresh.VaultEpoch)
 }
 
 // pollToken polls ONE token, applying the D2 (usage-first, probe fallback) and D5
 // (fail-closed / backoff) rules. open decrypts that token's already-fetched row via
-// the vault path (OpenSealed on both the tick's listing row and the poke's resolved
+// the vault path (OpenSealedAtEpoch on both the tick's listing row and the poke's resolved
 // row); ignoreBackoff is set on the poke path so a just-saved credential is polled even if the one it replaced was
 // backed off. rev is the token's enablement revision captured when the poll
 // started; the write is fenced on it (PRD #1732 D13). successGeneration is
@@ -326,15 +352,18 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev,
 	switch {
 	case !errors.As(err, &aerr) || aerr.Kind == anthropic.KindTransport:
 		// Transport failure — transient, just wait for the next tick (no backoff).
+		e.logPollFailure(secretID, "usage", err)
 		return
 	case aerr.Kind == anthropic.KindMalformed:
 		// A 2xx we couldn't parse — fail closed: keep the last good row, no backoff.
+		e.logPollFailure(secretID, "usage", err)
 		return
 	}
 
 	// KindHTTP: the usage endpoint definitively refused this credential (observed:
 	// 429 for setup-tokens). Fall back to the ~1-token header probe (D2).
 	if !e.probe {
+		e.logPollFailure(secretID, "usage", err)
 		e.setBackoff(secretID) // no usable fallback → back off (D5)
 		return
 	}
@@ -354,32 +383,38 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev,
 			e.logger.Error("usage poller: mark rejected token", "secret", secretID.String(), "error", markErr)
 		}
 	}
+	e.logPollFailure(secretID, "probe", perr)
 	// The probe also failed (refused, transport, or malformed) — no usable fallback,
 	// so back off to avoid hammering a persistently refusing credential (D5).
 	e.setBackoff(secretID)
+}
+
+// logPollFailure logs one line for a poll that ended without a reading: the secret
+// id, which call failed, the error kind and (for a refusal) the HTTP status. It
+// never logs the token or a response body. A token in backoff is skipped before any
+// call, so this fires at most once per tick per token.
+func (e *Engine) logPollFailure(secretID uuid.UUID, call string, err error) {
+	kind, status := "transport", 0
+	var aerr *anthropic.Error
+	if errors.As(err, &aerr) {
+		status = aerr.Status
+		switch aerr.Kind {
+		case anthropic.KindHTTP:
+			kind = "http"
+		case anthropic.KindMalformed:
+			kind = "malformed"
+		}
+	}
+	e.logger.Warn("usage poller: poll failed", "secret", secretID.String(), "call", call, "kind", kind, "status", status)
 }
 
 // earlyResetThreshold: only alert when the weekly window reopened comfortably
 // ahead of its advertised reset, so poll jitter never trips it (PRD #1020 D2).
 const earlyResetThreshold = 8 * time.Hour
 
-// resetEpochMoveMargin: Arm A requires the fresh 7-day reset epoch to move at
-// least this far past the advertised T. A genuine reset moves it by ~days,
-// while a usage_endpoint->header_probe source flip re-derives the same instant
-// from a different wire field (ISO body string vs Unix-epoch header) and can
-// differ by seconds; +1h absorbs that jitter so a bare .After never fires on it
-// (PRD #1114 D8).
-const resetEpochMoveMargin = 1 * time.Hour
-
-// pctResetFloor / pctResetCeil: Arm B treats a 7-day utilization drop from
-// >= pctResetFloor to <= pctResetCeil as a reset (the fixed-grid manifestation,
-// where used% zeroes but the boundary does not move). The 7-day used% is
-// monotonic non-decreasing between resets, so a genuine drop only happens at a
-// reset; the small buffer stops a cross-source rounding delta from reading as a
-// reset. Set low deliberately (owner accepts a noisy floor; real weekly resets
-// are rare and a missed early clear costs more than a spurious alert) (PRD #1114 D5/D8).
-const pctResetFloor = 5
-const pctResetCeil = 1
+// The Arm A margin (ResetEpochMoveMargin, +1h, PRD #1114 D8) and the Arm B floor/ceil
+// (PctResetFloor 5 / PctResetCeil 1, PRD #1114 D5/D8) are single-sourced in usagereserve,
+// next to the arm predicate the weekly usage reserve shares.
 
 // observe writes the fresh reading and, when the owner opted in, fires the early
 // 7-day reset alert (PRD #1020 M2). It wraps EVERY upsert path — tick and poke —
@@ -454,8 +489,8 @@ func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, rev in
 // a prior pending 7-day reset exists (T set AND in the future relative to
 // prev.SyncedAt), now is strictly more than earlyResetThreshold before T, and the
 // reset is observed by EITHER Arm A (the fresh reset epoch moved strictly more than
-// resetEpochMoveMargin past T — the rolling-boundary model) OR Arm B (the 7-day
-// used% dropped from >= pctResetFloor to <= pctResetCeil with an unmoved boundary —
+// usagereserve.ResetEpochMoveMargin past T — the rolling-boundary model) OR Arm B (the 7-day
+// used% dropped from >= usagereserve.PctResetFloor to <= usagereserve.PctResetCeil with an unmoved boundary —
 // the fixed-grid model). The prior "was limiting" gate is gone (PRD #1114): the two
 // arms' jitter margins replace the false-positive protection it provided. It returns
 // T as the expected reset.
@@ -472,20 +507,13 @@ func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic
 	if !t.After(prev.SyncedAt.Time) {
 		return false, time.Time{}
 	}
-	// Arm A — boundary moved forward (rolling model): the fresh reset epoch is set
-	// AND strictly more than resetEpochMoveMargin past T.
-	armA := next.SevenDay.ResetsAt != nil && next.SevenDay.ResetsAt.After(t.Add(resetEpochMoveMargin))
-	// Arm B — utilization zeroed ahead of schedule (fixed-grid model): the fresh 7-day
-	// reset epoch is PRESENT and unmoved (== T, i.e. the fixed grid did not shift — a
-	// forward move past the margin is Arm A's domain, and a nil, sub-margin, or backward
-	// boundary is jitter-ambiguous and must not fire here), AND prior 7-day used% >=
-	// pctResetFloor while the fresh used% <= pctResetCeil.
-	armB := next.SevenDay.ResetsAt != nil &&
-		next.SevenDay.ResetsAt.Equal(t) &&
-		prev.SevenDayPct.Valid &&
-		int(prev.SevenDayPct.Int16) >= pctResetFloor &&
-		next.SevenDay.Pct <= pctResetCeil
-	if !armA && !armB {
+	// Arms A and B (boundary moved forward / utilization zeroed on an unmoved boundary)
+	// live in usagereserve.ClaudeResetObserved, shared with the weekly usage reserve.
+	var priorPct *int16
+	if prev.SevenDayPct.Valid {
+		priorPct = &prev.SevenDayPct.Int16
+	}
+	if !usagereserve.ClaudeResetObserved(t, priorPct, next.SevenDay.ResetsAt, next.SevenDay.Pct) {
 		return false, time.Time{}
 	}
 	// early: now strictly before T - threshold (exactly -threshold is NOT early).
@@ -500,11 +528,19 @@ func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic
 // nil error means the D13 fence refused it (PRD #1732), because the token is
 // disabled or its enablement revision is no longer rev.
 func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, rev int64, r anthropic.Reading) (bool, error) {
+	// An account without a 5-hour window (r.FiveHour nil) stores NULL pct + reset,
+	// never a fabricated 0%.
+	var fhPct pgtype.Int2
+	var fhReset *time.Time
+	if r.FiveHour != nil {
+		fhPct = pgInt2(r.FiveHour.Pct)
+		fhReset = r.FiveHour.ResetsAt
+	}
 	n, err := e.store.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID:     secretID,
 		UserID:           userID,
-		FiveHourPct:      pgInt2(r.FiveHour.Pct),
-		FiveHourResetsAt: pgconv.TimePtr(r.FiveHour.ResetsAt),
+		FiveHourPct:      fhPct,
+		FiveHourResetsAt: pgconv.TimePtr(fhReset),
 		SevenDayPct:      pgInt2(r.SevenDay.Pct),
 		SevenDayResetsAt: pgconv.TimePtr(r.SevenDay.ResetsAt),
 		Source:           pgconv.Text(r.Source),

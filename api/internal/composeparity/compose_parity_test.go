@@ -48,7 +48,7 @@ func documents(t *testing.T) (map[string]any, map[string]any) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := readCompose("../../../deploy/compose/compose.yml")
+	server, err := readCompose("../../../deploy/compose/compose.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

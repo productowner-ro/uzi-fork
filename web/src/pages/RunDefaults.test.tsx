@@ -13,7 +13,7 @@ import { RunDefaults } from "./RunDefaults";
 import { api, ApiError, type User } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import type { ModelSettingCell, UserSettings } from "../lib/apiTypes";
-import { CODEX_CURATED_MODELS } from "../lib/codexModels";
+import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../lib/codexModels";
 import { mockTemplates } from "../mocks/data";
 
 vi.mock("../lib/api", async (importActual) => {
@@ -38,6 +38,7 @@ vi.mock("../lib/api", async (importActual) => {
       setCodeCrossCheckEnabled: vi.fn(),
       setWaitOnLimit: vi.fn(),
       setNotifyEarlyReset: vi.fn(),
+      setUsageReserve: vi.fn(),
       setJudgeEnabled: vi.fn(),
       setAttributionEnabled: vi.fn(),
       getMySettings: vi.fn(),
@@ -653,6 +654,40 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: null }));
     expect(claude.value).toBe("max");
   });
+  // PRD #3247: the ordinary worker cards offer the preference-only Runtime default.
+  describe("Runtime default (PRD #3247)", () => {
+    const base = { default_harness: null, default_model: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null };
+    const codexSecret = { id: "codex-rt", kind: "openai_api_key", label: "Codex fixture", is_default: true, enabled: true, disabled_at: null, auto_eligible: false, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+    const optionList = (el: HTMLElement) => Array.from((el as HTMLSelectElement).options).map((o) => [o.value, o.text]);
+
+    it("offers Runtime default with each harness's label and the card copy", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [codexSecret] });
+      mockApi.getMySettings.mockResolvedValue({ settings: { ...base, default_effort: null, default_codex_effort: null } });
+      render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+      const claude = await screen.findByLabelText("Claude effort");
+      const codex = await screen.findByLabelText("Codex effort");
+      expect(optionList(claude)[1]).toEqual(["runtime", "Runtime default · value not reported"]);
+      expect(optionList(codex)[1]).toEqual(["runtime", "Runtime default · Codex decides"]);
+      expect(screen.getByText(/Runtime default sends no level, so Claude Code or Codex decides; a resumed session may keep the level it last used\./)).toBeTruthy();
+    });
+
+    it("saving runtime sends the token and announces Runtime default, never 'runtime'", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [codexSecret] });
+      mockApi.getMySettings.mockResolvedValue({ settings: { ...base, default_effort: null, default_codex_effort: null } });
+      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: "runtime", default_codex_effort: null } });
+      render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+      fireEvent.change(await screen.findByLabelText("Claude effort"), { target: { value: "runtime" } });
+      fireEvent.click(screen.getByText("Save Claude effort"));
+      await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_effort: "runtime" }));
+      await screen.findByText("Claude reasoning effort set to Runtime default. Claude Code decides at your next run.");
+      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: "runtime", default_codex_effort: "runtime" } });
+      fireEvent.change(screen.getByLabelText("Codex effort"), { target: { value: "runtime" } });
+      fireEvent.click(screen.getByText("Save Codex effort"));
+      await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: "runtime" }));
+      await screen.findByText("Codex reasoning effort set to Runtime default. Codex decides at the next claim.");
+    });
+  });
+
   it("loads and shows the saved effort", async () => {
     mockApi.getMySettings.mockResolvedValue({
       settings: { default_harness: null, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
@@ -1302,6 +1337,79 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
   const saveButton = () =>
     screen.getByRole("button", { name: "Save defaults" }) as HTMLButtonElement;
 
+  it.each(CODEX_ROLE_MODELS)("recovers the stored Claude role ID %s only after explicit reset", async id => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: ` ${id} ` }));
+    mockApi.putMySettings.mockResolvedValue(settings({ default_harness: "codex", default_codex_model: "gpt-6-sol" }));
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await waitFor(() => expect((screen.getByLabelText("Custom Claude model ID") as HTMLInputElement).value).toBe(` ${id} `));
+    expect(screen.getByText(/^Not a Claude model/).textContent).toContain("stored value is skipped");
+    expect(screen.getByText(/^Not a Claude model/).textContent).toContain("existing Claude worker default");
+    fireEvent.change(screen.getByLabelText("Default harness"), { target: { value: "codex" } });
+    fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
+    expect(saveButton().disabled).toBe(true);
+    fireEvent.click(saveButton());
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Reset to Default" }));
+    await waitFor(() => expect((screen.getByLabelText("Claude model") as HTMLSelectElement).value).toBe("inherit"));
+    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({
+      default_harness: "codex", default_claude_model: null, default_codex_model: "gpt-6-sol",
+    }));
+  });
+
+  it.each(["claude-private-model", "gpt-looking-custom"])("keeps custom Claude ID %s saveable", async id => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: id }));
+    mockApi.putMySettings.mockResolvedValue(settings({ default_claude_model: id, default_harness: "codex" }));
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await waitFor(() => expect((screen.getByLabelText("Custom Claude model ID") as HTMLInputElement).value).toBe(id));
+    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reset to Default" })).toBeNull();
+    fireEvent.change(screen.getByLabelText("Default harness"), { target: { value: "codex" } });
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({
+      default_harness: "codex", default_claude_model: id, default_codex_model: null,
+    }));
+  });
+
+  it("recovers hidden Claude luna, preserving Codex and harness drafts after a failed reset-save", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: "gpt-6-luna", default_harness: "codex" }));
+    let rejectSave!: (reason: Error) => void;
+    mockApi.putMySettings.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectSave = reject; }));
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await screen.findByText(/^Not a Claude model/);
+    expect(screen.queryByLabelText("Claude model")).toBeNull();
+    expect(screen.queryByLabelText("Default harness")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
+    expect(saveButton().disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Reset to Default" }));
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    const patch = { default_harness: "codex", default_claude_model: null, default_codex_model: "gpt-6-sol" };
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith(patch));
+    expect(saveButton().disabled).toBe(true);
+    rejectSave(new ApiError(400, "Reset save failed"));
+    await screen.findByText("Reset save failed");
+    await waitFor(() => expect(saveButton().disabled).toBe(false));
+    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
+    expect((screen.getByLabelText("Codex model") as HTMLSelectElement).value).toBe("gpt-6-sol");
+    mockApi.putMySettings.mockResolvedValue(settings(patch));
+    fireEvent.click(saveButton());
+    await screen.findByText(/Defaults saved/);
+    expect(mockApi.putMySettings).toHaveBeenNthCalledWith(2, patch);
+  });
+
   it("both usable: shows the harness selector, both lanes, and the badge on the effective (Claude) lane", async () => {
     mockAuth(baseUser);
     mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
@@ -1683,13 +1791,13 @@ describe("B1 independent settings responses", () => {
       patch: { default_harness: null, default_claude_model: null, default_codex_model: "gpt-6.1-sol" },
       response: { default_claude_model: null, cross_check_pins: [{ ...initial.cross_check_pins![0], worker_default_model: null }] }, checker: "Claude checker model", expected: "SDK/account default" },
     { name: "Claude effort reset", label: "Claude effort", value: "", button: "Save Claude effort",
-      patch: { default_effort: null }, response: { default_effort: null }, checker: "Claude checker effort", expected: "medium" },
+      patch: { default_effort: null }, response: { default_effort: null }, checker: "Claude checker effort", expected: "high" },
     { name: "Codex effort", label: "Codex effort", value: "max", button: "Save Codex effort",
-      patch: { default_codex_effort: "max" }, response: { default_codex_effort: "max" }, checker: "Codex checker effort", expected: "max" },
+      patch: { default_codex_effort: "max" }, response: { default_codex_effort: "max" }, checker: "Codex checker effort", expected: "high" },
     { name: "Claude effort", label: "Claude effort", value: "max", button: "Save Claude effort",
-      patch: { default_effort: "max" }, response: { default_effort: "max" }, checker: "Claude checker effort", expected: "max" },
+      patch: { default_effort: "max" }, response: { default_effort: "max" }, checker: "Claude checker effort", expected: "high" },
     { name: "Codex effort reset", label: "Codex effort", value: "", button: "Save Codex effort",
-      patch: { default_codex_effort: null }, response: { default_codex_effort: null }, checker: "Codex checker effort", expected: "medium" },
+      patch: { default_codex_effort: null }, response: { default_codex_effort: null }, checker: "Codex checker effort", expected: "high" },
   ];
   beforeEach(() => {
     mockApi.getMySettings.mockResolvedValue({ settings: initial });
@@ -1700,8 +1808,11 @@ describe("B1 independent settings responses", () => {
       created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
     })) });
   });
+  // A checker effort Default is the cross-check default whatever the worker effort is.
   const label = (checker: string, value: string) =>
-    expect(within(screen.getByLabelText(checker)).getByRole("option", { name: `Default · ${value} (worker default)` })).toBeTruthy();
+    expect(within(screen.getByLabelText(checker)).getByRole("option", {
+      name: `Default · ${value} (${checker.endsWith("effort") ? "cross-check default" : "worker default"})`,
+    })).toBeTruthy();
   const start = (label: string, value: string, button: string) => {
     fireEvent.change(screen.getByLabelText(label), { target: { value } });
     const save = screen.getByRole("button", { name: button }) as HTMLButtonElement;
@@ -1779,6 +1890,21 @@ describe("B1 independent settings responses", () => {
   }
 });
 
+describe("checker effort selects stay free of the preference-only runtime token (PRD #3247)", () => {
+  it("offers runtime on the worker select but not on the checker select", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: "runtime",
+      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
+      cross_check_pins: [
+        { stage: "plan" as const, harness: "claude" as const, model: null, effort: null, worker_default_model: "opus", resolved_model: "opus", resolved_effort: "high", model_source: "worker default" as const, effort_source: "cross-check default" as const, active: false },
+      ] } });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    const checker = await screen.findByLabelText("Claude checker effort") as HTMLSelectElement;
+    expect(Array.from(checker.options).map((o) => o.value)).not.toContain("runtime");
+    expect(Array.from((screen.getByLabelText("Claude effort") as HTMLSelectElement).options).map((o) => o.value)).toContain("runtime");
+    expect(within(checker).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
+  });
+});
+
 describe("checker defaults follow committed worker settings", () => {
   it("refreshes the worker model and effort Defaults while retaining checker drafts", async () => {
     const initial = { default_harness: null, default_model: null, default_claude_model: "opus",
@@ -1798,10 +1924,11 @@ describe("checker defaults follow committed worker settings", () => {
     expect(checker.value).toBe("sonnet");
     fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "max" } });
     const checkerEffort = screen.getByLabelText("Claude checker effort");
-    expect(within(checkerEffort).getByRole("option", { name: "Default · medium (worker default)" })).toBeTruthy();
+    expect(within(checkerEffort).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
     mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, default_claude_model: "haiku", default_effort: "max" } });
     fireEvent.click(screen.getByRole("button", { name: "Save Claude effort" }));
-    await waitFor(() => expect(within(checkerEffort).getByRole("option", { name: "Default · max (worker default)" })).toBeTruthy());
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save Claude effort" }) as HTMLButtonElement).disabled).toBe(true));
+    expect(within(checkerEffort).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
     expect(checker.value).toBe("sonnet");
     mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, cross_check_pins: [
       { stage: "plan", harness: "claude", model: "sonnet", effort: null, worker_default_model: "haiku", resolved_model: "sonnet",
@@ -1809,5 +1936,279 @@ describe("checker defaults follow committed worker settings", () => {
     ] } });
     fireEvent.click(screen.getByRole("button", { name: "Save cross-check defaults" }));
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ cross_check_pins: [{ stage: "plan", harness: "claude", model: "sonnet" }] }));
+  });
+});
+
+// PRD #3522 M1: the weekly usage reserve. One endpoint owns the pair (threshold, pause), so
+// every control sends both; writes are optimistic and roll back on failure.
+describe("Run defaults — weekly usage reserve (PRD #3522)", () => {
+  const reserveSwitch = () => screen.getByRole("switch", { name: "Keep a weekly usage reserve" });
+  const pctInput = () =>
+    screen.getByLabelText("Stop starting runs when your 7-day usage reaches") as HTMLInputElement;
+  const pauseBox = () =>
+    screen.getByLabelText("Also pause running runs after their current milestone") as HTMLInputElement;
+  const renderPage = () =>
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+  // The server echoes the stored pair in the user envelope.
+  const echo = () =>
+    mockApi.setUsageReserve.mockImplementation(async (pct, pause) => ({
+      user: { ...baseUser, weekly_reserve_pct: pct, weekly_reserve_pause_running: pause },
+    }));
+
+  it("renders off by default, hiding the threshold and pause controls", () => {
+    renderPage();
+    expect(reserveSwitch().getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByLabelText("Stop starting runs when your 7-day usage reaches")).toBeNull();
+    expect(screen.queryByLabelText("Also pause running runs after their current milestone")).toBeNull();
+    const help = document.getElementById(reserveSwitch().getAttribute("aria-describedby") ?? "");
+    expect(help?.textContent).toMatch(/7-day/);
+    expect(help?.textContent).toMatch(/Chat is not affected/);
+  });
+
+  it("shows a saved threshold with pause on, and the reserve explained", () => {
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    const { container } = renderPage();
+    expect(reserveSwitch().getAttribute("aria-checked")).toBe("true");
+    expect(pctInput().value).toBe("70");
+    expect(pauseBox().checked).toBe(true);
+    const text = container.textContent ?? "";
+    expect(text).toContain("The last 30% of your 7-day window stays free");
+    expect(text).toMatch(/Best effort/);
+    expect(text).toMatch(/With no fresh reading, new work is held/);
+  });
+
+  it("enabling with 70 calls setUsageReserve(70, true) and refreshes the session", async () => {
+    echo();
+    renderPage();
+    fireEvent.click(reserveSwitch());
+    // Switching on saves at once with the offered default, then the typed value on blur.
+    await waitFor(() => expect(mockApi.setUsageReserve).toHaveBeenCalledWith(90, true));
+    fireEvent.change(pctInput(), { target: { value: "70" } });
+    fireEvent.blur(pctInput());
+    await waitFor(() => expect(mockApi.setUsageReserve).toHaveBeenLastCalledWith(70, true));
+    expect(refresh).toHaveBeenCalled();
+    expect(reserveSwitch().getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("Enter commits the threshold, and an unchanged value sends nothing", async () => {
+    echo();
+    mockAuth({ ...baseUser, weekly_reserve_pct: 80, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.blur(pctInput());
+    fireEvent.change(pctInput(), { target: { value: "65" } });
+    fireEvent.keyDown(pctInput(), { key: "Enter" });
+    await waitFor(() => expect(mockApi.setUsageReserve).toHaveBeenCalledWith(65, true));
+    expect(mockApi.setUsageReserve).toHaveBeenCalledTimes(1);
+  });
+
+  it("toggling pause off sends (70, false)", async () => {
+    echo();
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.click(pauseBox());
+    await waitFor(() => expect(mockApi.setUsageReserve).toHaveBeenCalledWith(70, false));
+    await waitFor(() => expect(pauseBox().checked).toBe(false));
+  });
+
+  it.each(["0", "101", "1.5", ""])("refuses %j with an inline error and makes no call", async (value) => {
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.change(pctInput(), { target: { value } });
+    fireEvent.blur(pctInput());
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe("Enter a whole number from 1 to 100.");
+    expect(pctInput().getAttribute("aria-invalid")).toBe("true");
+    expect(pctInput().getAttribute("aria-describedby")).toBe(alert.id);
+    expect(mockApi.setUsageReserve).not.toHaveBeenCalled();
+  });
+
+  it("turning off sends (null, current pause value) and hides the controls", async () => {
+    echo();
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: false });
+    renderPage();
+    fireEvent.click(reserveSwitch());
+    await waitFor(() => expect(mockApi.setUsageReserve).toHaveBeenCalledWith(null, false));
+    expect(reserveSwitch().getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByLabelText("Also pause running runs after their current milestone")).toBeNull();
+  });
+
+  it("rolls back and names the failure when the write fails", async () => {
+    mockApi.setUsageReserve.mockRejectedValue(new ApiError(500, "reserve endpoint down"));
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.change(pctInput(), { target: { value: "40" } });
+    fireEvent.blur(pctInput());
+    expect(await screen.findByText("reserve endpoint down")).toBeTruthy();
+    expect(pctInput().value).toBe("70");
+    expect(refresh).not.toHaveBeenCalled();
+
+    // A failed switch-off comes back on.
+    fireEvent.click(reserveSwitch());
+    await waitFor(() => expect(mockApi.setUsageReserve).toHaveBeenLastCalledWith(null, true));
+    await waitFor(() => expect(reserveSwitch().getAttribute("aria-checked")).toBe("true"));
+    expect(reserveSwitch().getAttribute("aria-disabled")).toBeNull();
+  });
+
+  it("its failure does not disable or blame the usage-limit toggle beside it", async () => {
+    mockApi.setUsageReserve.mockRejectedValue(new ApiError(500, "reserve endpoint down"));
+    renderPage();
+    fireEvent.click(reserveSwitch());
+    expect(await screen.findByText("reserve endpoint down")).toBeTruthy();
+    const limit = screen.getByLabelText(
+      "Pause my new runs on a usage limit instead of failing them",
+    ) as HTMLInputElement;
+    expect(limit.disabled).toBe(false);
+    expect(mockApi.setWaitOnLimit).not.toHaveBeenCalled();
+  });
+
+  it("gives the threshold input an accessible name that includes the unit", () => {
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    expect(screen.getByRole("spinbutton", { name: /percent/ })).toBe(pctInput());
+  });
+
+  it("Escape reverts an uncommitted edit and sends nothing", () => {
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.change(pctInput(), { target: { value: "55" } });
+    expect(pctInput().value).toBe("55");
+    fireEvent.keyDown(pctInput(), { key: "Escape" });
+    expect(pctInput().value).toBe("70");
+    expect(mockApi.setUsageReserve).not.toHaveBeenCalled();
+  });
+
+  // Deferred writes let a test act while a save is in flight.
+  const deferred = () => {
+    const calls: Array<{ pct: number | null; pause: boolean; done: () => void }> = [];
+    mockApi.setUsageReserve.mockImplementation(
+      (pct, pause) =>
+        new Promise((resolve) => {
+          calls.push({
+            pct,
+            pause,
+            done: () =>
+              resolve({ user: { ...baseUser, weekly_reserve_pct: pct, weekly_reserve_pause_running: pause } }),
+          });
+        }),
+    );
+    return calls;
+  };
+
+  it("a switch click right after a threshold blur-commit is not dropped", async () => {
+    const calls = deferred();
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.change(pctInput(), { target: { value: "60" } });
+    fireEvent.blur(pctInput());
+    fireEvent.click(reserveSwitch());
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toMatchObject({ pct: 60, pause: true });
+    calls[0].done();
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]).toMatchObject({ pct: null, pause: true });
+    calls[1].done();
+    await waitFor(() => expect(reserveSwitch().getAttribute("aria-checked")).toBe("false"));
+  });
+
+  it("a pause click right after a threshold blur-commit keeps both changes", async () => {
+    const calls = deferred();
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.change(pctInput(), { target: { value: "60" } });
+    fireEvent.blur(pctInput());
+    fireEvent.click(pauseBox());
+    await waitFor(() => expect(calls).toHaveLength(1));
+    calls[0].done();
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]).toMatchObject({ pct: 60, pause: false });
+    calls[1].done();
+    await waitFor(() => expect(mockApi.setUsageReserve).toHaveBeenCalledTimes(2));
+  });
+
+  it("overlapping saves are sent one at a time and end with the last intent", async () => {
+    const calls = deferred();
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.change(pctInput(), { target: { value: "60" } });
+    fireEvent.blur(pctInput());
+    fireEvent.change(pctInput(), { target: { value: "50" } });
+    fireEvent.blur(pctInput());
+    fireEvent.change(pctInput(), { target: { value: "40" } });
+    fireEvent.blur(pctInput());
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(mockApi.setUsageReserve).toHaveBeenCalledTimes(1);
+    calls[0].done();
+    await waitFor(() => expect(calls).toHaveLength(2));
+    // The 50 intent was superseded by 40 before it was sent.
+    expect(calls[1]).toMatchObject({ pct: 40, pause: true });
+    calls[1].done();
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    expect(pctInput().value).toBe("40");
+  });
+
+  it("a change made while the session refresh is pending is still sent", async () => {
+    const calls = deferred();
+    let release: () => void = () => {};
+    refresh.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.click(pauseBox());
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toMatchObject({ pct: 70, pause: false });
+    calls[0].done();
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    // The write landed and the refresh is in flight: type a new threshold and blur.
+    fireEvent.change(pctInput(), { target: { value: "40" } });
+    fireEvent.blur(pctInput());
+    release();
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]).toMatchObject({ pct: 40, pause: false });
+    calls[1].done();
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+  });
+
+  it("follows a session user change made elsewhere, and a bare focus and blur sends nothing", () => {
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    const view = renderPage();
+    expect(pctInput().value).toBe("70");
+    mockAuth({ ...baseUser, weekly_reserve_pct: 50, weekly_reserve_pause_running: true });
+    view.rerender(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(pctInput().value).toBe("50");
+    fireEvent.focus(pctInput());
+    fireEvent.blur(pctInput());
+    expect(mockApi.setUsageReserve).not.toHaveBeenCalled();
+  });
+
+  it("drops its optimistic value once the session user moves on after a save", async () => {
+    echo();
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    const view = renderPage();
+    fireEvent.change(pctInput(), { target: { value: "60" } });
+    fireEvent.blur(pctInput());
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    // The session catches up, then the CLI changes it again.
+    for (const pct of [60, 50]) {
+      mockAuth({ ...baseUser, weekly_reserve_pct: pct, weekly_reserve_pause_running: true });
+      view.rerender(
+        <MemoryRouter>
+          <RunDefaults />
+        </MemoryRouter>,
+      );
+    }
+    expect(pctInput().value).toBe("50");
+    expect(reserveSwitch().getAttribute("aria-checked")).toBe("true");
   });
 });

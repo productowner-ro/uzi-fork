@@ -7,7 +7,7 @@ audience: operator
 # Installation
 
 For an existing VPS with Docker, a TLS reverse proxy, and other services, use the
-[server Compose file](../deploy/compose/compose.yml) with
+[server Compose file](../deploy/compose/compose.yaml) with
 [Run uzi on a VPS with Docker Compose](./vps-deployment.md). It covers signed release
 images, HTTPS, administrator bootstrap, worker registration, and backups. Choose a
 release containing that server file. The steps below are the local source-build path.
@@ -41,7 +41,7 @@ This generates the three required secrets and writes them to `.env` (starting fr
 
 All three are refused at boot / by compose if left empty. The script is
 **generate-once**: it writes `.env` only if it is absent and never regenerates,
-because `UZI_SECRET_KEY` (rotating it makes stored tokens undecryptable) and
+because `UZI_SECRET_KEY` (rotating it makes server-key-sealed tokens undecryptable) and
 `POSTGRES_PASSWORD` (only used to init the `pgdata` volume on first run) must stay
 stable. The rest have sane defaults for local use; see
 [configuration.md](configuration.md) for the full list.
@@ -58,6 +58,98 @@ docker compose up
 This builds and starts three services (`db`, `api`, `web`) in dependency order: `api` waits for `db`'s healthcheck, `web` waits for `api`'s. The API runs its goose migrations against `db` before it starts serving. Once `web` is healthy, open <http://127.0.0.1:8080>.
 
 Register the first account — it becomes admin automatically. Subsequent registrations are regular users.
+
+## Codex account admission upgrades
+
+Deploy the **API first, then workers**. The API applies the additive
+`00364_codex_account_admission_throttle.sql` and
+`00365_codex_admission_projection.sql` schema, plus
+`00377_codex_operation_admission.sql` (operation metadata) and
+`00378_account_cooldown_projection.sql` (active owner projection), before
+serving. The supported Helm API deployment remains a singleton with `Recreate`
+([deployment template](../deploy/chart/templates/api-deployment.yaml));
+mixed old/new API replicas outside that topology have no enforcement promise.
+
+Workers negotiate `codex_account_admission_signal_v1` before reporting
+provider evidence. Older workers still obey the server's claim gate but
+supply less evidence. Missing or refused reporting drops telemetry without
+changing run lifecycle behavior. See the
+[user contract](rate-limits.md#temporary-account-admission-waits).
+
+Workers independently negotiate `codex_account_operation_admission_v1` for
+fresh supported model dispatches; evidence reporting and optional active
+snapshots do not grant operation permission. A flight that has never negotiated
+this feature retains legacy behavior. Once negotiated, it stays engaged through
+feature loss, clear/re-registration and application rollback. **An admission-service
+outage blocks the next dispatch of every negotiated subscription flight,
+including accounts with no known cooldown.** Already dispatched turns and
+preservation continue with existing controls, budgets and deadlines effective.
+Transport errors, 5xx, malformed/untyped responses and an untyped missing-route
+404 mean unavailable wait, not allow or a provider failure. Strict typed
+`authority_lost` / `stale_source` refusals use the existing ownership/source routes.
+
+Operation reads have a three-second client deadline and 2.5-second server
+context, bounded to 4 KiB actual request bytes and 8 KiB actual response bytes,
+including error bodies. One serialized read per run/generation shares the
+unsuccessful-read schedule across siblings and replacement sources: churn
+cannot bypass it. Cooldown rechecks wait 1–15 seconds using server time;
+unavailability waits 15 seconds. Each later dispatch still needs a fresh read.
+The server uses the existing episode/class policy and finite per-run spread;
+this adds no provider backoff/streak policy. Missing optional active snapshots
+make specialized owner visibility unknown without disabling enforcement.
+
+Reporting is bounded best effort and does not block the provider or lifecycle
+path. Each observation gets at most two HTTP attempts, at most three seconds
+each, within a ten-second monotonic budget. The current implementation starts
+that budget at observation, including queue time, stricter than starting at
+first send. The pending queue holds 32 observations including the active
+send; overflow drops signals rather than inventing evidence.
+
+The worker client has separate bounds of **1,024 live reporters** and
+**1,024 recent closed/refused generation markers**. Closing removes the live
+reporter and frees capacity for future bindings. Concurrent live overflow drops the telemetry binding but
+records its generation to fence older pending responses. Closed markers retain
+recent generation high-water marks in FIFO order. Eviction rotates the claim
+observation epoch to prevent pre-eviction responses from rebinding forgotten
+old authority; unrelated pending telemetry bindings may also be dropped.
+Claims and execution continue. A fresh server claim increments the generation;
+retained closed handles stay inert.
+
+Nonclosing running/awaiting-approval state sends, pause intent and completion
+attempts seal queued work and unsent retries. Active HTTP may finish within
+its existing three-second attempt and ten-second observation bounds under the
+server's live-state fence. Ending authority permanently closes reporting and
+aborts active HTTP, allowing loss of the last attempt. Lifecycle and preservation
+do not wait for a reporting ACK.
+
+Registration and temporarily missing feature support discard pending work and
+suspend new reporting while support is absent. Fresh attempts on live reporters
+resume when support is advertised; closed, refused or stale-generation reporters
+stay closed. Claims started before registration or feature invalidation are
+ignored for telemetry binding through the observation epoch, without changing
+execution. The signal retains typed evidence rather than raw provider text and
+does not use Retry-After.
+
+An ordinary API restart reconstructs admission from persisted database state.
+Application rollback leaves the additive tables and view in place: an old
+API does not read this state and admits new claims without this account gate.
+An already engaged operation flight remains closed to new dispatch until the
+admission service returns or existing controls/deadlines settle it; rollback
+is not an operation-admission bypass. Never-negotiated flights remain legacy.
+Roll-forward reapplies still-live finite state; expired rows follow the
+quiet-reset policy when qualifying evidence next arrives. Do not run the
+schema Down migrations as an application rollback.
+
+Automated reconstruction coverage creates a separate database pool and service
+instance; it does not exercise a binary or Kubernetes restart. An optional
+operator rollout smoke check can observe a queued run across an API restart
+and confirm admission after eligibility; that smoke check is unperformed here
+and does not replace required CI. M5 **full agent suite: exact-head PR CI**
+remains pending maintainer/hosted-CI verification at the published head:
+`validate-agent`, both `test-agent-shard` legs, `test-agent-worker-uid` and
+`test-agent`. Hosted queue/cache/rerun and critical-path costs remain unmeasured.
+See [ADR-1106](../adr/1106-codex-harness.md#amendment-temporary-account-admission-3530-2026-10-27)
+for the statement-snapshot boundary and critical invariants.
 
 ## Smoke test
 

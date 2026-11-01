@@ -12,7 +12,9 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 import { Link } from "react-router-dom";
-import type { RunProgress } from "../lib/apiTypes";
+import { forgeWaitLabel } from "../lib/forgeCooldown";
+import { effectiveRunStatus } from "../lib/runBadge";
+import type { RunHealth, RunProgress } from "../lib/apiTypes";
 import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
 
 export function cx(...parts: (string | false | null | undefined)[]): string {
@@ -512,6 +514,13 @@ export const RUN_STATUS_TONES: Record<
    *  wait" de-underscores fine, so the default label already matches runBadge's word
    *  (the ui.test.tsx label-agreement loop over this map asserts the two surfaces agree). */
   recovery_wait: { tone: "warning" },
+  codex_idle_stall_retrying: { tone: "warning" },
+  codex_idle_stall_held: { tone: "warning" },
+  codex_idle_stall_unknown: { tone: "warning" },
+  retained_recovery_retrying: { tone: "warning" },
+  retained_recovery_held: { tone: "warning" },
+  retained_recovery_adoption_failed: { tone: "warning" },
+  retained_recovery_unknown: { tone: "warning" },
   worker_requeue_exhausted: { tone: "warning" },
   worker_memory_pressure: { tone: "warning" },
   /** PRD #1190: a run its OWNER paused. `info` tone (D11), deliberately DISTINCT from
@@ -584,6 +593,13 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   // matching "waiting for pool" label (the ui.test.tsx label-agreement loop over
   // RUN_STATUS_TONES asserts the two surfaces print one word).
   pool_wait: "waiting for pool",
+  codex_idle_stall_retrying: "Codex idle stall retrying",
+  codex_idle_stall_held: "Codex idle stall needs decision",
+  codex_idle_stall_unknown: "Codex idle stall timing unknown",
+  retained_recovery_retrying: "retained recovery retrying",
+  retained_recovery_held: "retained recovery needs decision",
+  retained_recovery_adoption_failed: "retained recovery integrity hold",
+  retained_recovery_unknown: "retained recovery timing unknown",
   worker_requeue_exhausted: "recovery needs decision",
   worker_memory_pressure: "memory pressure: owner hold",
   // PRD #1190: the "‖" glyph tells a chosen pause apart from the rate-limit park's "~"
@@ -611,11 +627,21 @@ const RUN_STATUS_LABELS: Record<string, string> = {
 
 // A running or live completion row may attach its server estimate to the status pill.
 // Other callers and non-percent states retain the ordinary status presentation.
-export function StatusPill({ status, progress }: { status: string; progress?: RunProgress | null }) {
-  const cfg = RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
-  const label = RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
+export function StatusPill({ status: rawStatus, progress, health, recovery_wait_cause, recovery_retry_not_before }: {
+  status: string; progress?: RunProgress | null; health?: RunHealth;
+  recovery_wait_cause?: string | null;
+  recovery_retry_not_before?: string | null;
+}) {
+  const status = effectiveRunStatus({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before });
+  // Callers may already have projected live raw states to planning or revising.
+  const accountWait = health === "waiting_account_cooldown" &&
+    ["claimed", "running", "planning", "awaiting_approval", "revising", "completion_checking", "completion_reworking"].includes(status);
+  const cfg = accountWait ? { tone: "info" as BadgeTone, pulse: false } :
+    RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
+  const label = accountWait ? "waiting" :
+    forgeWaitLabel({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before }) ?? RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
   const showsProgress = status === "running" || status === "completion_checking" || status === "completion_reworking";
-  const pct = showsProgress && progress?.state === "percent" &&
+  const pct = !accountWait && showsProgress && progress?.state === "percent" &&
     typeof progress.pct === "number" && Number.isFinite(progress.pct)
     ? Math.max(0, Math.min(100, Math.round(progress.pct))) : null;
   const valueText = pct === null ? undefined :
@@ -644,7 +670,7 @@ export function StatusPill({ status, progress }: { status: string; progress?: Ru
         className={cx(
           "h-1.5 w-1.5 rounded-full",
           pct === null ? "bg-current" : "relative bg-info",
-          cfg.pulse && "animate-pulse",
+          !accountWait && cfg.pulse && "animate-pulse",
         )}
       />
       {pct === null ? label : <span className="relative" aria-hidden="true">{label} · {pct}%</span>}

@@ -27,6 +27,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AdminShell } from "../components/AdminShell";
 import { DocLink } from "../components/DocLink";
+import { HealthEvidenceLabel, HealthEvidenceValue } from "../components/HealthEvidenceLabel";
 import { SEV, SeverityBadge, SeverityShape, sevOf, type Sev } from "../components/healthSeverity";
 import { ChevronRightIcon } from "../components/icons";
 import { workerFailed, workerFailureCause, upgradePresentation } from "../components/WorkerUpgradeBadge";
@@ -38,6 +39,8 @@ import { maskEmail } from "../lib/demoMask";
 import { attentionChecks, healthVerdict, isAttention } from "../lib/healthView";
 import { formatAgo, useNow } from "../lib/rateLimits";
 import { stripUnsafeChars } from "../lib/safeText";
+import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { WorkerCordonMetadata } from "../components/WorkerCordonMetadata";
 import { useHealthStatus } from "../lib/useAdminHealth";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 
@@ -255,8 +258,8 @@ function AttentionItem({ check, nowMs }: { check: HealthCheck; nowMs: number }) 
           <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-xs">
             {check.evidence.map((e, i) => (
               <div key={i} className="contents">
-                <dt className="text-faint">{e.label}</dt>
-                <dd className="m-0 min-w-0 break-words font-mono text-fg">{e.value}</dd>
+                <dt className="text-faint"><HealthEvidenceLabel evidence={e} /></dt>
+                <dd className="m-0 min-w-0 break-words font-mono text-fg"><HealthEvidenceValue evidence={e} /></dd>
               </div>
             ))}
           </dl>
@@ -613,6 +616,8 @@ function FleetRow({ worker: w, demo }: { worker: AdminWorker; demo: boolean }) {
         )}
       </td>
       <td className="px-4 py-3">
+        <div className="flex flex-wrap gap-1"><WorkerCordonBadge worker={w} /></div>
+        <WorkerCordonMetadata worker={w} />
         <BlockingCell worker={w} />
       </td>
       <td className="px-4 py-3 tabular-nums text-muted">

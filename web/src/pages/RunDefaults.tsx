@@ -9,6 +9,7 @@ import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, type UserSettingsPatch } from "../lib/api";
 import { CrossCheckDefaults } from "../components/CrossCheckDefaults";
+import { UsageReserveSetting } from "../components/UsageReserveSetting";
 import type { UserSettings, BindMode, ModelSettingCell } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
@@ -483,7 +484,9 @@ export function RunDefaults() {
       setNotice(
         eff === ""
           ? "Claude reasoning effort cleared. Your Claude runs use the uzi default (medium)."
-          : `Reasoning effort set to ${eff}. It applies to your next run.`,
+          : eff === "runtime"
+            ? "Claude reasoning effort set to Runtime default. Claude Code decides at your next run."
+            : `Reasoning effort set to ${eff}. It applies to your next run.`,
       );
     } catch (err) {
       setError(errorMessage(err, "Failed to save reasoning effort"));
@@ -505,7 +508,9 @@ export function RunDefaults() {
       setSavedCodexEffort(eff);
       setNotice(eff === ""
         ? "Codex reasoning effort cleared. Your Codex runs use the uzi default (medium)."
-        : `Codex reasoning effort set to ${eff}. It applies at the next claim.`);
+        : eff === "runtime"
+          ? "Codex reasoning effort set to Runtime default. Codex decides at the next claim."
+          : `Codex reasoning effort set to ${eff}. It applies at the next claim.`);
     } catch (err) {
       setError(errorMessage(err, "Failed to save Codex reasoning effort"));
     } finally {
@@ -546,20 +551,29 @@ export function RunDefaults() {
   const badgeOnClaude = showClaudeLane && !effectiveIsCodex;
   const badgeOnCodex = showCodexLane && effectiveIsCodex;
 
-  // Independent dirty state per field: changing the harness never dirties a model, and
-  // an untouched lane is not resent. Each lane compares its trimmed draft to its own
-  // saved snapshot (the same "only a saved value reaches a run" rule the model warning
-  // gates on). The model warnings block Save for a shape the server would reject.
-  const claudeWarning = modelFieldWarning(claudeModel);
+  // Dirty state is independent per field, but Save resends BOTH model lanes together
+  // with the harness. Compare each trimmed draft to its own saved snapshot.
+  const claudeRoleModel = CODEX_ROLE_MODELS.includes(claudeModel.trim());
+  const claudeWarning = claudeRoleModel
+    ? `Not a Claude model: ${claudeModel.trim()} is a Codex model. The stored value is skipped and the existing Claude worker default is used. Reset to Default to clear it.`
+    : modelFieldWarning(claudeModel);
+  const claudeRoleRecovery = claudeRoleModel && (
+    <div className="flex flex-wrap items-center gap-3">
+      <Alert message={claudeWarning} tone="warning" />
+      <Button type="button" disabled={defaultsBusy} onClick={() => setClaudeModel("")}>
+        Reset to Default
+      </Button>
+    </div>
+  );
   const codexWarning = modelFieldWarning(codexModel);
   const harnessDirty = defaultHarness !== savedHarness;
   const claudeDirty = claudeModel.trim() !== savedClaudeModel;
   const codexDirty = codexModel.trim() !== savedCodexModel;
   const anyDirty = harnessDirty || claudeDirty || codexDirty;
-  // Only a shown lane's warning can block Save — a hidden lane's stored value is never
-  // edited here, so it cannot be dirty or invalid from this form.
+  // A known Claude rejection also blocks when hidden, since grouped Save resends it.
+  // Shape-only warnings keep their existing visible-lane gating.
   const blockingWarning =
-    (showClaudeLane && claudeWarning !== "") || (showCodexLane && codexWarning !== "");
+    claudeRoleModel || (showClaudeLane && claudeWarning !== "") || (showCodexLane && codexWarning !== "");
 
   // saveDefaults writes the harness pin and BOTH lanes in one PUT (D1), never the
   // legacy default_model (D3: new clients don't send it). Present-value sets, null
@@ -740,6 +754,11 @@ export function RunDefaults() {
           Sends a Slack DM when your weekly Anthropic or Codex limit reopens more than 8 hours
           before its expected reset. On by default; needs a linked Slack account to reach you.
         </p>
+
+        {/* PRD #3522: the weekly usage reserve. The third thing on this card that is
+            about your 7-day window; its own component and endpoint, so its busy/error
+            state never touches the two toggles above. */}
+        <UsageReserveSetting />
       </Card>
 
       <Card className="space-y-4">
@@ -1155,7 +1174,9 @@ export function RunDefaults() {
                       customAriaLabel="Custom Claude model ID"
                     />
                   </Field>
-                  {claudeWarning && <Alert message={claudeWarning} tone="warning" />}
+                  {claudeRoleModel
+                    ? claudeRoleRecovery
+                    : claudeWarning && <Alert message={claudeWarning} tone="warning" />}
                   <p className="text-xs text-faint">
                     Curated Claude aliases plus a custom model ID. Leave on{" "}
                     <em>Inherit</em> to use the lead template's model (opus by default);
@@ -1198,6 +1219,7 @@ export function RunDefaults() {
               )}
             </div>
 
+            {!showClaudeLane && claudeRoleRecovery}
             {showHarnessSelector && <Alert tone="info" message={retentionCopy} />}
 
             <Button
@@ -1225,6 +1247,9 @@ export function RunDefaults() {
             its model does not support; Codex receives the selected level directly. It applies to your
             own runs only; other users are unaffected.
           </p>
+          <p className="mt-2 text-sm text-muted">
+            Runtime default sends no level, so Claude Code or Codex decides; a resumed session may keep the level it last used.
+          </p>
         </div>
 
         {loading ? (
@@ -1232,7 +1257,7 @@ export function RunDefaults() {
         ) : (
           <div className="space-y-3">
             <Field label="Claude effort" htmlFor="worker-effort">
-              <EffortSelect id="worker-effort" value={defaultEffort} onChange={setDefaultEffort} />
+              <EffortSelect id="worker-effort" value={defaultEffort} onChange={setDefaultEffort} runtimeLabel="Runtime default · value not reported" />
             </Field>
             <Button type="button" disabled={effortBusy || !effortDirty} onClick={saveEffort}>
               Save Claude effort
@@ -1240,7 +1265,7 @@ export function RunDefaults() {
             {showCodexLane && (
               <>
                 <Field label="Codex effort" htmlFor="codex-effort">
-                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} />
+                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} runtimeLabel="Runtime default · Codex decides" />
                 </Field>
                 <Button type="button" disabled={codexEffortBusy || !codexEffortDirty} onClick={saveCodexEffort}>
                   Save Codex effort

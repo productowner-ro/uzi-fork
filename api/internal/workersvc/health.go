@@ -25,10 +25,12 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 )
 
 // ReasonWorkersUpgrading is shared with fleet.capacity's stored-reason confirmation.
@@ -95,12 +97,13 @@ type Settings interface {
 // Health flag values. These mirror the CHECK constraint on runs.health; keep them
 // in sync with migration 00057.
 const (
-	healthOK            = "ok"
-	healthStalled       = "stalled"
-	healthLooping       = "looping"
-	healthSlow          = "slow"
-	healthWaitingWorker = "waiting_worker"
-	healthApprovalIdle  = "approval_idle"
+	healthOK                     = "ok"
+	healthStalled                = "stalled"
+	healthLooping                = "looping"
+	healthSlow                   = "slow"
+	healthWaitingWorker          = "waiting_worker"
+	healthWaitingAccountCooldown = "waiting_account_cooldown"
+	healthApprovalIdle           = "approval_idle"
 )
 
 // Reason templates. FIXED, server-controlled strings: they never carry a tool name,
@@ -109,13 +112,14 @@ const (
 // recomputes elapsed from health_since, so a stored duration would go stale). The
 // owner sees these; non-owners never see the reason at all (owner-gated in M3).
 const (
-	reasonStalled       = "the agent stopped sending updates"
-	reasonLooping       = "the agent keeps repeating the same action"
-	reasonNearTimeout   = "this run is close to its wall-clock timeout and will be stopped when it reaches it"
-	reasonApprovalIdle  = "waiting for the plan to be approved"
-	reasonVaultLocked   = "your vault is locked, so this run can't start"
-	reasonNoWorker      = "no worker is online to pick up this run"
-	reasonWaitingWorker = "waiting for a worker to pick up this run"
+	reasonStalled         = "the agent stopped sending updates"
+	reasonLooping         = "the agent keeps repeating the same action"
+	reasonNearTimeout     = "this run is close to its wall-clock timeout and will be stopped when it reaches it"
+	reasonApprovalIdle    = "waiting for the plan to be approved"
+	reasonVaultLocked     = "your vault is locked, so this run can't start"
+	reasonNoWorker        = "no worker is online to pick up this run"
+	reasonWaitingWorker   = "waiting for a worker to pick up this run"
+	reasonForgeOriginWait = "waiting for worker forge-origin cooldown or recovery trial; heartbeat online does not prove forge reachability"
 	// reasonHandoffSetup (PRD #400 Decision 6 / issue #1367) is the honest queued reason
 	// for an UNDISPATCHED task (handoff) run — one whose uzi/task/<id> branch push or
 	// dispatch has not yet landed, so dispatched_at is still NULL. ClaimRun never offers
@@ -126,6 +130,11 @@ const (
 	// runs.health_reason is free text). The sweeper (SweepTaskNeverDispatched) expires
 	// the run to 'failed' with a terminal failure_reason after DispatchGrace.
 	reasonHandoffSetup = "handoff setup has not finished"
+	// reasonMaintenance (PRD #3454) is the honest queued reason for a run the instance intake pause
+	// holds (fn_instance_intake_paused() and the run not admitted by
+	// fn_run_admitted_during_intake_pause): ClaimRun matches no row for it, so no worker gap is the
+	// cause. Same fixed-string contract and healthWaitingWorker enum as its siblings.
+	reasonMaintenance = "waiting: uzi is in maintenance mode"
 	// reasonStaleRequeuePinPrefix opens both expected owner-hold reasons: stale requeue
 	// (#2705) and draining or maintenance (#3000). Unlike its fixed
 	// siblings they embed values (the deadline and the worker name). isStaleRequeuePinReason
@@ -176,6 +185,9 @@ const (
 	// owner-visible reason string differs.
 	reasonDeprioritized = "deprioritized — yields to interactive work"
 	reasonRestored      = "priority restored — no longer yielding"
+	// Shared by admin health presentation; the persisted worker wording stays fixed.
+	ReasonDeprioritized    = reasonDeprioritized
+	ReasonPriorityRestored = reasonRestored
 	// reasonNoEligibleWorker (PRD #84 M3) is emitted for a queued run whose
 	// required_capabilities are not a subset of ANY online worker's effective caps —
 	// distinct from reasonNoWorker (no worker online at all) and reasonAllWorkersBusy
@@ -455,7 +467,21 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// nudge (its flag was already waiting_worker) and would carry the hold in its "stuck for".
 		leftPin := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			isStaleRequeuePinReason(r.HealthReason.String) && !isStaleRequeuePinReason(reason)
-		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&
+		// PRD #3454: a run leaving the maintenance hold has health_since restamped so its "stuck for"
+		// excludes the pause, but it is NOT nudge-eligible on that tick: the whole backlog leaves the
+		// hold at once, and nudging here would burst a Slack DM per run right after the lift. Accepted
+		// trade-off (PRD #3454 D12): a run still stuck after the lift is not nudged until it
+		// clears to ok and flags again; only that later ok->flagged episode nudges.
+		leftMaintenance := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			r.HealthReason.String == reasonMaintenance && reason != reasonMaintenance
+		leftAdmission := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			apitypes.IsCodexAdmissionReason(r.HealthReason.String) && !apitypes.IsCodexAdmissionReason(reason)
+		leftAccountCooldown := r.Health == healthWaitingAccountCooldown && target != healthWaitingAccountCooldown
+		// Only independent faults start an episode directly from account cooldown.
+		// Expiry into ordinary silence or approval age stays quiet across the cohort.
+		independentFault := reason == reasonPersistFailing || reason == reasonLooping ||
+			reason == reasonNearTimeout || reason == reasonOutcomeUndelivered
+		nudge := target != healthOK && (r.Health == healthOK || leftPin || (leftAccountCooldown && independentFault)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
 		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner
@@ -489,6 +515,15 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonHandoffSetup {
 			nudge = false
 		}
+		// PRD #3454: maintenance is an expected, operator-announced wait; a worker-pickup nudge is noise.
+		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || leftAdmission || target == healthWaitingAccountCooldown {
+			nudge = false
+		}
+		// PRD #3522 M3: the weekly usage reserve is the owner's own deliberate limit, not a stuck
+		// run; a worker-pickup nudge would say the opposite of the truth. State still written below.
+		if isReserveHoldReason(reason) {
+			nudge = false
+		}
 		// Issues #2705/#3000: both owner-hold reasons are expected waiting; a worker-pickup
 		// nudge would be noise. Match the prefix shared by their deadline and worker name.
 		if isStaleRequeuePinReason(reason) {
@@ -497,11 +532,17 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// A live plan or code cross-check is expected waiting. A worker-pickup nudge would
 		// describe its already-running lead incorrectly, even with no checker capacity.
 		// Preserve the existing notification stamp and cooldown for ordinary health episodes.
-		if isCodeCrossCheckWaitingReason(reason) || reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker {
+		if isCodeCrossCheckWaitingReason(reason) || reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker ||
+			(r.Status == "running" && isManualCordonWaitReason(reason)) {
 			nudge = false
 		}
+		// PRD #3522 M3: a run leaving the reserve hold (the line was raised, the week reset) but
+		// still waiting restarts its "stuck for" clock like leaving maintenance, so the hold is not
+		// counted as time stuck; it is not nudge-eligible on that tick either (r.Health is not ok).
+		leftReserve := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			isReserveHoldReason(r.HealthReason.String) && !isReserveHoldReason(reason)
 		since := healthSince(now, target, r)
-		if leftPin {
+		if leftPin || leftMaintenance || leftReserve || leftAdmission || leftAccountCooldown {
 			since = pgconv.Time(now)
 		}
 		notifiedAt := pgtype.Timestamptz{}
@@ -534,6 +575,12 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 	return changed
 }
 
+// isReserveHoldReason reports a health reason that is a weekly-usage-reserve hold text
+// (usagereserve.HeldReason or UnknownReason).
+func isReserveHoldReason(reason string) bool {
+	return strings.HasPrefix(reason, usagereserve.ReasonPrefix)
+}
+
 // healthTargetFor computes the (flag, reason) a run should carry now. It returns
 // (healthOK, "") when the run looks healthy, which the caller writes as a
 // self-clear. Exactly one flag per run; the running-run priority is inside
@@ -555,28 +602,55 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		if th.queued == 0 {
 			return healthOK, ""
 		}
+		// PRD #3522 M3: a run the owner's weekly usage reserve holds is explained from the first
+		// tick, not after the queued threshold: the owner set the line on purpose and the reason is
+		// the answer to "why is it not starting". The reason IS the persisted reserve text. The
+		// intake pause (reasonMaintenance) still outranks it, so a paused instance keeps its own
+		// pill; a run past the age gate resolves it in queuedReason, in the same order.
+		if !r.IntakePauseHeld && r.ReserveHoldReason != "" {
+			return healthWaitingWorker, r.ReserveHoldReason
+		}
 		// Issue #2705: a run held for its returning worker is explained from the first tick of the
 		// hold, not after the queued threshold. Issue #2501: the unambiguous, persistent
-		// docker-allowlist block is also surfaced early. Both owner holds and that block bypass
+		// docker-allowlist block is also surfaced early. Manual cordon, owner holds and that block bypass
 		// the age gate: any other reason queuedReason resolves (vault, custody, codex, egress)
 		// stays quiet until th.queued, exactly as for an unpinned run. th.queued == 0 above still
 		// switches every queued flag off.
 		if !olderThan(now, r.StatusSince, th.queued) {
 			_, stalePinned := s.staleRequeuePin(now, r)
 			_, ownerHeld := s.ownerHold(now, r)
-			if stalePinned || ownerHeld {
-				if reason := s.queuedReason(ctx, now, r, th); isStaleRequeuePinReason(reason) {
+			manualBlocked := false
+			var projection *healthEligibilityResult
+			if !stalePinned && !ownerHeld {
+				counts, err := s.workerEligibilityForHealth(ctx, now, r.ID, s.capabilityAwareOn(ctx))
+				projection = &healthEligibilityResult{counts: counts, err: err}
+				manualBlocked = (err == nil && manualCordonWaitReason(counts) != "") ||
+					(err != nil && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String))
+			}
+			if stalePinned || ownerHeld || manualBlocked {
+				// Only a persistent hold warrants the prerequisite ladder before
+				// the age threshold; unrelated young runs retain the cheap path.
+				reason := s.queuedReasonWithEligibility(ctx, now, r, th, true, projection)
+				if isManualCordonWaitReason(reason) || isStaleRequeuePinReason(reason) {
 					return healthWaitingWorker, reason
 				}
 			}
-			return s.earlyDockerAllowlistTarget(ctx, now, r, th)
+			return s.earlyDockerAllowlistTarget(ctx, now, r, th, projection)
 		}
 		// Every queued-past-threshold reason is resolved in queuedReason, most-fundamental
 		// first (vault-lock, no online worker, no capability-eligible worker, priority-class
 		// re-label, then the fleet reasons). The flag is always healthWaitingWorker; only the
 		// reason string differs, so healthSince's "stuck for Xm" preservation keeps working.
 		return healthWaitingWorker, s.queuedReason(ctx, now, r, th)
+	case "claimed":
+		if activeAccountCooldown(now, r) {
+			return healthWaitingAccountCooldown, apitypes.AccountCooldownReason
+		}
+		return healthOK, ""
 	case "awaiting_approval":
+		if activeAccountCooldown(now, r) {
+			return healthWaitingAccountCooldown, apitypes.AccountCooldownReason
+		}
 		// auto_approve runs self-resolve their gate and must never nudge anyone to
 		// approve them (Decision 8).
 		if r.AutoApprove || th.approval == 0 || !olderThan(now, r.StatusSince, th.approval) {
@@ -664,18 +738,28 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// The live query owns the current-generation, deadline and required-check predicate;
 	// the strict pending/settlement helper is deliberately not a health signal.
 	if runkind.PlanCrossCheckable(r.Kind) {
+		preserveManual := r.Health == healthWaitingWorker && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String)
 		if reader, ok := s.q.(livePlanCrossCheckReader); ok {
 			live, err := reader.HasLivePlanCrossCheck(ctx, r.ID)
 			if err != nil {
 				slog.Error("health: read live plan cross-check", "run_id", r.ID, "error", err)
+				if preserveManual {
+					return healthWaitingWorker, r.HealthReason.String
+				}
 			} else if live {
 				if reader, ok := s.q.(interface {
 					GetPlanCrossCheckChildForHealth(context.Context, uuid.UUID) (uuid.UUID, error)
 				}); ok {
 					if childID, err := reader.GetPlanCrossCheckChildForHealth(ctx, r.ID); err == nil {
 						if counts, err := s.workerEligibilityForHealth(ctx, now, childID, s.capabilityAwareOn(ctx)); err == nil {
+							if reason := manualCordonWaitReason(counts); reason != "" {
+								return healthWaitingWorker, reason
+							}
 							if reason := rollWaitReason(now, counts); reason != "" {
 								return healthWaitingWorker, reason
+							}
+							if counts.ForgeBlocked > 0 && counts.Claimable == 0 {
+								return healthWaitingWorker, reasonForgeOriginWait
 							}
 							if counts.StrictEligible == 0 {
 								return healthWaitingWorker, reasonNoCrossCheckWorker
@@ -683,7 +767,11 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 							if counts.Claimable == 0 {
 								return healthWaitingWorker, reasonCrossCheckSlotsBusy
 							}
+						} else if preserveManual {
+							return healthWaitingWorker, r.HealthReason.String
 						}
+					} else if preserveManual {
+						return healthWaitingWorker, r.HealthReason.String
 					}
 				}
 				return healthWaitingWorker, reasonPlanCrossCheckWaiting
@@ -704,6 +792,18 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 				return healthWaitingWorker, "waiting until " + deadline.Time.UTC().Format(time.RFC3339) + reasonCodeCrossCheckWaitingSuffix
 			}
 		}
+	}
+
+	// Current authority is supplied by codex_active_run_cooldown; wall exhaustion
+	// remains actionable while an operation is waiting.
+	if activeAccountCooldown(now, r) {
+		if eff, ok := runWallClock(r.BudgetWallSeconds, r.Kind, r.Interactive, r.Status, r.StartedAt.Valid, s.p.RunTimeout, r.BudgetExtensionSeconds, r.BudgetFinalizeSeconds); ok {
+			active := now.Sub(r.StartedAt.Time) - time.Duration(r.BudgetPausedSeconds)*time.Second
+			if active >= eff || (th.nearTimeoutPct > 0 && active >= eff/100*time.Duration(th.nearTimeoutPct)) {
+				return healthSlow, reasonNearTimeout
+			}
+		}
+		return healthWaitingAccountCooldown, apitypes.AccountCooldownReason
 	}
 
 	// stalled: silence past the threshold, suppressed while a LEAD tool call is in
@@ -1109,6 +1209,47 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 // re-label, so a demoted-but-unplaceable run still reports the actionable capability block
 // rather than a yield message.
 func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) string {
+	return s.queuedReasonBeforeAge(ctx, now, r, th, false)
+}
+
+// queuedReasonBeforeAge shares prerequisite and manual evidence ordering with the
+// ordinary ladder. early stops before transient fleet diagnostics for young runs.
+func (s *Service) queuedReasonBeforeAge(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool) string {
+	return s.queuedReasonWithEligibility(ctx, now, r, th, early, nil)
+}
+
+// healthEligibilityResult belongs to one evaluation, including a failed read.
+type healthEligibilityResult struct {
+	counts store.CountOnlineWorkersClaimableForRunRow
+	err    error
+}
+
+// QueuedReasonPrecedesCodexAdmission identifies the owner/setup blockers that
+// queuedReasonWithEligibility resolves before temporary provider admission.
+// Maintenance is projected separately at read time, so stale maintenance text
+// must not keep outranking an active cooldown after maintenance ends.
+func QueuedReasonPrecedesCodexAdmission(reason string) bool {
+	switch reason {
+	case reasonHandoffSetup, reasonVaultLocked, reasonCustodyLimit,
+		reasonCustodyLimitUnavailable, reasonCodexAccountUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool, projection *healthEligibilityResult) string {
+	// PRD #3454: the instance intake pause outranks every rung, the handoff one included, since the
+	// pause is the reason ClaimRun matches nothing.
+	if r.IntakePauseHeld {
+		return reasonMaintenance
+	}
+	// PRD #3522 M3: the weekly usage reserve is the next most fundamental cause: ClaimRun matches no
+	// row for the run whatever the fleet looks like, so none of the worker-side rungs below is
+	// the reason. The reason is the persisted reserve text.
+	if r.ReserveHoldReason != "" {
+		return r.ReserveHoldReason
+	}
 	// PRD #400 Decision 6 / issue #1367: an undispatched task run (its uzi/task/<id> branch
 	// push or dispatch never landed) is NOT waiting for a worker — ClaimRun never offers it
 	// (kind<>'task' OR dispatched_at IS NOT NULL), so none of the fleet reasons below is the
@@ -1118,7 +1259,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	if r.Kind == "task" && !r.DispatchedAt.Valid {
 		return reasonHandoffSetup
 	}
-	if s.vlt != nil && !s.vlt.Unlocked(r.UserID) {
+	if s.vlt != nil && s.vlt.RequiresUnlock(ctx, r.UserID) {
 		return reasonVaultLocked
 	}
 	// PRD #1296 M4 (D4): the owner-scoped custody-admission block. When the owner holds
@@ -1163,45 +1304,70 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	if r.CodexAccountGated {
 		return reasonCodexAccountUnavailable
 	}
+	// Temporary provider admission is separate from account availability. The
+	// owner-scoped projection already includes this run\'s stable recovery offset.
+	if r.CodexAdmissionClass.Valid && r.CodexAdmissionEligibleAt.Valid && now.Before(r.CodexAdmissionEligibleAt.Time) {
+		if reason := apitypes.CodexAdmissionReason(r.CodexAdmissionClass.String, r.CodexAdmissionEligibleAt.Time); reason != "" {
+			return reason
+		}
+	}
 	// PRD #1906 M5: a profile-bound run is claimable ONLY by an api-provisioned lane worker, so
 	// the ordinary fleet rungs below (online, capable, busy workers) cannot describe it; every one
 	// of them excludes lane workers. Placed after the owner-account blocks, which still gate it.
 	if r.EgressProfileID.Valid {
 		return s.isolatedLaneReason(ctx, r)
 	}
-	// Draining or maintenance holds take precedence when both owner holds overlap.
-	if until, held := s.ownerHold(now, r); held {
+	// Availability and manual diagnostics share one projection. Manual intent must
+	// remain visible alongside an automatic owner hold, but a claimable continuation
+	// is not blocked by either soft intent.
+	capAware := s.capabilityAwareOn(ctx)
+	if projection == nil {
+		counts, err := s.workerEligibilityForHealth(ctx, now, r.ID, capAware)
+		projection = &healthEligibilityResult{counts: counts, err: err}
+	}
+	eligibility, eligibilityErr := projection.counts, projection.err
+	until, held := s.ownerHold(now, r)
+	preserveManual := eligibilityErr != nil && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String)
+	if eligibilityErr == nil {
+		if reason := manualCordonWaitReason(eligibility); reason != "" {
+			if held && eligibility.AutomaticOwnerHold {
+				reason += "; " + ownerHoldReason(until, r.StaleRequeueWorkerName)
+			}
+			return reason
+		}
+	}
+	if held && !preserveManual && (eligibilityErr != nil || (eligibility.AssignedClaimable == 0 && (eligibility.ManualCordoned == 0 || eligibility.AutomaticOwnerHold))) {
 		return ownerHoldReason(until, r.StaleRequeueWorkerName)
 	}
-	// Issue #2705: ClaimRun is holding this stale-requeued run for its returning worker, so no
-	// fleet reason below is the cause. After every fundamental block above (none of which a
-	// returning worker clears) and before the cross_check and fleet rungs.
 	if until, pinned := s.staleRequeuePin(now, r); pinned {
 		return staleRequeuePinReason(until, r.StaleRequeueWorkerName)
 	}
-	// Read the capability-aware kill-switch ONCE and thread the same value into both the
-	// capability-gap rung (below) and the claim-time eligibility rung (rung 5), so the two
-	// counts and the claim path can never disagree on whether capabilities are enforced.
+	if preserveManual {
+		// A failed projection cannot prove that the prior manual block ended.
+		// Account prerequisites and independent stale requeue pins retain priority.
+		return r.HealthReason.String
+	}
+	if early {
+		return ""
+	}
+	if eligibilityErr == nil && eligibility.ForgeBlocked > 0 && eligibility.Claimable == 0 {
+		return reasonForgeOriginWait
+	}
 	if r.Kind == "cross_check" {
-		counts, err := s.workerEligibilityForHealth(ctx, now, r.ID, s.capabilityAwareOn(ctx))
-		if err != nil {
-			slog.Error("health: read child eligibility", "run_id", r.ID, "error", err)
+		if eligibilityErr != nil {
+			slog.Error("health: read child eligibility", "run_id", r.ID, "error", eligibilityErr)
 			return reasonPlanCrossCheckWaiting
 		}
-		if reason := rollWaitReason(now, counts); reason != "" {
+		if reason := rollWaitReason(now, eligibility); reason != "" {
 			return reason
 		}
-		if counts.StrictEligible > 0 {
-			if counts.Claimable == 0 {
+		if eligibility.StrictEligible > 0 {
+			if eligibility.Claimable == 0 {
 				return reasonCrossCheckSlotsBusy
 			}
 			return reasonPlanCrossCheckWaiting
 		}
-		// Diagnose missing rounds/pins below when no worker meets the combined
-		// child contract. StrictEligible includes bound ephemeral checker workers.
 	}
-	capAware := s.capabilityAwareOn(ctx)
-	eligibility, eligibilityErr := s.workerEligibilityForHealth(ctx, now, r.ID, capAware)
 	if eligibilityErr != nil {
 		slog.Error("health: read current worker eligibility", "run_id", r.ID, "error", eligibilityErr)
 	} else if reason := rollWaitReason(now, eligibility); reason != "" {
@@ -1404,13 +1570,17 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 				capableIgnoringCodexLead := false
 				claudeChecker := run.Kind == "cross_check" && run.Harness == harnessClaude
 				for _, worker := range workers {
-					if worker.Status == "online" && !worker.DrainingSince.Valid && !worker.Ephemeral && !worker.IsolatedLane &&
+					if worker.Status == "online" && store.WorkerAcceptsNewIntake(store.Worker{
+						ManualCordonedAt:  worker.ManualCordonedAt,
+						DrainingSince:     worker.DrainingSince,
+						MaintenanceFenced: worker.MaintenanceFenced,
+						MaintenancePhase:  worker.MaintenancePhase,
+					}) && !worker.Ephemeral && !worker.IsolatedLane &&
 						slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) &&
 						slices.Contains(worker.ProtocolCapabilities, requiredProtocol) &&
 						(!r.CrossCheckPinRequired || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckPinsV1)) &&
 						(!r.CodexCustomRoot || slices.Contains(worker.ProtocolCapabilities, capability.CodexCustomModelV1)) &&
-						(run.Harness != harnessCodex || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) &&
-						!worker.MaintenanceFenced && worker.MaintenancePhase != "requested" && worker.MaintenancePhase != "ready" && worker.MaintenancePhase != "stopping" && worker.MaintenancePhase != "recycling" {
+						(run.Harness != harnessCodex || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) {
 						capableIgnoringCodexLead = true
 						if !claudeChecker || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckCodexLeadV1) {
 							capable = true
@@ -1656,7 +1826,7 @@ func (s *Service) repoNotDockerAllowedReason(ctx context.Context, ownerID uuid.U
 // is eligible for the repo, and queuedReason resolves to the docker-allowlist reason (so
 // every more-fundamental rung still wins); every other path, including any probe read error (an owner-lookup failure still shows the Member wording),
 // returns (healthOK, "").
-func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) (string, string) {
+func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, projection *healthEligibilityResult) (string, string) {
 	if !r.RepoID.Valid || r.EgressProfileID.Valid || s.dockerAllowlist == nil {
 		return healthOK, ""
 	}
@@ -1688,7 +1858,7 @@ func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time,
 	if elig != 0 {
 		return healthOK, ""
 	}
-	if reason := s.queuedReason(ctx, now, r, th); isRepoNotDockerAllowedReason(reason) {
+	if reason := s.queuedReasonWithEligibility(ctx, now, r, th, false, projection); isRepoNotDockerAllowedReason(reason) {
 		return healthWaitingWorker, reason
 	}
 	return healthOK, ""
@@ -1960,4 +2130,8 @@ func toolResultID(payload []byte) string {
 		return ""
 	}
 	return p.ToolUseID
+}
+
+func activeAccountCooldown(now time.Time, r store.ListActiveRunsForHealthRow) bool {
+	return r.AccountCooldownClass.Valid && (r.AccountCooldownClass.String == "rate_limit" || r.AccountCooldownClass.String == "overload") && r.AccountCooldownEligibleAt.Valid && r.AccountCooldownEligibleAt.InfinityModifier == pgtype.Finite && r.AccountCooldownEligibleAt.Time.After(now)
 }

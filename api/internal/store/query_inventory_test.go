@@ -411,11 +411,14 @@ var inventoryQueryFiles = []string{
 	"notifications.sql",
 	"agent_memory.sql",
 	"user_vaults.sql",
+	"vault_material.sql",
 	"settings.sql",
 	// PRD #71 M4 — the ci-autofix loop guard
 	"ci_autofix.sql",
 	// PRD #333 M1 — the incidental-findings store (full query set)
 	"findings.sql",
+	// PRD #3454 instance maintenance mode
+	"intake_pause.sql",
 }
 
 // inventoryPackages are the directories, relative to this one, whose *_test.go files are
@@ -762,22 +765,27 @@ var queryInventory = []queryPin{
 			"affects 0 rows, then the owner's delete of that SAME id affects 1, which proves the 0 " +
 			"was the predicate and not a missing row"},
 
-	// ── user_vaults.sql — the ORIGINAL THREE unpinned, the PRD #890 M1 THREE executed ──
-	// The per-user vault (Argon2 KEK + wrapped DEK) is the mechanism protecting every
-	// sealed_with='dek' secret, and until PRD #890 NOT ONE of its queries had executed
-	// against a database (measured 0/0/0 for GetUserVault / CreateUserVaultIfAbsent /
-	// DeleteUserVault, all still unpinned below). It is not that nobody wrote a live test
-	// near it — four live-DB files mention "vault", which is exactly the false positive a
-	// name-based scan would report. They do not reach those queries:
-	// secrets_crud_livedb_test.go:24 states it passes a NIL vault on purpose ("real box
-	// (nil vault → the master-box seal path, which is all these tests need)"), a deliberate
-	// and locally reasonable choice that leaves that path with no live exercise.
-	//
-	// PRD #890 M1 adds the three vault-lock-notice queries and, unlike the original three,
-	// EXECUTES each against real Postgres in TestVaultLockNoticeQueriesLiveDB (the sqlc-
-	// inference gate: a green generate does not prove the multi-subquery SELECT / the atomic
-	// RETURNING claim / the guarded re-arm actually run). So this file is now 3 executed +
-	// 3 still-unpinned — the original coverage gap is unchanged, not closed by M1.
+	// ── user_vaults.sql — wrapper lifecycle, mode/epoch and lock notices ──
+	// PRD #890 introduced real-database pins for the notice queries. Issue #3507
+	// exercises wrapper creation, existing-wrapper reads and atomic deletion through
+	// the lifecycle, alongside direct mode/epoch and migration tests. These pins
+	// name executed paths, not a claim that a nearby vault-named test proves SQL.
+	{"GetUserVaultState", "user_vaults.sql", "TestVaultModeMigrationBackfillLiveDB",
+		"direct calls in vault_mode_livedb_test.go — existing vaultless, OIDC and inactive users " +
+			"must all reload as protected with epoch zero after migration"},
+	{"LockUserVaultState", "user_vaults.sql", "TestVaultModeQueriesLiveDB",
+		"direct transaction-bound calls in vault_mode_livedb_test.go — one transaction holds " +
+			"the user row and a competing lock attempt reaches its deadline before rollback"},
+	{"LockVaultAuthState", "user_vaults.sql", "TestVaultLifecycleRoundTripLiveDB",
+		"transaction-bound lifecycle calls lock current mode, epoch and password hash; wrong-password enable preserves the complete durable snapshot"},
+	{"LockUserVault", "user_vaults.sql", "TestVaultLifecycleRoundTripLiveDB",
+		"lifecycle transactions lock existing wrappers and observe missing wrappers before create-only enable"},
+	{"AdvanceUserVaultMode", "user_vaults.sql", "TestVaultModeQueriesLiveDB",
+		"direct calls in vault_mode_livedb_test.go — returned state and the subsequent locked reload " +
+			"must both report the requested mode and an epoch increment of one"},
+	{"CountUnprotectedUsers", "user_vaults.sql", "TestVaultModeQueriesLiveDB",
+		"direct call in vault_mode_livedb_test.go — the off-user count is one beside a protected " +
+			"user, independently of the protected-only legacy-secret count"},
 	{"ListUsersNeedingVaultLockNotice", "user_vaults.sql", "TestVaultLockNoticeQueriesLiveDB",
 		"direct call in vault_lock_notice_livedb_test.go — the PRD #890 M1 reconciler-eligibility " +
 			"query, executed against real Postgres with a seeded eligible user (vault row + confirmed " +
@@ -793,28 +801,37 @@ var queryInventory = []queryPin{
 		"direct call in vault_lock_notice_livedb_test.go — the unlock re-arm, executed against real " +
 			"Postgres: after a claim, ClearVaultLockNotice nulls lock_notified_at back so a re-claim " +
 			"once again returns the row (proves the IS NOT NULL guard and the episode cycle)"},
-	{"GetUserVault", "user_vaults.sql", unpinnedPin,
-		"0 executions. Production callers are vault.go:117, :200 and :265; every test in its path " +
-			"is a fake (vault/vault_test.go:76, workersvc/vault_gate_test.go:27, " +
-			"handler/vault_test.go:31), each returning a canned store.UserVault. So the SELECT that " +
-			"fetches the KEK salt and wrapped DEK has never run against the real table"},
-	{"CreateUserVaultIfAbsent", "user_vaults.sql", unpinnedPin,
-		"0 executions — and it is the query in this file whose whole point a fake CANNOT stand in " +
-			"for. Its `ON CONFLICT (user_id) DO NOTHING` exists to make two concurrent first-unlocks " +
-			"safe: one insert wins, the loser gets pgx.ErrNoRows and re-reads the winner's row, so " +
-			"the cached DEK always equals the persisted one. That is a race fixed by database " +
-			"semantics, and a fake has no unique index to conflict on. The comment states the " +
-			"consequence of getting it wrong (each request caching a different DEK than the DB " +
-			"holds); nothing has ever made Postgres produce the conflict"},
-	{"DeleteUserVault", "user_vaults.sql", unpinnedPin,
-		"0 executions, and it has NO CALLER AT ALL — not a test, not production. `rg` over " +
-			"internal/ and cmd/ finds only the generated method. It is a deliberate primitive for " +
-			"PRD #32's password reset (its own comment says reset is out of scope and this is what " +
-			"that flow will build on), so it is dead-but-intended rather than dead-by-accident. " +
-			"Worth a row precisely because 'unused' and 'untested' are indistinguishable from a " +
-			"coverage report, and only one of them is fine"},
+	{"GetUserVault", "user_vaults.sql", "TestVaultLifecycleRoundTripLiveDB",
+		"status checks reload actual wrapper presence after create, disable and re-enable on a real database"},
+	{"CreateUserVaultIfAbsent", "user_vaults.sql", "TestVaultLifecycleRoundTripLiveDB",
+		"create-only lifecycle transactions persist wrapped keys used by later existing-wrapper unlock; concurrent lifecycle coverage is separate"},
+	{"DeleteUserVault", "user_vaults.sql", "TestVaultLifecycleRollbackLiveDB",
+		"disable removes the wrapper only after conversion; an injected error after DELETE rolls back mode, ciphertext and wrapper together"},
+
+	// ── vault_material.sql — bounded, owner-scoped crypto conversion primitives ──
+	{"HasMasterVaultMaterial", "vault_material.sql", "TestVaultLifecycleRoundTripLiveDB",
+		"existing-wrapper unlock executes the all-DEK fast path and then rewraps a legacy personal row plus both canonical account slots"},
+	{"GetVaultMaterialTotals", "vault_material.sql", "TestVaultMaterialQueriesLiveDB",
+		"direct call in vault_material_livedb_test.go — exact owned row/slot and ciphertext-byte " +
+			"totals include disabled secrets and orphan canonical accounts, excluding foreign material"},
+	{"LockVaultSecretMaterialBatch", "vault_material.sql", "TestVaultMaterialBatchBytesLiveDB",
+		"direct call proves an exact 1 MiB prefix; the Queries test independently asserts the " +
+			"64-row cap, NULL initial cursor including zero UUID, keyset tail, owner scope and row locks"},
+	{"LockVaultAccountMaterialBatch", "vault_material.sql", "TestVaultMaterialBatchBytesLiveDB",
+		"direct call proves the combined live/recovery 1 MiB bound and exclusion of oversized " +
+			"pairs; the Queries test covers 64 slots, owner scope, keyset tail, locking and empty recovery"},
+	{"ResealVaultSecretMaterial", "vault_material.sql", "TestVaultMaterialQueriesLiveDB",
+		"direct calls reject foreign ownership, then change ciphertext/discriminator while a " +
+			"JSON snapshot asserts every non-crypto column is preserved"},
+	{"ResealVaultAccountMaterial", "vault_material.sql", "TestVaultMaterialQueriesLiveDB",
+		"direct calls reject foreign ownership, update both slot discriminators together, retain " +
+			"empty recovery pairing and preserve every non-crypto column including revisions/generation"},
 
 	// ── settings.sql — the write path and the plain read are pinned; the LOCK is not ──
+	{"GetVaultPolicy", "settings.sql", "TestVaultModeQueriesLiveDB",
+		"direct calls in vault_mode_livedb_test.go — only exact optional permits optional mode; " +
+			"missing and invalid policy rows fail closed to required. The admission-lock test also " +
+			"reads the policy in a separate statement after the settings writer commits"},
 	{"DeleteAppSettings", "settings.sql", unpinnedPin,
 		"PRD #590 M2 — retires the legacy selfimprove_* keys after the boot-migration materializes " +
 			"the self_improve schedule row. Its only caller is schedsvc.MigrateLegacySelfImprove, which " +
@@ -986,6 +1003,58 @@ var queryInventory = []queryPin{
 			"NULL, and it reappears in the to_file bucket / open_count) while a `filing` coordinate " +
 			"with a FRESH filing_since (within the cutoff) is NOT reset — the clamp that protects a " +
 			"slow-but-alive CreateIssue mid-flight (M5 review reaper)"},
+
+	// ── intake_pause.sql — instance maintenance mode (PRD #3454) ───────────────────────
+	// Execution counts observed with log_statement=all over TestIntakePause*, TestMaintenance*,
+	// TestQueueReason*, TestEphemeralProvision*IntakePause* across store, handler and workersvc
+	// (excluding STATEMENT: echoes): Get 26, Lock 45, Ensure 45, Update 31, InsertEvent 31,
+	// ListEvents 7, RunAdmittable 169, Snapshot/Active/Held/Custody/Queued/IdleBound 11 each,
+	// ListRunQueueReasons 19. None is zero. A receipt of that sweep, not a live count.
+	{"GetInstanceIntakePause", "intake_pause.sql", "TestIntakePauseMissingRowLiveDB",
+		"direct call at intake_pause_livedb_test.go (reads back by_user_id and by_label after a " +
+			"re-seeded row is lifted); also reached through store.ReadInstanceIntakePause in " +
+			"several tests of the same file"},
+	{"LockInstanceIntakePause", "intake_pause.sql", "TestIntakePauseTransitionsLiveDB",
+		"reached through store.SetInstanceIntakePause (row lock before the transition); the test " +
+			"asserts changed/no-op for every pause and lift transition"},
+	{"EnsureInstanceIntakePauseRow", "intake_pause.sql", "TestIntakePauseMissingRowLiveDB",
+		"reached through store.SetInstanceIntakePause, which re-seeds a deleted singleton row; the " +
+			"test deletes the row, lifts the pause and asserts the row is back unpaused with one off event"},
+	{"UpdateInstanceIntakePause", "intake_pause.sql", "TestIntakePauseTransitionsLiveDB",
+		"reached through store.SetInstanceIntakePause; asserts the resulting state and the " +
+			"changed flag per transition (TestIntakePauseReasonEditKeepsAttributionLiveDB covers the " +
+			"reason-edit path)"},
+	{"InsertInstanceIntakePauseEvent", "intake_pause.sql", "TestIntakePauseTransitionsLiveDB",
+		"reached through store.SetInstanceIntakePause in the same transaction as the update; " +
+			"asserted by reading the events back, and TestIntakePauseRollbackIsAtomicLiveDB asserts " +
+			"a rolled-back transition leaves no event"},
+	{"ListInstanceIntakePauseEvents", "intake_pause.sql", "TestIntakePauseTransitionsLiveDB",
+		"direct call at intake_pause_livedb_test.go, asserting the event sequence and order"},
+	{"RunAdmittableForEphemeralProvision", "intake_pause.sql", "TestEphemeralProvisionOneRechecksIntakePauseLiveDB",
+		"../handler: prov.ProvisionPass -> provisionOne recheck under the advisory lock; the test " +
+			"enables the pause mid-pass and asserts no worker is created (replacing the query with " +
+			"SELECT true reddens it). The batch test also executes it but never depends on its answer"},
+	{"MaintenanceSnapshotNow", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout (one statement-time clock shared by every " +
+			"section); executed; the test asserts only that as_of is set"},
+	{"ListMaintenanceActiveRuns", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout; the partition test asserts which seeded runs " +
+			"land in the active section"},
+	{"ListMaintenanceHeldRuns", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout; asserts the held section membership"},
+	{"ListMaintenanceCustodyRuns", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout; asserts the custody section membership"},
+	{"ListMaintenanceQueuedRuns", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout; asserts the queued section membership " +
+			"(TestMaintenanceReadoutCapLiveDB asserts the row cap)"},
+	{"ListMaintenanceIdleBoundWorkers", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout; asserts the idle-bound worker section"},
+	{"ListRunAdmissionQueueReasons", "intake_pause.sql", "TestCodexAdmissionReadProjectionsLiveDB",
+		"../handler: executed indirectly through h.overlayQueueReasons; asserts owner class and " +
+			"eligibility time, foreign-admin privacy, expiry, and maintenance precedence"},
+	{"ListRunQueueReasons", "intake_pause.sql", "TestQueueReasonLiveDB",
+		"../handler: runs_dto.go batch lookup behind the run reads; asserts queue_reason for queued " +
+			"runs while paused and its absence once lifted. Also called from workersvc/jobs.go"},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)

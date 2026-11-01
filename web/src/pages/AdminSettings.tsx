@@ -5,7 +5,7 @@
 // (Decision 8) for immediate feedback, but the server stays the source of truth.
 
 import { useLocation } from "react-router-dom";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   api,
   type AppSettings,
@@ -43,6 +43,7 @@ import { CustodyHoldLimitCard } from "./adminSettings/CustodyHoldLimitCard";
 import { HostedWorkerQuotaCard } from "./adminSettings/HostedWorkerQuotaCard";
 import { EphemeralWorkersCard } from "./adminSettings/EphemeralWorkersCard";
 import { UpdatesSettingsCard } from "./adminSettings/UpdatesSettingsCard";
+import { MaintenanceCard } from "./adminSettings/MaintenanceCard";
 import { SummarySettingsCard } from "./adminSettings/SummarySettingsCard";
 import { AgentSourceSettingsCard } from "./adminSettings/AgentSourceSettingsCard";
 import { HealthSettingsCard } from "./adminSettings/HealthSettingsCard";
@@ -147,6 +148,11 @@ export function AdminSettings() {
   // Vault migration progress (PRD #32): stored secrets still using pre-vault
   // (master-key) encryption. Fetched separately so a failure never blocks the
   // settings form; null = unknown/not-yet-loaded, rendered only when > 0.
+  const [reunlockDays, setReunlockDays] = useState("7");
+  const confirmedReunlockDays = useRef<string | null>(null);
+  const [reunlockError, setReunlockError] = useState("");
+  const [vaultPolicy, setVaultPolicy] = useState("required");
+  const [unprotectedUsers, setUnprotectedUsers] = useState<number | null>(null);
   const [masterSealed, setMasterSealed] = useState<number | null>(null);
 
   // applyResponse fans a GET/PUT response out to the label-form fields and the
@@ -154,7 +160,16 @@ export function AdminSettings() {
   // consistent snapshot.
   const applyResponse = useCallback((resp: SettingsResponse) => {
     const { settings, secrets: sec, sources: src } = resp;
-    setSaved(settings);
+    // Sibling cards save independently and may return an older full map.
+    // Only the initial load and this field's own save confirm its lifetime.
+    const lifetime = confirmedReunlockDays.current ?? settings.vault_reunlock_days ?? "7";
+    if (confirmedReunlockDays.current === null) {
+      confirmedReunlockDays.current = lifetime;
+      setReunlockDays(lifetime);
+    }
+    setSaved({ ...settings, vault_reunlock_days: lifetime });
+    setVaultPolicy(settings.vault_policy ?? "required");
+    setUnprotectedUsers(resp.unprotected_users ?? null);
     setSecrets(sec ?? {});
     setSources(src ?? {});
     setDefaults(resp.defaults ?? {});
@@ -196,8 +211,11 @@ export function AdminSettings() {
   );
 
   useEffect(() => {
-    if (!loading && hash === "#agent-source") {
-      document.getElementById("agent-source")?.scrollIntoView?.({ block: "start" });
+    // Deep links that arrive before the cards render: the browser's own hash jump has
+    // nothing to land on yet, so scroll once loading settles (the maintenance banner's
+    // "Manage maintenance" link is one).
+    if (!loading && (hash === "#agent-source" || hash === "#maintenance")) {
+      document.getElementById(hash.slice(1))?.scrollIntoView?.({ block: "start" });
     }
   }, [loading, hash]);
 
@@ -275,8 +293,10 @@ export function AdminSettings() {
     ...(masterSealed !== null && masterSealed > 0
       ? [{ id: "vault-migration", label: "Vault migration" }]
       : []),
+    { id: "vault-policy", label: "Credential protection" },
     { id: "forge-labels", label: "Forge labels" },
     ...(!loading && saved ? [{ id: "run-judge", label: "Run judge" }] : []),
+    ...(!loading ? [{ id: "maintenance", label: "Maintenance mode" }] : []),
     ...(!loading && oidcStatus !== "disabled"
       ? [{ id: "sso", label: "Single sign-on" }]
       : []),
@@ -331,14 +351,60 @@ export function AdminSettings() {
             <strong className="text-fg">
               {masterSealed} stored secret{masterSealed === 1 ? "" : "s"}
             </strong>{" "}
-            still use pre-vault encryption — their owners haven&rsquo;t logged in since password
-            protection was enabled. Each re-seals under the owner&rsquo;s password automatically the
-            next time they log in (or unlock). For full protection those owners should also rotate
-            the affected token: sealing an existing value protects it from now on, not
-            retroactively.
+            belonging to protected users still use legacy server-key encryption. Those owners
+            need to log in or unlock to finish migration. Off users intentionally use server-key
+            encryption and are excluded from this count. Rotate affected credentials for protection
+            against older backups; migration cannot protect them retroactively.
           </p>
         </Card>
       )}
+
+      <Card id="vault-policy" className="space-y-4">
+        <SectionTitle>Credential protection</SectionTitle>
+        <p className="text-sm text-muted">TL;DR: Password encryption protects personal credentials against theft of the database together with the server key. A compromised running server can still read credentials while unlocked. After a release or server restart, an eligible foreground request can re-unlock with a live browser grant. New runs still wait until the user opens or focuses uzi; expired grants require a password unlock. Off uses server-key encryption, like forge bot tokens. <a href="/docs/vault-threat-model">Learn more</a>.</p>
+        <form className="space-y-2" onSubmit={async e => {
+          e.preventDefault();
+          if (loading || busy || !saved || !/^(?:[1-9]|[12][0-9]|30)$/.test(reunlockDays)) return;
+          setBusy(true); setReunlockError("");
+          try {
+            const resp = await api.updateSettings({ vault_reunlock_days: reunlockDays });
+            const days = resp.settings.vault_reunlock_days ?? "7";
+            confirmedReunlockDays.current = days;
+            setSaved(current => current ? { ...current, vault_reunlock_days: days } : current);
+            setReunlockDays(days);
+          } catch (err) { setReunlockError(errorMessage(err, "Failed to save browser grant lifetime")); }
+          finally { setBusy(false); }
+        }}>
+          <label>Browser grant lifetime (days)<Input aria-label="Browser grant lifetime (days)" inputMode="numeric" value={reunlockDays} disabled={loading || busy} onChange={e => setReunlockDays(e.target.value)} /></label>
+          {!/^(?:[1-9]|[12][0-9]|30)$/.test(reunlockDays) && <p>Enter a canonical integer from 1 to 30.</p>}
+          {reunlockError && <Alert message={reunlockError} />}
+          <p className="text-xs text-muted">Default: 7 days. New browser grants have an absolute expiry capped by this lifetime and the session expiry at creation. Session refresh never extends them. Changing this cap affects new grants only; existing grants keep their original expiry.</p>
+          <Button type="submit" disabled={loading || busy || !saved || !/^(?:[1-9]|[12][0-9]|30)$/.test(reunlockDays) || reunlockDays === (saved.vault_reunlock_days ?? "7")}>Save browser grant lifetime</Button>
+        </form>
+        <p>Optional lets each user turn protection on or off; new users start with protection off. Required prompts off users to enroll and prevents protected users from switching off.</p>
+        <p>Unprotected users: {unprotectedUsers ?? "unknown (older server or unavailable)"}</p>
+        <div className="space-y-3">
+          <label>Vault policy
+            <Select aria-label="Vault policy" value={vaultPolicy} disabled={loading || busy} onChange={e => setVaultPolicy(e.target.value)}>
+              <option value="optional">Optional</option>
+              <option value="required">Required</option>
+            </Select>
+          </label>
+          <Button disabled={loading || busy || !saved || vaultPolicy === (saved.vault_policy ?? "required")} onClick={async () => {
+            if (!saved || busy || loading) return;
+            setBusy(true); setError(""); setNotice("");
+            try {
+              const resp = await api.updateSettings({ vault_policy: vaultPolicy });
+              setSaved(current => current ? { ...current, vault_policy: resp.settings.vault_policy } : current);
+              setVaultPolicy(resp.settings.vault_policy ?? "required");
+              setUnprotectedUsers(resp.unprotected_users ?? null);
+              await refresh(true);
+              setNotice("Vault policy saved.");
+            } catch (err) { setError(errorMessage(err, "Failed to save vault policy")); }
+            finally { setBusy(false); }
+          }}>Save vault policy</Button>
+        </div>
+      </Card>
 
       <Card id="forge-labels" className="scroll-mt-6 space-y-5">
         <div>
@@ -468,6 +534,12 @@ export function AdminSettings() {
       {!loading && (
         <section id="agent-source" className="scroll-mt-6">
           <AgentSourceSettingsCard />
+        </section>
+      )}
+
+      {!loading && (
+        <section id="maintenance" className="scroll-mt-6">
+          <MaintenanceCard />
         </section>
       )}
 

@@ -24,12 +24,17 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
-	SemanticPlanning        *apitypes.SemanticEnrollment `json:"semantic_planning,omitempty"`
-	MemoryEpisode           int64                        `json:"memory_episode"`
-	MemoryInterventionCount int32                        `json:"memory_intervention_count"`
-	MemoryPolicy            *MemoryPolicy                `json:"memory_policy"`
-	CrossCheck              *ClaimPlanCrossCheck         `json:"cross_check,omitempty"`
-	RunID                   string                       `json:"run_id"`
+	ForgeOriginReservation *ForgeOriginReservation `json:"forge_origin_reservation,omitempty"`
+	// CheckpointWriteUnresolved is admission-time evidence for validated enrolled tasks;
+	// nil leaves recovery status unknown for legacy claims.
+	CheckpointWriteUnresolved *bool                        `json:"checkpoint_write_unresolved,omitempty"`
+	CheckpointCoordinates     *CheckpointCoordinates       `json:"checkpoint_coordinates,omitempty"`
+	SemanticPlanning          *apitypes.SemanticEnrollment `json:"semantic_planning,omitempty"`
+	MemoryEpisode             int64                        `json:"memory_episode"`
+	MemoryInterventionCount   int32                        `json:"memory_intervention_count"`
+	MemoryPolicy              *MemoryPolicy                `json:"memory_policy"`
+	CrossCheck                *ClaimPlanCrossCheck         `json:"cross_check,omitempty"`
+	RunID                     string                       `json:"run_id"`
 	// Kind is the run kind (one of the runkind values; PRD #6). The worker branches on it: an
 	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
 	Kind string `json:"kind"`
@@ -62,6 +67,15 @@ type ClaimPayload struct {
 	LastSeq                  int32   `json:"last_seq"` // resume: continue message numbering
 	IterationCount           int32   `json:"iteration_count"`
 	RequeueCount             int32   `json:"requeue_count"`
+	// WorkerRecoveryEpisode combines the stored owner-authorized episode and retained parks.
+	// ResumeWorkerRecoveryEpisode increments the stored episode; retained parks advance
+	// this projection. Automatic requeues and claims
+	// preserve it. Always present, including zero; older workers ignore the key.
+	// Run-backed cross-check claims use the child run's episode, never the lead's.
+	// Non-run cross-check records have no recovery episode to project.
+	WorkerRecoveryEpisode int64 `json:"worker_recovery_episode"`
+	// WorkerRecoveryOwnerEpisode is the stored owner-authorized episode, including zero.
+	WorkerRecoveryOwnerEpisode int64 `json:"worker_recovery_owner_episode"`
 	// ClaimGeneration is the general claim-lane counter (PRD #1296 M1, D2), incremented
 	// atomically in the ClaimRun transaction that produced this payload and read straight
 	// off the returned run row. The worker binds its durable source-journal identity to
@@ -123,7 +137,8 @@ type ClaimPayload struct {
 	// (no requeue writer touches them), so a worker that dies with a pause pending re-arms it
 	// on resume — the re-claim seeds the flag, and pause_after_count still compares against the
 	// monotone milestones_completed. PausePending is (pause_requested_at IS NOT NULL);
-	// PauseMode passes the mode through ('milestone'|'now'), empty/omitted when none is
+	// PauseMode passes the mode through ('milestone'|'now'|'wall'; the weekly reserve's
+	// own 'reserve' request is served as 'milestone', servedPauseMode), empty/omitted when none is
 	// pending. Additive on the wire — an old worker ignores both keys.
 	// ParkRunSupported negotiates the protocol for the entire flight; endpoint
 	// authorization independently checks its current phase and persisted plan.
@@ -625,14 +640,23 @@ type ClaimConfig struct {
 	// DefaultEffort is the SDK effort level the worker applies to the lead/main
 	// thread: the owner's explicit per-user reasoning effort (PRD #617), or the uzi
 	// default `medium` (issue #1157) when the owner has not chosen (NULL). It is
-	// populated for every issue-lane claim assembled through resolveEffortPtr; the
-	// judge lane (issue #1157) now ALSO populates it best-effort through the same
-	// resolveEffortPtr, inheriting the owner's per-user default_effort (uzi default
-	// `medium` when NULL) just like the run/chat lanes, so judge runs carry the owner's
-	// effort rather than riding the SDK's own fallback. omitempty is retained. Unlike
-	// DefaultModel there is no per-run/per-schedule freeze; the owner's per-user value
-	// is the only source.
+	// populated for every ordinary claim assembled through resolveHarnessEffortPtr /
+	// resolveEffortPtr (the judge lane included, best-effort) EXCEPT when the owner
+	// chose Runtime default (stored `runtime`, PRD #3247): then it is nil and omitempty
+	// drops the key so the runtime picks. A claim never carries the string `runtime`.
+	// Unlike DefaultModel there is no per-run/per-schedule freeze; the owner's
+	// per-user value is the only source (a checker child carries its frozen
+	// cross-check effort instead).
 	DefaultEffort *string `json:"default_effort,omitempty"`
+	// DefaultModelSource says who decided DefaultModel (a leadcfg.ModelSource token:
+	// schedule_pin or user_default today). PRD #3244: set only on a lead-lane claim
+	// (leadcfg.LeadLane) and only when DefaultModel is shipped; never for cross-check,
+	// review, isolated-lane, judge, chat or job claims.
+	DefaultModelSource *string `json:"default_model_source,omitempty"`
+	// DefaultEffortSource says who decided DefaultEffort (a leadcfg.EffortSource token:
+	// user_default or builtin today). PRD #3244: present on every lead-lane claim, which makes
+	// it the worker's activation signal for the lead-config reporter; absent otherwise.
+	DefaultEffortSource *string `json:"default_effort_source,omitempty"`
 	// AttributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// LIVE from the owner's users row on every claim. When false, the worker suppresses
 	// the Agent SDK's Co-Authored-By: Claude commit trailer for this run (agent-side, a

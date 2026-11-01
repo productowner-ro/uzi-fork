@@ -82,6 +82,27 @@ func inputOutcome(kind string, serverSide bool) string {
 // prints HEALTH_REASON and FAILURE_REASON generically, switching on no vocabulary,
 // so PRD #108's new reason strings flow through untouched.
 func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) error {
+	return renderRunDetailAt(p, r, time.Now(), origin...)
+}
+
+// leadConfigRows are the LEAD and LEAD_SOURCE rows (PRD #3244 section 8), emitted only when the run
+// carries lead_config (a lead-lane run). LEAD is the chip text without its "lead: " prefix; LEAD_SOURCE joins
+// the tooltip lines with "; ". Model strings are worker-attested, so both cells go through sanitizeTTY.
+func leadConfigRows(r apitypes.RunDTO) [][]string {
+	if r.LeadConfig == nil {
+		return nil
+	}
+	v := runpresentation.LeadConfigView(runpresentation.LeadConfigViewInputFromRun(r))
+	if v.Chip == "" {
+		return nil
+	}
+	return [][]string{
+		{"LEAD", sanitizeTTY(strings.TrimPrefix(v.Chip, "lead: "))},
+		{"LEAD_SOURCE", sanitizeTTY(strings.Join(v.Lines, "; "))},
+	}
+}
+
+func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, origin ...string) error {
 	rows := [][]string{
 		{"ID", r.ID},
 		{"KIND", r.Kind},
@@ -107,8 +128,12 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 		// and still carries the raw enum (machine-facing, D1).
 		{"HEALTH", displayHealth(r.Health)},
 	}
+	rows = append(rows, leadConfigRows(r)...)
 	if len(r.AutoApproveBlockedReasons) > 0 {
 		rows = append(rows, []string{"AUTO_APPROVE_BLOCKED", strings.Join(r.AutoApproveBlockedReasons, ", ")})
+	}
+	if r.RepoPath != "" {
+		rows = append(rows, []string{"REPO", sanitizeTTY(r.RepoPath)})
 	}
 	rows = append(rows, semanticGateRows(r)...)
 	rows = append(rows, completionPendingRows(r)...)
@@ -116,6 +141,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	rows = append(rows, planCrossCheckRows(r)...)
 	rows = append(rows, codeCrossCheckRows(r)...)
 	rows = append(rows, workerExhaustionRows(r)...)
+	for _, line := range forgeRunLines(r) {
+		rows = append(rows, []string{"FORGE", line})
+	}
 	// DEADLINE (PRD #1170): the run's wall-clock stop time and countdown, emitted only when
 	// the server set a deadline (a running issue run) — right after HEALTH, and emit-only-
 	// when-set like HEALTH_REASON below, so a chat/judge/non-running run prints no new row.
@@ -156,8 +184,20 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	if line := checkpointDurabilityLine(r); line != "" {
 		rows = append(rows, []string{"CHECKPOINT", line})
 	}
-	if r.HealthReason != nil && *r.HealthReason != "" {
-		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
+	if reason := runHealthReasonAt(r, now); reason != "" {
+		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(reason)})
+	}
+	if reason := runQueueReason(r); reason != "" {
+		rows = append(rows, []string{"QUEUE_REASON", reason})
+	}
+	if reason := codexAdmissionLineAt(r, now); reason != "" {
+		rows = append(rows, []string{"CODEX_ADMISSION", reason})
+	}
+	// RESERVE (PRD #3522): the weekly usage reserve's visible reason on a queued run it holds
+	// ("weekly usage reserve: 72% >= 70%", or "... weekly usage unknown"), emit-only-when-set. The
+	// text is server-built from numbers, but it rides a persisted column, so it is sanitized.
+	if r.ReserveHoldReason != nil && *r.ReserveHoldReason != "" {
+		rows = append(rows, []string{"RESERVE", sanitizeTTY(*r.ReserveHoldReason)})
 	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
@@ -179,6 +219,35 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	// the untrusted join goes through the same scrub the sibling free-text rows use.
 	if len(r.RequiredCapabilities) > 0 {
 		rows = append(rows, []string{"REQUIRED_CAPABILITIES", sanitizeTTY(strings.Join(r.RequiredCapabilities, ","))})
+	}
+	if len(r.IgnoredInferredCapabilities) > 0 {
+		rows = append(rows, []string{"IGNORED_INFERRED_CAPABILITIES", sanitizeTTY(strings.Join(r.IgnoredInferredCapabilities, ","))})
+	}
+	if r.CapabilityProvenance != nil {
+		if len(r.CapabilityProvenance.Capabilities) > 0 {
+			if !r.CapabilityProvenance.HintsKnown {
+				rows = append(rows, []string{"CAPABILITY_PROVENANCE", "repo-hint history unknown"})
+			}
+			if !r.CapabilityProvenance.InferenceKnown {
+				rows = append(rows, []string{"CAPABILITY_PROVENANCE", "inference evidence unknown"})
+			}
+		}
+		for _, item := range r.CapabilityProvenance.Capabilities {
+			status := "required"
+			if !item.Required {
+				status = "not currently required"
+			}
+			if item.InferenceIgnored {
+				status += "; inference ignored"
+			}
+			rows = append(rows, []string{"CAPABILITY_SOURCE", sanitizeTTY(item.Capability + ": " + strings.Join(item.Sources, "+") + "; " + status)})
+			for _, trigger := range item.Triggers {
+				rows = append(rows, []string{"CAPABILITY_TRIGGER", sanitizeTTY(item.Capability + ": " + trigger.Reason + ": " + trigger.Path)})
+			}
+			if item.Truncated {
+				rows = append(rows, []string{"CAPABILITY_TRIGGER", sanitizeTTY(item.Capability + ": additional or invalid trigger paths omitted")})
+			}
+		}
 	}
 	if len(r.RequiredTools) > 0 {
 		rows = append(rows, []string{"REQUIRED_TOOLS", sanitizeTTY(strings.Join(r.RequiredTools, ","))})
@@ -524,6 +593,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, credentialSwitchAction(r))
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
+	case holdWeeklyReserve:
+		clauses = append(clauses, weeklyReserveAction(r))
 	}
 	return []string{"HOLD", strings.Join(clauses, " · ")}
 }
@@ -546,9 +617,18 @@ func holdReasonLabel(reason string) string {
 		return "credential switch unsettled"
 	case holdBaseAttestation:
 		return "base not attested"
+	case holdWeeklyReserve:
+		return "weekly usage reserve"
 	default:
 		return cellText(reason)
 	}
+}
+
+// weeklyReserveAction is the owner's next step for a weekly_reserve hold (PRD #3522): the run resumes
+// by itself when usage falls below the threshold, and `uzi run resume` overrides the reserve until the
+// next weekly reset.
+func weeklyReserveAction(r apitypes.RunDTO) string {
+	return "resumes when usage drops below the threshold; override: uzi run resume " + cellText(r.ID)
 }
 
 // isBaseAttestationHold reports whether r is held because its kept work carries no
@@ -623,6 +703,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, credential switch unsettled; " + credentialSwitchAction(r)
 	case holdBaseAttestation:
 		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
+	case holdWeeklyReserve:
+		return "held by the weekly usage reserve; " + weeklyReserveAction(r)
 	default:
 		return "paused (" + holdReasonLabel(reason) + ")"
 	}
@@ -784,14 +866,20 @@ func pauseBoundaryClause(r apitypes.RunDTO) string {
 	if r.PauseMode != nil && *r.PauseMode == "now" {
 		return "now"
 	}
+	// PRD #3522: the weekly usage reserve files the same milestone-boundary request; name the cause so
+	// the owner does not read it as their own pause.
+	suffix := ""
+	if r.PauseMode != nil && *r.PauseMode == "reserve" {
+		suffix = " (weekly usage reserve)"
+	}
 	if len(r.Milestones) == 0 {
-		return "after the current step"
+		return "after the current step" + suffix
 	}
 	n := 1
 	if r.PauseAfterCount != nil {
 		n = *r.PauseAfterCount + 1
 	}
-	return fmt.Sprintf("after M%d", n)
+	return fmt.Sprintf("after M%d", n) + suffix
 }
 
 // joinSheddingClauses joins clauses with " · ", DROPPING trailing clauses (from the right)
@@ -978,6 +1066,9 @@ func progressRow(r apitypes.RunDTO) []string {
 		}
 		return row("stalled")
 	case runprogress.StateWaiting:
+		if activeAccountCooldown(r) {
+			return row("waiting on account")
+		}
 		switch r.Status {
 		case "awaiting_approval":
 			return row("waits on you · plan gate")
@@ -1017,9 +1108,11 @@ func progressParkWord(status string) string {
 // `<agent> · <agent_label> · <tool> <detail> · <age> ago`. It is the CLI twin of the
 // web run view's now line, the TUI board's second line (boardSecondLine) and the crew
 // rail's `↳` line, and reads RunDTO.CurrentActivity directly — no milestone
-// precondition (D5): any non-terminal run that has an activity gets the row.
+// precondition (D5). A non-terminal run with activity gets the row unless it is
+// waiting on account cooldown.
 //
-// Rendered ONLY when current_activity is present AND the run is non-terminal. The
+// Rendered only when current_activity is present, the run is non-terminal, and
+// activeAccountCooldown is false: a retained tool frame is not live during that wait. The
 // server already returns null for a terminal run and for a run with no tool_use frame,
 // so the nil guard alone matches the wire; the terminal-status guard is the same
 // belt-and-braces the board's boardShowSecondLine carries — a finished run has no
@@ -1042,7 +1135,7 @@ func progressParkWord(status string) string {
 // inherits that exclusion and can never surface a raw command.
 func nowRow(r apitypes.RunDTO) []string {
 	act := r.CurrentActivity
-	if act == nil || terminalRunStatuses[r.Status] {
+	if act == nil || terminalRunStatuses[r.Status] || activeAccountCooldown(r) {
 		return nil
 	}
 	parts := make([]string, 0, 4)
@@ -1104,6 +1197,9 @@ func milestoneNowRows(r apitypes.RunDTO) [][]string {
 		return nil
 	}
 	act := r.CurrentActivity
+	if activeAccountCooldown(r) {
+		act = nil
+	}
 	uniqueID := ""
 	if act != nil {
 		uniqueID = uniqueMilestoneAgentMatch(eff, act.Agent)
@@ -1868,9 +1964,9 @@ func compactPayload(raw json.RawMessage) string {
 // renderRunInputs prints the steer queue (follow-ups and scope directives,
 // newest-first) as a kind/body/state/age table (PRD #95 M4, #634). The body is the
 // user's own text, sanitized like any free text bound for a TTY. State is derived per
-// kind — from the receipt timestamps and runStatus for a follow_up, from disposition for a scope
+// kind — from the receipt timestamps and run.Status for a follow_up, from disposition for a scope
 // directive; age is relative to created_at.
-func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStatus string, recoveryCause ...string) error {
+func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, run apitypes.RunDTO) error {
 	rows := make([][]string, 0, len(inputs))
 	for _, in := range inputs {
 		body := "-"
@@ -1880,7 +1976,7 @@ func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStat
 		rows = append(rows, []string{
 			steerKindLabel(in.Kind),
 			body,
-			steerState(in, runStatus, recoveryCause...),
+			steerStateForRun(in, run),
 			relAge(in.CreatedAt),
 		})
 	}
@@ -1936,6 +2032,15 @@ func steerKindLabel(kind string) string {
 // "vault_locked" (issue #1766) names the vault unlock the run is waiting for, and
 // "data_volume_full" (PRD #1809) names the disk space it is waiting for.
 func steerState(in apitypes.SteerInputDTO, runStatus string, recoveryCause ...string) string {
+	return steerStateWithRun(in, runStatus, recoveryCause, nil)
+}
+
+// steerStateForRun preserves explicit NULL versus finite timing from a full read.
+func steerStateForRun(in apitypes.SteerInputDTO, run apitypes.RunDTO) string {
+	return steerStateWithRun(in, run.Status, []string{strOr(run.RecoveryWaitCause, "")}, &run)
+}
+
+func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCause []string, run *apitypes.RunDTO) string {
 	kind, consumedAt, disposition := in.Kind, in.ConsumedAt, in.Disposition
 	// PRD #634: a scope directive's state IS its disposition — it is never consumed, so
 	// consumed_at/runStatus carry no delivery signal for it. A nil disposition means the
@@ -1969,7 +2074,21 @@ func steerState(in apitypes.SteerInputDTO, runStatus string, recoveryCause ...st
 	// it lives on the fuller run-get notice and the web panel). issue #1088 widened the
 	// non-forge cause to any transient interruption (a transient empty turn or provider outage).
 	recoveringSuffix := " (run recovering from a transient interruption)"
-	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause) {
+	if len(recoveryCause) > 0 && (recoveryCause[0] == retainedRecoveryExhaustedCause || recoveryCause[0] == "codex_idle_stall") {
+		recoveringSuffix = " (retained recovery; retry timing unknown)"
+		if recoveryCause[0] == "codex_idle_stall" {
+			recoveringSuffix = " (Codex idle stall; retry timing unknown)"
+		}
+		if run != nil && isRecoveryDecisionPark(*run) {
+			if run.RecoveryRetryNotBefore != nil {
+				recoveringSuffix = " (timed retry)"
+			}
+			if isRecoveryDecisionHold(*run) {
+				recoveringSuffix = " (owner Resume/Cancel)"
+			}
+		}
+	}
+	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause || recoveryCause[0] == retainedRecoveryAdoptionFailedCause) {
 		recoveringSuffix = " (owner Resume/Cancel)"
 	}
 	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
@@ -2153,7 +2272,7 @@ var parkedStatuses = map[string]bool{statusLimitWait: true, statusRecoveryWait: 
 // reported it; it is shown only while the run is parked. "" when the run is not parked or the
 // worker did not report it.
 func checkpointDurabilityLine(r apitypes.RunDTO) string {
-	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isOwnerRequiredWorkerHold(r) {
+	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isOwnerRequiredWorkerHold(r) || isRecoveryDecisionPark(r) {
 		return ""
 	}
 	if *r.CheckpointContainsLatest {
@@ -2313,8 +2432,18 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // (PRD #1809) a data_volume_full park adds "(waiting for disk space)".
 // A run held on credential_disabled (PRD #1732 D14) gets "(credential disabled)" likewise.
 func runStatusCell(r apitypes.RunListItemDTO) string {
+	return runStatusCellAt(r, time.Now())
+}
+
+func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.FailOrigin, ""))
-	if isOwnerRequiredWorkerHold(r.RunDTO) {
+	if isForgePark(r.RunDTO) {
+		s += " (" + forgeParkLine(r.RunDTO) + ")"
+	}
+	if r.ForgeOriginCooldown != nil {
+		s += " (" + strings.Join(forgeOriginLines(r.ForgeOriginCooldown), "; ") + ")"
+	}
+	if isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
 	}
 	if short := codexAccountActionShort(r.RunDTO); short != "" {
@@ -2334,7 +2463,55 @@ func runStatusCell(r apitypes.RunListItemDTO) string {
 	case isCredentialSwitchUnsettledHold(r.RunDTO):
 		s += " (credential switch unsettled)"
 	}
+	admission := codexAdmissionLineAt(r.RunDTO, now)
+	if cooldown := accountCooldownLineAt(r.RunDTO, now); cooldown != "" {
+		admission = cooldown
+	}
+	if reason := runQueueReason(r.RunDTO); reason != "" {
+		s += " (" + reason + ")"
+	} else if reason := strOr(r.HealthReason, ""); r.Status == "queued" && (reason == "your Codex account is unavailable (quarantined or being re-linked), so this run can't start" || (admission != "" && reason != "" && !apitypes.IsCodexAdmissionReason(reason))) {
+		// The API keeps higher-priority queued blockers in HealthReason. Retain
+		// them after maintenance and before the independent admission details.
+		s += " (" + reason + ")"
+	}
+	if admission != "" {
+		s += " (" + admission + ")"
+	}
 	return s
+}
+
+// codexAdmissionLineAt uses only owner-authorized typed fields, never persisted health text.
+func codexAdmissionLineAt(r apitypes.RunDTO, now time.Time) string {
+	if r.Status != "queued" || r.CodexAdmissionClass == nil || r.CodexAdmissionEligibleAt == nil || !r.CodexAdmissionEligibleAt.After(now) {
+		return ""
+	}
+	return apitypes.CodexAdmissionReason(*r.CodexAdmissionClass, *r.CodexAdmissionEligibleAt)
+}
+
+// runHealthReasonAt discards stale persisted provider reasons, retaining other blockers.
+func runHealthReasonAt(r apitypes.RunDTO, now time.Time) string {
+	reason := strOr(r.HealthReason, "")
+	if reason == apitypes.AccountCooldownReason {
+		return accountCooldownLineAt(r, now)
+	}
+	if apitypes.IsCodexAdmissionReason(reason) {
+		return codexAdmissionLineAt(r, now)
+	}
+	return reason
+}
+
+func runQueueReason(r apitypes.RunDTO) string {
+	reason := strOr(r.QueueReason, "")
+	switch reason {
+	case "codex_rate_limit", "codex_overload":
+		// CODEX_ADMISSION carries the independently active class and eligibility.
+		return ""
+	default:
+		if r.Status != "queued" {
+			return ""
+		}
+		return queueReasonCell(reason)
+	}
 }
 
 // providerParkLine is CLI retry wording; shared TUI glyphs remain unchanged.
@@ -2403,7 +2580,10 @@ func forgeParkLine(r apitypes.RunDTO) string {
 	if r.RecoveryRetryNotBefore != nil {
 		return "waiting for the forge, retry at " + r.RecoveryRetryNotBefore.Local().Format("15:04") + " (" + count + ")"
 	}
-	return "waiting for the forge (" + count + ")"
+	if isForgeOwnerHold(r) {
+		return "forge automatic retries exhausted; owner-held; no automatic resume (" + count + "); owner Resume or Cancel"
+	}
+	return "waiting for the forge (" + count + "); retry timing unknown"
 }
 
 // limitWaitLine is the ONE sentence every CLI surface renders for a parked run
@@ -2589,4 +2769,30 @@ func pauseOriginLabel(r apitypes.RunDTO, personal bool, origin ...string) string
 		value = origin[0]
 	}
 	return runpresentation.PauseLabel(value, personal)
+}
+
+// queueReasonCell renders a run's queue_reason. The two reasons today are spelled out:
+// "maintenance" (PRD #3454) and "weekly_reserve" (PRD #3522, the exact figures are on the
+// RESERVE row beside it); an unknown future value still renders, sanitized.
+func queueReasonCell(reason string) string {
+	switch reason {
+	case "maintenance":
+		return "maintenance (uzi is in maintenance mode)"
+	case "weekly_reserve":
+		return "weekly_reserve (held by your weekly usage reserve)"
+	}
+	return sanitizeTTY(reason)
+}
+
+// activeAccountCooldown follows health until a fresh report clears it, even when
+// accountCooldownLineAt has no current typed metadata to display.
+func activeAccountCooldown(r apitypes.RunDTO) bool {
+	return r.Health == "waiting_account_cooldown" && (r.Status == "claimed" || r.Status == "running" || r.Status == "awaiting_approval")
+}
+
+func accountCooldownLineAt(r apitypes.RunDTO, now time.Time) string {
+	if !activeAccountCooldown(r) || r.AccountCooldownClass == nil || r.AccountCooldownEligibleAt == nil || !r.AccountCooldownEligibleAt.After(now) {
+		return ""
+	}
+	return apitypes.AccountCooldownLine(*r.AccountCooldownClass, *r.AccountCooldownEligibleAt)
 }

@@ -19,13 +19,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/agentsource"
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
-	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/codexusagepoller"
 	"github.com/vtmocanu/uzi/api/internal/config"
@@ -112,12 +110,14 @@ var (
 // collector is the workersvc Service, so this keeps a signature drift a build error.
 var _ codexusagepoller.Recoverer = (*workersvc.Service)(nil)
 
-// codexProviderRequestTimeout bounds one Codex provider HTTP call in the production
-// codexauth.Client (PRD #1171 M1). The refresh callback spends it only on the oauth exchange;
-// import and recovery spend it on their nonrotating identity reads. Request-entry anchoring
-// leaves commit/recheck and response-delivery margin inside the 7.5s route budget, while the
-// worker HTTP client remains capped at 8s.
+// codexProviderRequestTimeout bounds nonrotating identity and usage reads in the
+// production codexauth.Client (PRD #1171 M1).
 const codexProviderRequestTimeout = 2500 * time.Millisecond
+
+// codexRefreshTimeout bounds the refresh callback's single OAuth exchange. Request-entry
+// anchoring leaves commit/recheck and response-delivery margin inside the unchanged 7.5s
+// route budget, while the worker HTTP client remains capped at 8s.
+const codexRefreshTimeout = 5 * time.Second
 
 // bindWorkerListeners binds the worker-facing listener(s) and, ONLY after every enabled bind
 // succeeds, calls setReady — so the boot-grace anchor (Service.SetReadyAt) fires after the api
@@ -358,23 +358,29 @@ func run() error {
 		// internally consistent while the meter and the selector disagreed about the
 		// same token, with nothing going red.
 		Autoselect: cfg.AutoselectPolicy(),
+		// PRD #3522: the weekly usage reserve's freshness window is three of these, the rule the
+		// rate-limit surfaces already apply.
+		UsagePollInterval:      cfg.UsagePollInterval,
+		CodexUsagePollInterval: cfg.CodexUsagePollInterval,
 		// PRD #35 usage-limit park. Both are server-side bounds on a WORKER-REPORTED
 		// event: the worker asks to park, the server decides for how long and how often.
 		RunLimitMaxWaits: cfg.RunLimitMaxWaits,
 		RunLimitMaxPark:  cfg.RunLimitMaxPark,
 		// Transient-recovery park (issue #1197): the base/ceiling of the server-owned
-		// exponential backoff the sweeper auto-promotes a 'recovery_wait' run on. No
-		// per-run cap — a park always becomes promotable again.
-		RunRecoveryParkBase: cfg.RunRecoveryParkBase,
-		RunRecoveryMaxPark:  cfg.RunRecoveryMaxPark,
-		// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2): past this many forge parks
-		// the run fails with fail_origin='forge_unreachable' instead of parking again. 0 =
-		// unlimited. Counted separately from the recovery-park backoff (recovery_wait_count).
+		// exponential backoff used by timed recovery parks. Codex idle stalls have
+		// their own count bound and wait for owner Resume above that bound.
+		RunCodexIdleStallMaxParks: cfg.RunCodexIdleStallMaxParks,
+		RunRecoveryParkBase:       cfg.RunRecoveryParkBase,
+		RunRecoveryMaxPark:        cfg.RunRecoveryMaxPark,
+		// Forge-unreachable timed-park allowance: the next exhausted group enters
+		// an owner-held NULL-retry recovery wait. Zero deliberately means unlimited.
+		// Counted separately from the recovery-park backoff (recovery_wait_count).
 		RunForgeUnreachableMaxParks: cfg.RunForgeUnreachableMaxParks,
 		RunGateRefusalMax:           cfg.RunGateRefusalMax,
 		// Data-volume-full park cap (PRD #1809 M5, D6): past this many COUNTED disk parks the run
 		// fails with fail_origin='data_volume_full'. 0 = unlimited. Preventive parks never count.
-		RunDiskParkMax: cfg.RunDiskParkMax,
+		RunDiskParkMax:              cfg.RunDiskParkMax,
+		RunRetainedRecoveryMaxParks: cfg.RunRetainedRecoveryMaxParks,
 		// PRD #1733: elapsed-time bound on an unbroken provider-outage park streak; past it the next
 		// provider park becomes a paused 'provider_unavailable' hold. 0 disables the hold.
 		RunProviderParkMaxDuration: cfg.RunProviderParkMaxDuration,
@@ -420,13 +426,13 @@ func run() error {
 	// Reject-without-reason buttons. It rides workersvc's ownership-checked
 	// SubmitInput (via the gateSubmitter adapter, which keeps slacksvc free of a
 	// workersvc import) and reads run status itself for stale-click handling.
-	slackGate := slacksvc.NewGatekeeper(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+	slackGate := slacksvc.NewGatekeeper(q, gateSubmitter{wsvc, q}, slackPoster, slog.Default())
 
 	// Reply-from-Slack handler (PRD #25 M5): inbound message.im thread replies →
 	// reasoned reject during a reject-pending gate, follow_up on a live run, a nudge
 	// during an open gate, or a coalesced ephemeral otherwise. Same ownership-checked
 	// submitter as the gatekeeper.
-	slackReplier := slacksvc.NewReplier(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+	slackReplier := slacksvc.NewReplier(q, gateSubmitter{wsvc, q}, slackPoster, slog.Default())
 
 	// Per-user chat budget (PRD #39): a spend guard on chat create + message posts.
 	// Created here (ahead of the other route limiters) because the Slack chat opener
@@ -443,7 +449,7 @@ func run() error {
 	// Dismiss on an issue-proposal card — routed as a THIRD InboundMux member beside the
 	// linker and the gatekeeper. The forge write rides the same claim-first
 	// ConfirmProposalForUser the web confirm uses (lifted in M1).
-	slackChatActions := slacksvc.NewChatActions(q, gateSubmitter{wsvc}, slackPoster, settingsCache.PublicBaseURL, slog.Default())
+	slackChatActions := slacksvc.NewChatActions(q, gateSubmitter{wsvc, q}, slackPoster, settingsCache.PublicBaseURL, slog.Default())
 	// The Continue button mints a run and spends the owner's token, so it draws from the
 	// SAME shared per-user chat budget the opener uses (PRD #191 M6) — same key, one pool.
 	slackChatActions.SetChatSpendGuard(func(userID uuid.UUID) bool {
@@ -496,7 +502,7 @@ func run() error {
 	// Optional startup admin seed. Runs after migrations, before serving. A
 	// failure here (e.g. DB error) aborts boot; an already-present seed user is
 	// left untouched.
-	if err := seedAdmin(ctx, q, cfg); err != nil {
+	if err := seedAdmin(ctx, pool, cfg); err != nil {
 		return err
 	}
 	// Optional startup forge-connection seed for the seed admin. Runs after the
@@ -507,37 +513,28 @@ func run() error {
 	if err := seed.ForgeConnection(ctx, q, svc, cfg); err != nil {
 		return err
 	}
-	// Per-user vault (PRD #32): password-wrapped DEKs sealing each user's personal
-	// secrets. One instance, shared by the HTTP handlers (unlock at login, secret
-	// save) and — from M3 — the worker service (claim-time open), so a login on the
-	// API and a claim by the worker see one DEK cache. Built on the master box
-	// (which now seals only connection PATs + legacy master-sealed rows) and the store.
-	vlt := vault.New(box, q)
+	// Shared policy-aware credential vault: protected users use password-wrapped
+	// DEKs; unprotected users use the master box with owner/kind AAD. HTTP handlers
+	// and workers share this instance and its per-user DEK cache.
+	vlt := vault.NewPostgres(box, pool)
 	// Boot-unlock the seed admin so a headless deployment runs overnight autopilot
 	// from the first boot: the DEK cache is empty after every restart, and without
-	// this the seed admin would sit locked until an interactive login (defeating the
-	// bootstrap case). Fatal when seeding is configured — a seed admin whose vault
-	// cannot be unlocked at boot is a broken bootstrap, matching the other seed
+	// this a protected seed admin would sit locked until an interactive login.
+	// Off accounts skip unlock. A protected seed admin whose vault cannot be
+	// unlocked at boot is a broken bootstrap, matching the other seed
 	// steps' loud-on-misconfig stance. First boot creates the vault here; a later
 	// boot re-derives it and lazily rewraps any legacy master-sealed secret to the DEK.
-	if cfg.SeedEmail != "" {
-		seedUser, err := q.GetUserByEmail(ctx, cfg.SeedEmail)
-		if err != nil {
-			return fmt.Errorf("boot-unlock seed admin: look up %q: %w", cfg.SeedEmail, err)
-		}
-		if err := vlt.Unlock(ctx, seedUser.ID, cfg.SeedPassword); err != nil {
-			return fmt.Errorf("boot-unlock seed admin vault: %w", err)
-		}
-		slog.Info("boot-unlocked seed admin vault", "email", cfg.SeedEmail)
+	if err := seed.UnlockAdminVault(ctx, q, vlt, cfg); err != nil {
+		return err
 	}
 	// Optional startup Anthropic-token seed for the seed admin (dev convenience:
 	// survives `docker compose down -v` so the token need not be re-pasted). Runs
 	// after the admin seed (whose user it belongs to) and the boot-unlock (so it can
-	// DEK-seal). Create-only and format-checked only — it seeds the operator's
-	// EXISTING token, never mints a credential, never does a live/network check, and
-	// never logs the value. A DB error or a malformed configured token aborts boot;
+	// seal for its current mode). Create-only and format-checked only — it seeds
+	// the operator's EXISTING token, never mints a credential, never does a live
+	// network check, and never logs the value. A DB error or malformed token aborts boot;
 	// an already-present token is left untouched.
-	if err := seed.AnthropicToken(ctx, q, vlt, cfg); err != nil {
+	if err := seed.AnthropicToken(ctx, seed.NewPostgresSecretStore(pool), vlt, cfg); err != nil {
 		return err
 	}
 	// Optional startup Slack-settings seed (UZI_SEED_SLACK_*): create-only
@@ -611,6 +608,7 @@ func run() error {
 	// completion errors rather than completing non-atomically), so this wiring is what lets an
 	// interlocked run complete at all.
 	wsvc.SetTxBeginner(pool)
+	wsvc.StartPrerequisiteClosures(ctx)
 	// Checkpoint-ref retention (PRD #1810): the per-run SESSION advisory lock that serialises
 	// every forge write against a retained checkpoint ref pins its connection from this pool. A
 	// nil pool is fail-safe (every retained ref is kept, nothing is deleted).
@@ -624,7 +622,7 @@ func run() error {
 	// (codexauth.NewClient) — NEVER from a claim, model, repo, saved label or callback. Tests
 	// inject a fake through WithHTTPDoer; production takes the fixed defaults.
 	//
-	// The per-provider-request deadline (codexProviderRequestTimeout) is the innermost of a
+	// The refresh-only deadline (codexRefreshTimeout) is the innermost of a
 	// nested budget that keeps the WHOLE worker → API → provider → durable-commit → callback
 	// round trip UNDER the pinned app-server 10-second external-auth callback deadline
 	// (PRD #1147 M2 B6):
@@ -635,7 +633,7 @@ func run() error {
 	//	worker → API HTTP timeout ............................. 8s   (agent WorkerClient)
 	//	API route handling timeout .......................... 7.5s   (worker_codex.go)
 	//	coordinated-refresh lease ............................. 7s   (codexrefresh.go)
-	//	oauth exchange (codexProviderRequestTimeout) ........ 2.5s   (the callback's only
+	//	oauth exchange (codexRefreshTimeout) .................. 5s   (the callback's only
 	//	                                                           provider network call)
 	//
 	// Each outer layer therefore has actual response/cancellation margin. A timeout keeps
@@ -643,6 +641,7 @@ func run() error {
 	// the same operation instead of blindly starting another exchange.
 	wsvc.SetCodexRefresh(codexauth.NewClient(
 		codexauth.WithPerRequestTimeout(codexProviderRequestTimeout),
+		codexauth.WithRefreshTimeout(codexRefreshTimeout),
 	))
 
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
@@ -783,6 +782,9 @@ func run() error {
 		WorkerAffinityGrace:     cfg.WorkerAffinityGrace,
 		WorkerStaleRequeueGrace: cfg.WorkerStaleRequeueGrace,
 		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
+		// PRD #3522: the weekly usage reserve's freshness window for provisionOne's recheck.
+		UsagePollInterval:      cfg.UsagePollInterval,
+		CodexUsagePollInterval: cfg.CodexUsagePollInterval,
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
 		DockerEnabled:       cfg.WorkerDockerEnabled,
@@ -797,6 +799,14 @@ func run() error {
 	})
 
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,
+		sweeper.Pass{
+			Name: "vault_browser_slots_expired",
+			Run: func(ctx context.Context) (int64, error) {
+				return q.DeleteExpiredVaultBrowserSlots(ctx, store.DeleteExpiredVaultBrowserSlotsParams{
+					ObservedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, BatchSize: 256,
+				})
+			},
+		},
 		sweeper.Pass{
 			Name: "hosted_tokens_expired",
 			Run: func(ctx context.Context) (int64, error) {
@@ -929,6 +939,14 @@ func run() error {
 		sweeper.Pass{
 			Name: "held_publication",
 			Run:  wsvc.SweepHeldPublications,
+		},
+		// Prerequisite closure always advances existing rows, regardless of admission knobs.
+		// Its extra share before run liveness is at most a 10s pass plus a 5s in-flight
+		// durable outcome tail (15s), independent of WorkerHeartbeatStale and RunTimeout.
+		// Prior pass costs and the tick cadence add to this; this is no pin-latency promise.
+		sweeper.Pass{
+			Name: "prerequisite_closure",
+			Run:  wsvc.SweepPrerequisiteClosures,
 		},
 		// Stale fetch reservations (PRD #1906 M3): a reservation older than
 		// fetchctl.StaleReservationAge belongs to a fetch whose fetcher crashed or lost its
@@ -1125,10 +1143,13 @@ func run() error {
 	// debounced claimed fan-out is M6). Wired beside the custody-episode reconciler above: a
 	// standalone reconciler with a boot pass then a one-minute ticker.
 	healthSvc := healthsvc.New(healthsvc.Config{
-		WorkerEligibilityForHealth:   wsvc.WorkerEligibilityForHealth,
-		ResidueQuarantine:            wsvc.ResidueQuarantineFor,
-		MemoryAuthorityLost:          wsvc.MemoryAuthorityLostFor,
-		Store:                        q,
+		WorkerEligibilityForHealth: wsvc.WorkerEligibilityForHealth,
+		ResidueQuarantine:          wsvc.ResidueQuarantineFor,
+		MemoryAuthorityLost:        wsvc.MemoryAuthorityLostFor,
+		Store:                      q,
+		MaintenanceReadout: func(ctx context.Context) (store.MaintenanceReadout, error) {
+			return store.ReadMaintenanceReadout(ctx, pool)
+		},
 		Pool:                         pool,
 		DiskFull:                     diskFull,
 		DBStorageCapacityBytes:       cfg.DBStorageCapacityBytes,
@@ -1624,14 +1645,19 @@ func run() error {
 	// the storage work they are blocked in (pool acquire, lock wait, queries), and waits 2 s more
 	// for them to return. So the worst case is 17 s, not the 60 s storage deadline: a generation
 	// holding a pooled connection does not make the deferred pool.Close wait that long. Budget: the
-	// HTTP drain above is up to 10 s, so 10 s + 17 s stays inside the default 30 s Kubernetes
+	// HTTP drain above is up to 10 s; the prerequisite drain runs concurrently for up to 5 s,
+	// so 10 s + max(17 s, 5 s) stays inside the default 30 s Kubernetes
 	// termination grace (the chart sets none). A generation that does not return even then (stuck
 	// outside a context-aware call) is left behind, and is not lost silently: SubmitJobResult
 	// committed a generation_pending refusal row for each generated file with the result, and only
 	// storing the file (or recording its failure) removes it, so an abandoned one (this bound, a
 	// SIGKILL, a crash) stays visible as generation_pending.
-	if !wsvc.DrainGeneratedOutputs() {
+	generatedDrained, prerequisiteErr := drainShutdownWork(wsvc.DrainPrerequisiteClosures, wsvc.DrainGeneratedOutputs)
+	if !generatedDrained {
 		slog.Warn("shutdown: generated job outputs still in flight at the drain deadline")
+	}
+	if prerequisiteErr != nil {
+		slog.Warn("shutdown: prerequisite closures failed to drain", "error", prerequisiteErr)
 	}
 	stop() // cancel ctx so the poller + sweeper + reconciler Run return (covers the server-error path too)
 	bgWG.Wait()
@@ -1642,11 +1668,30 @@ func run() error {
 	return runErr
 }
 
+const prerequisiteShutdownBudget = 5 * time.Second
+
+// drainShutdownWork joins the prerequisite drain alongside the existing generated-output
+// drain. Call after HTTP shutdown and before pool.Close. Each callback owns its bounded
+// drain; an error in one does not prevent joining the other.
+func drainShutdownWork(prerequisiteDrain func(context.Context) error, generatedDrain func() bool) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), prerequisiteShutdownBudget)
+	defer cancel()
+	prerequisiteDone := make(chan error, 1)
+	go func() {
+		prerequisiteDone <- prerequisiteDrain(ctx)
+	}()
+	generatedDrained := generatedDrain()
+	return generatedDrained, <-prerequisiteDone
+}
+
 // gateSubmitter adapts *workersvc.Service to slacksvc.PlanGateSubmitter — the
 // slice the Slack approval gatekeeper needs (read a run, submit an approve/reject
 // input). It drops SubmitInput's result (the gatekeeper only cares whether it
 // succeeded) and keeps slacksvc free of a workersvc import.
-type gateSubmitter struct{ svc *workersvc.Service }
+type gateSubmitter struct {
+	svc *workersvc.Service
+	q   *store.Queries
+}
 
 func (g gateSubmitter) GetRun(ctx context.Context, userID, runID uuid.UUID) (store.Run, error) {
 	return g.svc.GetRun(ctx, userID, runID)
@@ -1765,6 +1810,16 @@ func (g gateSubmitter) CreateChatRun(ctx context.Context, userID uuid.UUID, mess
 // HasOnlineWorker adapts the opener's no-worker check (PRD #191 M6).
 func (g gateSubmitter) HasOnlineWorker(ctx context.Context, userID uuid.UUID) (bool, error) {
 	return g.svc.HasOnlineWorker(ctx, userID)
+}
+
+// MaintenanceNotice adapts the create-time maintenance notice (PRD #3454).
+func (g gateSubmitter) MaintenanceNotice(ctx context.Context) string {
+	st, err := store.ReadInstanceIntakePause(ctx, g.q)
+	if err != nil {
+		slog.Warn("read intake pause for create notice", "error", err)
+		return ""
+	}
+	return store.MaintenanceNoticeText(st)
 }
 
 // EndChat adapts the Slack End-chat button (PRD #191 M6): cancel the live chat, with
@@ -1975,43 +2030,9 @@ func startRunCardMessage(err error) string {
 	}
 }
 
-// seedAdmin provisions the configured admin user if seeding is enabled and no
-// user with that email exists yet. It uses the exact same argon2id hashing as
-// registration and never touches an existing user's password. A concurrent
-// create (unique violation) is treated as "already exists".
-func seedAdmin(ctx context.Context, q *store.Queries, cfg config.Config) error {
-	if cfg.SeedEmail == "" {
-		return nil
-	}
-	if _, err := q.GetUserByEmail(ctx, cfg.SeedEmail); err == nil {
-		slog.Info("seed admin already present, leaving untouched", "email", cfg.SeedEmail)
-		return nil
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("seed admin lookup: %w", err)
-	}
-
-	hash, err := auth.HashPassword(cfg.SeedPassword)
-	if err != nil {
-		return fmt.Errorf("seed admin hash: %w", err)
-	}
-	name := pgtype.Text{}
-	if cfg.SeedName != "" {
-		name = pgtype.Text{String: cfg.SeedName, Valid: true}
-	}
-	if _, err := q.CreateUser(ctx, store.CreateUserParams{
-		Email:        cfg.SeedEmail,
-		PasswordHash: pgtype.Text{String: hash, Valid: true},
-		DisplayName:  name,
-		IsAdmin:      true,
-	}); err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return nil // raced with another creator; the user now exists
-		}
-		return fmt.Errorf("seed admin create: %w", err)
-	}
-	slog.Info("seeded admin user", "email", cfg.SeedEmail)
-	return nil
+// seedAdmin retains the server's boot entry point for the shared production helper.
+func seedAdmin(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) error {
+	return seed.Admin(ctx, pool, cfg)
 }
 
 // stripXFF removes the forwarding headers from every request on the TLS listener

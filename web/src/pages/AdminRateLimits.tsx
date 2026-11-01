@@ -53,7 +53,7 @@ import { maskEmail, maskName } from "../lib/demoMask";
 // name), and the chip stays text-muted (not the mock's faint) so it clears WCAG AA
 // at its small size: it is the only visible window identity a sighted low-vision
 // admin has now that the full column headers are gone.
-type OkWindow = Extract<MyRateLimits, { status: "ok" }>["five_hour"];
+type OkWindow = Extract<MyRateLimits, { status: "ok" }>["seven_day"];
 
 function WindowRow({
   win,
@@ -103,14 +103,16 @@ function UtilizationCell({ token, now }: { token: TokenRateLimits; now: number }
   if (limits.status !== "ok") return <span className="text-faint">—</span>;
   return (
     <div className="flex max-w-[22rem] flex-col gap-2">
-      <WindowRow
-        win={limits.five_hour}
-        chip="5h"
-        label="5-hour window"
-        stale={limits.stale}
-        now={now}
-        forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
-      />
+      {limits.five_hour && (
+        <WindowRow
+          win={limits.five_hour}
+          chip="5h"
+          label="5-hour window"
+          stale={limits.stale}
+          now={now}
+          forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
+        />
+      )}
       <WindowRow
         win={limits.seven_day}
         chip="7d"
@@ -309,7 +311,7 @@ function CodexAdminSection() {
             <tbody className="divide-y divide-edge">
               {rows.flatMap((u) =>
                 u.accounts.map((a, i) => {
-                  const badge = codexStatusBadge(a);
+                  const badge = codexStatusBadge(a, u.vault_mode);
                   return (
                     <tr key={`${u.id}:${a.account_id}`} className="transition-colors hover:bg-raised/30">
                       {i === 0 ? <CodexUserCell user={u} rowSpan={u.accounts.length} /> : null}
@@ -419,7 +421,7 @@ export function AdminRateLimits() {
                         </tr>,
                       ]
                     : u.tokens.map((t, i) => {
-                        const badge = statusBadge(t.limits, u.vault_locked);
+                        const badge = statusBadge(t.limits, u.vault_locked, u.vault_mode);
                         // The mock's absolute "resets <Day HH:MM>" line under the token
                         // name (PRD #310 M3), from the 7-day reset — the weekly quota
                         // users plan around. The map also runs for non-ok tokens (which

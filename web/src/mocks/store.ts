@@ -4,9 +4,10 @@
 // socket is therefore a live cache over this store, exactly like /api/ws is
 // over Postgres, so useRunStream's replay/merge logic runs unmodified.
 
-import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
+import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, VaultMode, WsEvent } from "../lib/api";
 import { seedUnifiedProgress } from "./data/unifiedProgress";
-import { deriveMockProgress } from "./runProgress";
+import { deriveMockProgress, foreignCooldownRun } from "./runProgress";
+import { mockScenario } from "./mockScenario";
 import {
   mockAdmin,
   mockAwaitingMessages,
@@ -52,6 +53,9 @@ export interface MockState {
   // the Lock vault action flips it so the badge, banner, and "waiting for vault
   // unlock" run state are all browsable.
   vaultUnlocked: boolean;
+  vaultMode: VaultMode;
+  // Undefined uses the scenario's initial wrapper presence.
+  vaultExists?: boolean;
 }
 
 // seedRun copies a fixture into the store with status_since defaulted to the fixture's own
@@ -161,6 +165,39 @@ function seed(): MockState {
   for (const r of mockJobRuns) messages.set(r.id, []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
   seedUnifiedProgress(runs, messages);
+  // ?mock=maintenance (PRD #3454): every queued fixture is held back by maintenance mode, as
+  // the server derives queue_reason for a queued, never-claimed run while the pause is on.
+  const maintenance = mockScenario() === "maintenance";
+  if (maintenance) {
+    for (const r of runs.values()) if (r.status === "queued") r.queue_reason = "maintenance";
+  }
+  // ?mock=weekly-reserve (PRD #3522): queued fixtures are held by the weekly usage reserve and
+  // owner-paused fixtures read as parked by it (resuming one records the override).
+  if (mockScenario() === "weekly-reserve") {
+    for (const r of runs.values()) {
+      if (r.status === "queued") {
+        r.queue_reason = "weekly_reserve";
+        r.reserve_hold_reason = "weekly usage reserve: 85% >= 80%";
+      } else if (r.status === "paused" && !r.hold_reason) {
+        r.hold_reason = "weekly_reserve";
+      }
+    }
+  }
+  // ?mock=account-cooldown: owner wait, foreign redaction and an independent wall warning.
+  if (mockScenario() === "account-cooldown") {
+    for (const id of ["run-live", "run-mira-embed", "run-stalled"]) {
+      const r = runs.get(id);
+      if (!r) continue;
+      r.harness = "codex";
+      r.model = null;
+      r.health = id === "run-stalled" ? "slow" : "waiting_account_cooldown";
+      r.account_cooldown_class = id === "run-live" ? "rate_limit" : "overload";
+      r.account_cooldown_eligible_at = new Date(Date.now() + 300_037).toISOString();
+      r.health_reason = id === "run-stalled" ? "near timeout" : "waiting for account cooldown";
+      if (id === "run-stalled") r.deadline_at = new Date(Date.now() + 60_000).toISOString();
+      r.progress = deriveMockProgress(r);
+    }
+  }
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });
   const boards = new Map<string, Board>();
@@ -173,9 +210,20 @@ function seed(): MockState {
         latest_run: c.latest_run ? {
           ...c.latest_run,
           auto_approve_blocked_reasons: c.latest_run.auto_approve_blocked_reasons ?? [],
+          ...(maintenance && c.latest_run.status === "queued" ? { queue_reason: "maintenance" as const } : {}),
         } : null,
       })),
     });
+  }
+  if (mockScenario() === "account-cooldown") {
+    for (const board of boards.values()) for (const card of board.cards) {
+      const r = card.latest_run && runs.get(card.latest_run.id);
+      if (!r?.account_cooldown_class || !card.latest_run) continue;
+      const projected = card.latest_run.is_mine ? r : foreignCooldownRun(r);
+      card.latest_run = { ...card.latest_run, health: projected.health, health_reason: null,
+        ...(card.latest_run.is_mine ? { account_cooldown_class: r.account_cooldown_class,
+          account_cooldown_eligible_at: r.account_cooldown_eligible_at } : {}) };
+    }
   }
   // Auth is instant/fake in mock mode: the session starts signed in as admin so
   // the whole app is browsable with zero steps. Logout still works (and any
@@ -188,10 +236,23 @@ function seed(): MockState {
     boardPrefs: new Map<string, BoardPrefs>(),
     proposals,
     vaultUnlocked: true,
+    vaultMode: "protected",
   };
 }
 
 export const state: MockState = seed();
+
+// Material-only projection: policy remains owned by mockApi/settings.ts.
+// Read on demand so store initialization never depends on a scenario or domain.
+export function mockVaultMaterial(passwordless: boolean) {
+  const mode = state.vaultMode;
+  const exists = state.vaultExists ?? !passwordless;
+  return {
+    mode,
+    exists,
+    unlocked: mode === "protected" && exists && state.vaultUnlocked,
+  };
+}
 
 // ── Event bus (one channel per run, like the WS hub) ─────────────────────────
 
@@ -268,6 +329,12 @@ const CARD_MIRRORED_FIELDS = [
   "health_reason",
   "health_since",
   "deadline_at",
+  // PRD #3454: the maintenance queue reason rides the card so the board badge agrees.
+  "queue_reason",
+  "account_cooldown_class",
+  "account_cooldown_eligible_at",
+  "codex_admission_class",
+  "codex_admission_eligible_at",
   // PRD #1732 D14: the board projection sends hold_reason on every card, so a run parked
   // on (or released from) credential_disabled flips the card's badge along with its status.
   "hold_reason",
@@ -326,6 +393,19 @@ function syncCards(runId: string, patch: Partial<Run>): void {
       const merged = { ...card.latest_run, updated_at: new Date().toISOString() };
       for (const key of CARD_MIRRORED_FIELDS) {
         if (key in patch) (merged as Record<string, unknown>)[key] = patch[key];
+      }
+      if (!merged.is_mine) {
+        const run = state.runs.get(runId);
+        if (run) {
+          const projected = foreignCooldownRun(run);
+          merged.health = projected.health;
+        }
+        delete merged.account_cooldown_class;
+        delete merged.account_cooldown_eligible_at;
+        delete merged.codex_admission_class;
+        delete merged.codex_admission_eligible_at;
+        if (merged.queue_reason !== "maintenance") delete merged.queue_reason;
+        merged.health_reason = null;
       }
       card.latest_run = merged;
     }

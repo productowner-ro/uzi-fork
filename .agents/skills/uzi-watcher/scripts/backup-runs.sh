@@ -31,6 +31,17 @@
 # writes the stopped-source marker uzi-stopped.<runId>.entry); that marker, when it
 # names THIS run, branch, key and the key's exact canonical path, makes the canonical
 # dir a retained candidate (never journal-current, and never an attempt dir).
+# A journal (plain or protected descriptor) may carry an optional completionSourceFence
+# {version:1, sourceUseEpoch: UUID, sourceCoreDigest: 64 lowercase hex} (issue #3404): the protected
+# descriptor validator accepts exactly that shape and refuses any other value; the fence grants no
+# attribution of its own.
+# A journal may also carry an optional memoryPark record (issue #3638), the worker's cooperative memory-park
+# record: exactly {version:1, binding:{runId,claimGeneration,workerId,registerNonce,memoryEpisode},
+# ack:"confirmed"|"sent_unconfirmed"|"not_sent", origin:{flightId,attemptId|null,executorIncarnation|null,
+# authorityIncarnation,sourceEpoch}, settlement?:{version:1,confirmed,sources:[1..16 sorted unique {path,authorityKey,
+# attemptId|null,epoch,seq}],evidence:{parkAck (= binding),interventionIds (<=64),processJoin,commands,steering,
+# auxiliaries,feedback,sinkReceipts,parkReap}}} (settlement only with ack "confirmed"). The protected descriptor
+# validator accepts exactly that v1 shape and refuses anything else; the record grants no attribution of its own.
 # .uzi-residue-* / .uzi-skills-* siblings are never candidates. The host resolves the concrete dir and passes it to the capture.
 #
 # For each run id it resolves worker_id -> pod FRESH each call (so it survives a
@@ -558,11 +569,12 @@ select_clone(){
         and (if has("restoreTip") then (.restoreTip | sha) else true end);
       def same($s): .runId == $s.runId and .clonePath == $s.clonePath and .attemptId == $s.attemptId;
       def progress:
-        type == "object" and fields(["version","source","attempts","startedAt","deadline","claimGeneration","backoffMs","stage","restoreTip","successor","blocker"])
+        type == "object" and fields(["version","source","attempts","startedAt","deadline","claimGeneration","episode","backoffMs","stage","restoreTip","successor","blocker"])
         and .version == 1 and (.source | src)
         and (.attempts | integer) and .attempts >= 1 and .attempts <= 3
         and (.startedAt | integer) and (.deadline | integer) and .deadline == .startedAt + 300000
         and (if has("claimGeneration") then (.claimGeneration | integer) and .claimGeneration >= 1 else true end)
+        and (if has("episode") then (.episode | integer) else true end)
         and (.backoffMs | integer) and .backoffMs <= 480000
         and (.stage as $s | ["capturing","captured","adopting","ready-for-model","blocked"] | index($s) != null)
         and (if has("restoreTip") then (.restoreTip | sha) else true end)
@@ -571,13 +583,57 @@ select_clone(){
         and (if .stage == "blocked" then has("blocker") else true end)
         and (if .stage == "captured" or .stage == "adopting" or .stage == "ready-for-model" then has("restoreTip") else true end)
         and (if .stage == "ready-for-model" then has("successor") else true end);
+      def uuid: type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+      def fence:
+        type == "object" and (keys == ["sourceCoreDigest","sourceUseEpoch","version"])
+        and .version == 1 and (.sourceUseEpoch | uuid)
+        and (.sourceCoreDigest | type == "string" and test("^[0-9a-f]{64}$"));
+      def hex64: type == "string" and test("^[0-9a-f]{64}$");
+      def mpid($min; $max): type == "string" and length >= $min and length <= $max and (contains("\u0000") | not);
+      def mpbinding:
+        type == "object" and (keys == ["claimGeneration","memoryEpisode","registerNonce","runId","workerId"])
+        and (.runId | mpid(1; 128)) and (.claimGeneration | integer) and .claimGeneration >= 1
+        and (.memoryEpisode | integer) and (.workerId | mpid(1; 128)) and (.registerNonce | mpid(1; 256));
+      def mpsource:
+        type == "object" and (keys == ["attemptId","authorityKey","epoch","path","seq"])
+        and (.path | mpid(1; 4096) and startswith("/") and (split("/")[1:] | all(.[]; length > 0 and . != "." and . != "..")))
+        and (.authorityKey | hex64) and (.attemptId == null or (.attemptId | aid))
+        and (.epoch | uuid) and (.seq | integer) and .seq >= 1;
+      def mpevidence($b):
+        type == "object"
+        and (keys == ["auxiliaries","commands","feedback","interventionIds","parkAck","parkReap","processJoin","sinkReceipts","steering"])
+        and (.parkAck | mpbinding) and .parkAck == $b
+        and (.interventionIds | type == "array" and length <= 64 and all(.[]; mpid(1; 128))
+             and ((unique | length) == length))
+        and (.processJoin | IN("executor","codex_disposal")) and (.commands | IN("confirmed","not_required"))
+        and .steering == "joined" and (.auxiliaries | IN("joined","none")) and .feedback == "drained"
+        and .sinkReceipts == "joined" and (.parkReap | IN("complete","not_applicable"));
+      def mpsettlement($b):
+        type == "object" and (keys == ["confirmed","evidence","sources","version"])
+        and .version == 1 and (.confirmed | type == "boolean")
+        and (.sources | type == "array" and length >= 1 and length <= 16 and all(.[]; mpsource)
+             and (map(.path) as $p | $p == ($p | sort) and (($p | unique | length) == ($p | length)))
+             and ((map(.authorityKey) | unique | length) == length))
+        and (.evidence | mpevidence($b));
+      def memorypark($rid):
+        . as $m | type == "object" and ((keys - ["settlement"]) == ["ack","binding","origin","version"])
+        and .version == 1 and (.binding | mpbinding) and .binding.runId == $rid
+        and (.ack | IN("confirmed","sent_unconfirmed","not_sent"))
+        and (.origin | type == "object"
+             and (keys == ["attemptId","authorityIncarnation","executorIncarnation","flightId","sourceEpoch"])
+             and (.flightId | uuid) and (.attemptId == null or (.attemptId | aid))
+             and (.executorIncarnation == null or (.executorIncarnation | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")))
+             and (.authorityIncarnation | uuid) and (.sourceEpoch | uuid))
+        and (if has("settlement") then .ack == "confirmed" and (.settlement | mpsettlement($m.binding)) else true end);
       def journal:
-        . as $j | type == "object" and fields(["runId","clonePath","attemptId","restoreTip","recovery","retainedSources","peeledMarkers"])
+        . as $j | type == "object" and fields(["runId","clonePath","attemptId","restoreTip","recovery","retainedSources","peeledMarkers","memoryPark","completionSourceFence"])
         and ({runId,clonePath} + (if has("attemptId") then {attemptId} else {} end)
           + (if has("restoreTip") then {restoreTip} else {} end) | src)
         and (if has("retainedSources") then (.retainedSources | type) == "array" and all(.retainedSources[]; src) else true end)
         and (if has("peeledMarkers") then (.peeledMarkers | type) == "array" and (.peeledMarkers | length) <= 64
              and all(.peeledMarkers[]; sha) and ((.peeledMarkers | unique | length) == (.peeledMarkers | length)) else true end)
+        and (if has("completionSourceFence") then (.completionSourceFence | fence) else true end)
+        and (if has("memoryPark") then (.memoryPark | memorypark($j.runId)) else true end)
         and (if has("recovery") then
           (.recovery | progress) and
           (same(.recovery.source) or any((.retainedSources // [])[]; same($j)) or
@@ -636,6 +692,7 @@ select_clone(){
         and .recovery.attempts >= 1 and .recovery.attempts <= 3
         and .recovery.deadline == .recovery.startedAt + 300000
         and (.recovery | if has("claimGeneration") then (.claimGeneration | integer) and .claimGeneration >= 1 else true end)
+        and (.recovery | if has("episode") then (.episode | integer) else true end)
         and .recovery.backoffMs >= 0 and .recovery.backoffMs <= 480000
         and (.recovery.source | source)))
       | [., (.retainedSources // [])[], .recovery.source // empty, .recovery.successor // empty]

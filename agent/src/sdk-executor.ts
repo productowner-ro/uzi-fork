@@ -42,6 +42,8 @@ import type {
 import { buildCIEvidenceServer, CI_EVIDENCE_SERVER, ciEvidencePrompt, withCIEvidenceAgents } from "./ci-evidence-tools.js";
 import type { Executor, ExecutorResult, RunContext, WallParkOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
+import { resolveLeadRequest, type LeadRequest, type PhaseEntry } from "./lead-config-report.js";
+import { toLeadObservation } from "./runtime-observation.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { startDepsInstall, reportDepsInstall, safeDirLabel } from "./js-deps-provision.js";
 import { makeProgressObserver } from "./milestone-progress-observer.js";
@@ -246,27 +248,36 @@ const EMPTY_TURN_BACKOFF_SLICE_MS = 250;
  *    transient provider error that persisted, or (issue #3179) a stream that ended with no
  *    events and no terminal at all;
  *  - the Codex lane, `CodexExecutor.driveTurnWithWallPark` (issue #2099): a turn that kept
- *    failing with a transient provider classification after its bounded same-thread retries.
+ *    failing with a transient provider classification after its bounded same-thread retries,
+ *    or an eligible measured idle turn: zero model-processing evidence (#3462, #3466),
+ *    or productive evidence under the negotiated Codex idle-stall contract.
+ *    Human revision silence is consumed by its in-flight driver, never the ordinary recovery park.
  *
- * This is NEVER thrown for a genuine wall/idle/cancel/pause interruption (those keep their
- * existing terminal/cancelled/paused outcome) nor, on the Claude lane, for a turn that RAN but
+ * Except for eligible measured Codex idle, wall/idle/cancel/pause interruptions keep their
+ * existing terminal/cancelled/paused outcome. It is never thrown on the Claude lane for a turn that RAN but
  * did not submit a plan (that stays REASON_NO_PLAN). A distinct typed error is what lets the
  * runner catch route it to the non-terminal park instead of the generic failure path.
  */
 export class TransientRecoveryError extends Error {
-  /** PRD #1733: true only when the FINAL in-process attempt failed with a transient provider
-   *  error. The runner types the recovery_wait park `provider_outage` from this alone; the
+  /** PRD #1733: true when the final attempt failed with a transient provider error, or
+   *  measured zero-evidence Codex idle retained a transient provider retry. The runner types the recovery_wait park `provider_outage` from this alone; the
    *  empty-turn and gate-recovery throws stay unmarked. */
   public readonly providerOrigin: boolean;
+  /** Measured Codex idle provenance; may coexist with providerOrigin for revision recovery. */
+  public readonly idleStallKind?: "zero_evidence" | "productive";
+  /** Original idle trip retained by identity for unsupported revision recovery. */
+  public readonly originalIdle?: Error;
   /** Session resolved by the final failed attempt; undefined means resume no session. */
   public readonly sessionId?: string;
   constructor(
     message = "the model returned a positively-empty result (0 turns, no activity) after bounded in-process retries",
-    opts: { providerOrigin?: boolean; sessionId?: string } = {},
+    opts: { providerOrigin?: boolean; sessionId?: string; idleStallKind?: "zero_evidence" | "productive"; originalIdle?: Error } = {},
   ) {
     super(message);
     this.name = "TransientRecoveryError";
     this.providerOrigin = opts.providerOrigin === true;
+    this.idleStallKind = opts.idleStallKind;
+    this.originalIdle = opts.originalIdle;
     this.sessionId = opts.sessionId;
   }
 }
@@ -770,6 +781,12 @@ function unansweredPrompt(questions: AskUserQuestion[]): string {
  *  The first-truthy-session-id latch moved into the per-run reducer (harness-
  *  reducer.ts); the owner delivers ctx.onSessionId from its `firstSessionId`. */
 interface RunDrive {
+  /** PRD #3244: the lead's requested model/effort, the same value the SDK options were built from;
+   *  reported through ctx.leadConfig at each lead phase entry. */
+  leadRequest: LeadRequest;
+  /** PRD #3244 M2: the phase entries whose first turn already carried the runtime-config callback
+   *  ("phase:entry"); a later turn of the same entry (revise round, re-drive) does not get one. */
+  observedEntries?: Set<string>;
   refreshCodeCrossCheckTools?: () => Promise<void>;
   tripReason?: string;
   /** Issue #2471: the exact error a memory-authority trip carries (the runner's stop, or an
@@ -1678,10 +1695,16 @@ export class SdkExecutor implements Executor {
     // an explicit key), so an unset model falls back to the SDK/account default.
     // Computed HERE (before the plan-turn copy at planTurnSubagents) so the PRD #305
     // own-roster override below can run against the same value the lead uses.
-    const leadModel = resolveLeadModel(
-      ctx.config?.default_model,
-      assembled.leadModel,
-    );
+    //
+    // PRD #3244: one LeadRequest per run (equal for both phases in this unit). The model/effort
+    // sent below and the lead-config row reported at each phase entry come from this one value.
+    const leadRequest = resolveLeadRequest({
+      harness: "claude",
+      phase: "implement",
+      config: ctx.config,
+      ...(assembled.leadModel !== undefined ? { templateModel: assembled.leadModel } : {}),
+    });
+    const leadModel = leadRequest.model;
     // PRD #305: apply the run's model to every OWN subagent now, before planTurnSubagents
     // copies them and before the own-source implement path reuses them, so both the plan
     // turn and an own-source implement follow the lead model. The repo roster is built
@@ -1950,7 +1973,7 @@ export class SdkExecutor implements Executor {
     // now populates effort with the owner's choice or the uzi default `medium` for an
     // inheriting owner (issue #1157). Both reach the implement turn too, via the
     // `baseConfig` spread.
-    const effort = ctx.config?.default_effort;
+    const effort = leadRequest.effort;
     const baseConfig: ClaudeTurnConfig = {
       cwd: ctx.worktreePath,
       env: env as unknown as Record<string, string | undefined>,
@@ -1988,6 +2011,7 @@ export class SdkExecutor implements Executor {
     // it. This replaced the applied-once `wallScaled` latch, which swallowed a second bump.
     let maxServedWallMs = initialWallMs;
     const state: RunDrive = {
+      leadRequest,
       currentChild: {},
       wallRemainingMs: initialWallMs,
       ...(ctx.codeCrossCheckGate && ctx.codeCrossCheckRepairActive && ctx.codeCrossCheckRepair && ctx.reportCrossCheckDispositions && ctx.claimGeneration ? {
@@ -4441,12 +4465,10 @@ export class SdkExecutor implements Executor {
       if (isIssueRun && depsTruncated) {
         result.gatesDiscoveryTruncated = true;
       }
-      // issue #279: forward the report-only declaration + captured summary on `issue` runs
-      // only, with the SAME OMITTED-not-undefined discipline as prdDonePath above — the keys
-      // are absent unless the lead actually declared them, so an ordinary push+MR completion
-      // is byte-identical to before and every existing deepStrictEqual on this result holds.
+      // Forward report-only on issue runs and captured summaries on issue and prompt runs.
+      // Omit each key unless the lead declared it, as with prdDonePath above.
       if (isIssueRun && declaredReportOnly) result.reportOnly = true;
-      if (isIssueRun && declaredSummary !== undefined) {
+      if ((isIssueRun || resolveRunKind(ctx.kind) === "prompt") && declaredSummary !== undefined) {
         result.summary = declaredSummary;
       }
       // PRD #929 M2: forward the declared proposal. NOT gated on isIssueRun — it is the
@@ -4887,6 +4909,35 @@ export class SdkExecutor implements Executor {
     const resumableSessionId = (): string | undefined =>
       initSessionId ?? turnSessionId ?? (freshInit ? undefined : resumeId);
 
+    // PRD #3244: record the lead's requested config for this phase before the turn starts. A new
+    // entry only on a phase change (a re-driven turn of the same phase is a no-op); bounded to 3 s
+    // inside the reporter, which never throws. A trip that landed meanwhile still wins below.
+    // An inactive or disabled reporter gets no entry and hands the harness no probe callback.
+    let onRuntimeConfig: RunTurnRequest["onRuntimeConfig"];
+    let markObserved: (() => void) | undefined;
+    if (ctx.leadConfig?.enabled) {
+      const reporter = ctx.leadConfig;
+      const entry: PhaseEntry = await reporter.enterPhase(phase, state.leadRequest);
+      // PRD #3244 M2: only the first turn of a phase entry asks the runtime for its config, so the
+      // single settings probe runs at most once per entry. The callback never throws into the turn.
+      const key = `${entry.phase}:${entry.entry}`;
+      const seen = (state.observedEntries ??= new Set<string>());
+      if (!seen.has(key)) {
+        // The key is spent when the lead init arrives (below), not when the callback is handed over:
+        // a turn that yields no init and is retried keeps its chance, and a later turn of the entry
+        // cannot start a second probe while the first turn's probe is still settling.
+        markObserved = () => seen.add(key);
+        onRuntimeConfig = (obs) => {
+          seen.add(key);
+          try {
+            reporter.observe(entry, toLeadObservation(obs));
+          } catch {
+            /* an observation is best-effort and never reaches the turn */
+          }
+        };
+      }
+      if (state.tripReason) throw this.tripError(state);
+    }
     this.armWall(state);
     // Budget already spent by earlier turns → fail now rather than run unbounded.
     if (state.tripReason) throw this.tripError(state);
@@ -4937,6 +4988,7 @@ export class SdkExecutor implements Executor {
         phase,
         agents: {},
         leadSkills: [],
+        ...(onRuntimeConfig ? { onRuntimeConfig } : {}),
       };
       const turn = this.harness.startTurn(request);
       for await (const event of turn.events) {
@@ -4963,6 +5015,7 @@ export class SdkExecutor implements Executor {
         }
         armIdle(); // any event is liveness when no tool is outstanding
         if (event.kind === "initialized") {
+          markObserved?.();
           if (event.sessionId) initSessionId = event.sessionId;
           if (event.freshSession === true) freshInit = true;
         } else if (event.sessionId && !(event.kind === "frame" && event.origin.kind === "subagent")) {
@@ -5690,23 +5743,6 @@ function planMaxRevisionsOf(config: ClaimConfig | null | undefined): number {
   if (typeof v === "number" && Number.isFinite(v) && v >= 0)
     return Math.floor(v);
   return DEFAULT_MAX_REVISIONS;
-}
-
-/**
- * Resolve the model for the lead/main thread (PRD #17 Decision 6): the run
- * owner's per-user default (`config.default_model`) wins over the lead template's
- * model. A blank config model falls back to the template (|| not ??), so a
- * defensively empty string can't blank out the template's model — in practice
- * the server sends NULL (omitted), never "". Returns undefined when nothing
- * resolves, so the caller omits the SDK `model` key entirely rather than sending
- * an explicit empty override (an unset model falls back to the SDK/account
- * default). Null-model subagents follow the main thread, so this governs them too.
- */
-export function resolveLeadModel(
-  configModel?: string,
-  templateModel?: string,
-): string | undefined {
-  return configModel || templateModel || undefined;
 }
 
 /**

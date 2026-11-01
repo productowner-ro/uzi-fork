@@ -29,11 +29,14 @@ import {
   RecoveryWaitPanel,
   MrReworkPanel,
   PausedPanel,
+  ReserveExemptLine,
+  pauseRequestedLabel,
   RunView,
   RunSummary,
   derivePlanRevision,
 } from "./RunView";
 import { useRunStream } from "../lib/useRunStream";
+import { useMaintenance } from "../lib/useMaintenance";
 import { useAuth } from "../auth/AuthContext";
 // ?raw rather than node:fs — the web tsconfig has no node types, and this repo
 // already makes the same choice for the same reason in WorkerUpgradeBadge.test.tsx
@@ -128,6 +131,11 @@ const mockApi = vi.mocked(api);
 // directly (the real hook opens a websocket). useRunStream is used ONLY by RunView, so
 // this mock does not touch the sub-component tests above.
 vi.mock("../lib/useRunStream", () => ({ useRunStream: vi.fn() }));
+// PRD #3454: the shared maintenance state, defaulting to "no provider" (status null) so every
+// existing case renders as before; the maintenance HealthFlag cases set a reason.
+vi.mock("../lib/useMaintenance", () => ({
+  useMaintenance: vi.fn(() => ({ status: null, reload: () => {} })),
+}));
 const mockUseRunStream = vi.mocked(useRunStream);
 
 // Issue #1766: the vault_locked park body reads the VIEWER's vault state off useAuth (the
@@ -1393,6 +1401,55 @@ describe("RunStopReason — the operator's cancel reason (#525, text channel)", 
   });
 });
 
+it("HealthFlag renders manual attribution as escaped single-cell text", () => {
+  const { container, rerender } = render(<HealthFlag run={run({
+    status: "queued", health: "waiting_worker",
+    health_reason: "waiting for workers cordoned (manual): Ada (uuid) 2026-10-21T12:00:00Z\n\t\u001b[31m<b>disk</b>\u001b[0m\u001b]0;hidden\u001b\\\u202e 🚀",
+  })} />);
+  expect(container.textContent).toContain(
+    "waiting for workers cordoned (manual): Ada (uuid) 2026-10-21T12:00:00Z<b>disk</b> 🚀",
+  );
+  expect(container.textContent).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+  expect(container.querySelector("b")).toBeNull();
+  rerender(<HealthFlag run={run({ status: "queued", health: "waiting_worker", health_reason: {} as string })} />);
+  expect(container.textContent).not.toContain("[object Object]");
+});
+
+describe("HealthFlag — maintenance queue reason (PRD #3454)", () => {
+  const held = { status: "queued" as const, queue_reason: "maintenance" as const, health: "waiting_worker" as const,
+    health_since: "2026-10-25T12:00:00Z", health_reason: "waiting for a worker to pick up this run" };
+
+  it("replaces the waiting-for-worker flag with the maintenance line", () => {
+    const { container } = render(<HealthFlag run={run(held)} />);
+    const pill = container.querySelector('[data-queue-reason="maintenance"]')!;
+    expect(pill.textContent).toBe("waiting: uzi is in maintenance mode");
+    expect(container.textContent).not.toContain("waiting for worker");
+    expect(container.textContent).not.toContain("stuck for");
+    expect(container.querySelector('[role="status"]')!.textContent).toBe("waiting: uzi is in maintenance mode");
+  });
+
+  it("appends the maintenance reason from the shared state", () => {
+    vi.mocked(useMaintenance).mockReturnValue({
+      status: { active: true, since: null, reason: "Node pool upgrade\u202e" },
+      reload: () => {},
+    });
+    try {
+      const { container } = render(<HealthFlag run={run(held)} />);
+      expect(container.querySelector('[data-queue-reason="maintenance"]')!.textContent).toBe(
+        "waiting: uzi is in maintenance mode (Node pool upgrade)",
+      );
+    } finally {
+      vi.mocked(useMaintenance).mockReturnValue({ status: null, reload: () => {} });
+    }
+  });
+
+  it("leaves a plain queued run's waiting-for-worker flag alone", () => {
+    const { container } = render(<HealthFlag run={run({ ...held, queue_reason: null })} />);
+    expect(container.querySelector('[data-queue-reason="maintenance"]')).toBeNull();
+    expect(container.textContent).toContain("waiting for worker");
+  });
+});
+
 describe("HealthFlag — the health reason (#124, text channel)", () => {
   it("strips bidi/zero-width characters out of the rendered reason", () => {
     const { container } = render(
@@ -1583,12 +1640,13 @@ describe("RunCompletedLine — the declared PRD-completion move (issue #150)", (
   });
 });
 
-// PRD #300: the frozen per-schedule model is shown in the STATUS-INDEPENDENT header
-// metadata row (a Badge), not in the completed-hero line — a wrong/typo'd model must be
-// visible on a FAILED or stopped run too (Risks / SC6). These render the whole page
-// (useRunStream mocked) so the header badge is exercised where it actually lives.
-describe("RunView header — the frozen per-schedule model badge (PRD #300)", () => {
-  const MODEL_BADGE_TITLE = "Model this run was fired with (frozen by its schedule)";
+// PRD #300 / PRD #3244: the lead chip (the schedule-frozen model, now rules 2 and 3 of the lead
+// display) sits in the STATUS-INDEPENDENT header metadata row, not in the completed-hero line —
+// a wrong/typo'd model must be visible on a FAILED or stopped run too (Risks / SC6). These render
+// the whole page (useRunStream mocked) so the header chip is exercised where it actually lives.
+describe("RunView header — the lead chip (PRD #3244 rules 2 and 3; PRD #300 schedule model)", () => {
+  const FOOTER = "This is the lead agent; subagents with their own pin may differ.";
+  const NO_ROWS = { applicable: true, claim_generation: 0, current: true, phases: [] };
 
   function renderPage(over: Partial<Run>) {
     mockUseRunStream.mockReturnValue({
@@ -1609,38 +1667,207 @@ describe("RunView header — the frozen per-schedule model badge (PRD #300)", ()
     );
   }
 
-  it("shows the model badge on a COMPLETED run", async () => {
-    const { container } = renderPage({
-      status: "completed",
-      model: "fable",
-      branch: "agent/issue-87",
-      mr_iid: 42,
-      mr_state: "merged",
-    });
-    expect(await screen.findByTitle(MODEL_BADGE_TITLE)).toBeTruthy();
-    expect(container.textContent).toContain("model fable");
+  // Rule 2: queued with a schedule pin.
+  it("shows the schedule-pinned model on a QUEUED run, labelled 'fixed by schedule'", async () => {
+    const { container } = renderPage({ status: "queued", harness: "codex", model: "gpt-6-astra", lead_config: NO_ROWS });
+    const chip = await screen.findByText("lead: gpt-6-astra · effort resolves at claim");
+    expect(chip.getAttribute("title")).toBe(`gpt-6-astra: fixed by schedule\n${FOOTER}`);
+    expect(chip.getAttribute("aria-label")).toContain("lead: gpt-6-astra · effort resolves at claim");
+    expect(chip.getAttribute("aria-label")).toContain("gpt-6-astra: fixed by schedule");
+    expect(chip.getAttribute("tabindex")).toBe("0");
     // The old completed-hero "Model <code>…</code>." clause is gone — no double render.
-    expect(container.textContent).not.toContain("Model fable");
+    expect(container.textContent).not.toContain("Model gpt-6-astra");
   });
 
-  it("shows the model badge on a FAILED run — the whole point of the header placement (SC6)", async () => {
-    const { container } = renderPage({ status: "failed", model: "fable", failure_reason: "boom" });
-    expect(await screen.findByTitle(MODEL_BADGE_TITLE)).toBeTruthy();
-    expect(container.textContent).toContain("model fable");
+  // The pre-claim chip is muted; a claimed run's chip carries the normal foreground.
+  it("mutes the lead chip while queued and not once claimed", async () => {
+    const queued = renderPage({ status: "queued", model: "gpt-6-astra", lead_config: NO_ROWS });
+    const preChip = await screen.findByText("lead: gpt-6-astra · effort resolves at claim");
+    expect(preChip.classList.contains("text-faint")).toBe(true);
+    expect(preChip.classList.contains("text-neutral-fg")).toBe(false);
+    queued.unmount();
+
+    renderPage({ status: "failed", model: "gpt-6-astra", failure_reason: "boom", lead_config: NO_ROWS });
+    const claimedChip = await screen.findByText("lead: not recorded");
+    expect(claimedChip.classList.contains("text-neutral-fg")).toBe(true);
+    expect(claimedChip.classList.contains("text-faint")).toBe(false);
+  });
+
+  // Rule 3: claimed, lead lane, no rows — still shows the create-time value (PRD #300 SC6).
+  it("shows 'lead: not recorded' plus the create-time model on a FAILED claimed run (SC6)", async () => {
+    const { container } = renderPage({
+      status: "failed",
+      harness: "codex",
+      model: "gpt-6-astra",
+      failure_reason: "boom",
+      lead_config: NO_ROWS,
+    });
+    const chip = await screen.findByText("lead: not recorded");
+    expect(chip.getAttribute("title")).toContain("gpt-6-astra: fixed by schedule");
+    expect(chip.getAttribute("title")).toContain("the worker did not record it");
+    expect(container.textContent).not.toContain("gpt-6-astra · ");
   });
 
   it("strips format characters from the model value, like the other header metadata", async () => {
     const injected = `cl${String.fromCodePoint(0x202e)}aude`;
-    const { container } = renderPage({ status: "failed", model: injected });
-    expect(await screen.findByTitle(MODEL_BADGE_TITLE)).toBeTruthy();
+    const { container } = renderPage({ status: "queued", model: injected, lead_config: NO_ROWS });
+    const chip = await screen.findByText("lead: claude · effort resolves at claim");
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(chip.getAttribute("title") ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(chip.getAttribute("aria-label") ?? "").not.toMatch(/[\p{Cf}]/u);
   });
 
-  it("shows no model badge when the run inherited (model null)", async () => {
-    renderPage({ status: "failed", model: null });
-    // Wait for the page to settle (RunHeading renders the issue title synchronously).
+  it("shows the unresolved form on a queued run that inherited (model null)", async () => {
+    renderPage({ status: "queued", model: null, lead_config: NO_ROWS });
+    expect(await screen.findByText("lead: model and effort resolve at claim")).toBeTruthy();
+  });
+
+  // Rule 1: no lead_config (not a lead-lane run) — no chip, header unchanged.
+  it("shows no chip for a run without lead_config", async () => {
+    const { container } = renderPage({ status: "failed", model: "fable", lead_config: undefined });
     await screen.findByText("Add rate limiting");
-    expect(screen.queryByTitle(MODEL_BADGE_TITLE)).toBeNull();
+    expect(container.textContent).not.toContain("lead:");
+  });
+
+  // Bug-shaped regression (PRD #3244): a default-model Claude run has run.model = null, so the
+  // old badge (keyed off run.model) rendered nothing even though the claim fixed opus / medium.
+  it("regression: a claimed default-model Claude run shows the 'lead: opus · medium' chip", async () => {
+    renderPage({
+      status: "running",
+      harness: "claude",
+      model: null,
+      lead_config: {
+        applicable: true,
+        claim_generation: 1,
+        current: true,
+        phases: [
+          {
+            phase: "implement",
+            phase_entry: 1,
+            seq: 1,
+            harness: "claude",
+            requested_model: "opus",
+            requested_model_source: "user_default",
+            requested_model_fixed_at: "claim",
+            requested_effort: "medium",
+            requested_effort_mode: "explicit",
+            requested_effort_source: "builtin",
+            requested_effort_fixed_at: "claim",
+            observed_model: null,
+            observed_model_evidence: null,
+            observed_effort: null,
+            observed_effort_evidence: null,
+            truncated: false,
+            reported_at: "2026-10-29T10:00:00Z",
+          },
+        ],
+      },
+    });
+    const chip = await screen.findByText("lead: opus · medium");
+    expect(chip.getAttribute("title")).toContain("opus: your Claude default");
+    expect(chip.getAttribute("title")).toContain("medium: built-in");
+  });
+
+  function phase(over: Record<string, unknown>) {
+    return {
+      phase: "implement",
+      phase_entry: 1,
+      seq: 1,
+      harness: "codex",
+      requested_model: null,
+      requested_model_source: "builtin",
+      requested_model_fixed_at: "claim",
+      requested_effort: null,
+      requested_effort_mode: "explicit",
+      requested_effort_source: "builtin",
+      requested_effort_fixed_at: "claim",
+      observed_model: null,
+      observed_model_evidence: null,
+      observed_effort: null,
+      observed_effort_evidence: null,
+      truncated: false,
+      reported_at: "2026-10-29T10:00:00Z",
+      ...over,
+    };
+  }
+
+  it("claimed schedule-pinned Codex run: chip 'lead: gpt-6-astra · high' with schedule and user effort sources", async () => {
+    renderPage({
+      status: "running",
+      harness: "codex",
+      model: "gpt-6-astra",
+      lead_config: {
+        applicable: true,
+        claim_generation: 1,
+        current: true,
+        phases: [
+          phase({
+            requested_model: "gpt-6-astra",
+            requested_model_source: "schedule_pin",
+            requested_effort: "high",
+            requested_effort_source: "user_default",
+          }),
+        ],
+      },
+    } as Partial<Run>);
+    const chip = await screen.findByText("lead: gpt-6-astra · high");
+    expect(chip.getAttribute("title")).toContain("gpt-6-astra: fixed by schedule");
+    expect(chip.getAttribute("title")).toContain("high: your Codex effort");
+  });
+
+  it("claimed template-fallback Claude run: tooltip says 'opus: lead template'", async () => {
+    renderPage({
+      status: "running",
+      harness: "claude",
+      model: null,
+      lead_config: {
+        applicable: true,
+        claim_generation: 1,
+        current: true,
+        phases: [
+          phase({
+            harness: "claude",
+            requested_model: "opus",
+            requested_model_source: "template",
+            requested_effort: "medium",
+            requested_effort_source: "builtin",
+          }),
+        ],
+      },
+    } as Partial<Run>);
+    const chip = await screen.findByText("lead: opus · medium");
+    expect(chip.getAttribute("title")).toContain("opus: lead template");
+  });
+
+  // PRD #3244 M2: the runtime reported a level that differs from the request.
+  it("claimed run whose runtime reported 'high' against a requested 'xhigh': chip 'high (requested xhigh)'", async () => {
+    renderPage({
+      status: "running",
+      harness: "claude",
+      model: null,
+      lead_config: {
+        applicable: true,
+        claim_generation: 1,
+        current: true,
+        phases: [
+          phase({
+            harness: "claude",
+            requested_model: "opus",
+            requested_model_source: "user_default",
+            requested_effort: "xhigh",
+            requested_effort_source: "user_default",
+            observed_model: "claude-opus-5",
+            observed_model_evidence: "claude_init",
+            observed_effort: "high",
+            observed_effort_evidence: "claude_init",
+          }),
+        ],
+      },
+    } as Partial<Run>);
+    const chip = await screen.findByText("lead: opus · high (requested xhigh)");
+    expect(chip.getAttribute("title")).toContain("runtime: claude-opus-5 (Claude SDK init)");
+    expect(chip.getAttribute("title")).toContain("effort: high (Claude SDK init)");
+    expect(chip.classList.contains("text-neutral-fg")).toBe(true);
   });
 
   // PRD #305: the frozen "apply model also to agents" flag, shown on every status.
@@ -2006,6 +2233,185 @@ describe("RunView — a paused run shows no live 'now' activity strip (PRD #1190
     expect(container.querySelector("[data-run-progress-card] ul")).not.toBeNull();
     // … but the live "now" strip is gone (nothing runs while paused).
     expect(nowStrip(container)).toBeNull();
+  });
+});
+
+// PRD #3522 M5: the weekly usage reserve on the run view.
+describe("RunView — weekly usage reserve (PRD #3522)", () => {
+  const CONFIRM = "Resuming overrides your weekly usage reserve until the next weekly reset";
+  function renderPage(over: Partial<Run>, canSteer = true) {
+    const refreshRun = vi.fn();
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun,
+      inputs: [],
+      canSteer,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const utils = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    return { ...utils, refreshRun };
+  }
+  const RESERVE_PAUSED: Partial<Run> = {
+    status: "paused",
+    hold_reason: "weekly_reserve",
+    started_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T03:42:00Z",
+    branch: "agent/issue-33",
+  };
+  const RESERVE_REQUEST: Partial<Run> = {
+    status: "running",
+    pause_requested_at: "2026-01-01T02:00:00Z",
+    pause_mode: "reserve",
+    pause_after_count: 1,
+    milestones: [
+      { id: "m1", title: "a" },
+      { id: "m2", title: "b" },
+    ],
+    milestones_completed: ["m1"],
+  };
+
+  const realConfirm = window.confirm;
+  afterEach(() => { window.confirm = realConfirm; });
+
+  it("labels a pending reserve request and hides Cancel pause, offering guidance and Pause now", async () => {
+    renderPage(RESERVE_REQUEST);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByText("Pause requested · weekly usage reserve · after M2")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /cancel pause/i })).toBeNull();
+    expect(screen.getByText(/Run defaults/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /pause now/i })).toBeTruthy();
+  });
+
+  it("keeps Cancel pause for an owner request (positive control for the hidden button)", async () => {
+    renderPage({ ...RESERVE_REQUEST, pause_mode: "milestone" });
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByRole("button", { name: /cancel pause/i })).toBeTruthy();
+    expect(screen.queryByText(/weekly usage reserve/)).toBeNull();
+  });
+
+  it("pauseRequestedLabel words the reserve source with and without milestones", () => {
+    expect(pauseRequestedLabel(run({ pause_mode: "reserve" }))).toBe(
+      "Pause requested · weekly usage reserve · after the current step",
+    );
+    expect(pauseRequestedLabel(run({ pause_mode: "milestone" }))).toBe("Pause requested · after the current step");
+  });
+
+  it("a reserve-parked run explains the hold in the panel", async () => {
+    renderPage(RESERVE_PAUSED);
+    await screen.findByText("Add rate limiting");
+    const note = document.querySelector('[data-hold-reason="weekly_reserve"]')!;
+    expect(note.textContent).toMatch(/Held by your weekly usage reserve/);
+    expect(note.textContent).toMatch(/resumes automatically when usage drops below the\s+threshold/);
+    expect(note.textContent).toMatch(/until the next weekly reset/);
+  });
+
+  it("an ordinary pause shows no reserve note", async () => {
+    renderPage({ ...RESERVE_PAUSED, hold_reason: null });
+    await screen.findByText("Add rate limiting");
+    expect(document.querySelector('[data-hold-reason="weekly_reserve"]')).toBeNull();
+  });
+
+  it("header Resume asks the exact confirmation and does not resume on cancel", async () => {
+    const confirm = vi.fn(() => false);
+    window.confirm = confirm;
+    renderPage(RESERVE_PAUSED);
+    await screen.findByText("Add rate limiting");
+    mockApi.resumeRun.mockClear();
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /resume/i })[0]);
+    });
+    expect(confirm).toHaveBeenCalledWith(CONFIRM);
+    expect(mockApi.resumeRun).not.toHaveBeenCalled();
+  });
+
+  it("header Resume proceeds once the owner confirms", async () => {
+    const confirm = vi.fn(() => true);
+    window.confirm = confirm;
+    const { refreshRun } = renderPage(RESERVE_PAUSED);
+    await screen.findByText("Add rate limiting");
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /resume/i })[0]);
+    });
+    expect(confirm).toHaveBeenCalledWith(CONFIRM);
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("the panel Resume asks too, and an ordinary pause resumes with no prompt", async () => {
+    const confirm = vi.fn(() => false);
+    window.confirm = confirm;
+    const onResume = vi.fn();
+    const { unmount } = render(
+      <PausedPanel run={run(RESERVE_PAUSED)} busy={false} canSteer onResume={onResume} onStop={vi.fn()} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /resume/i }));
+    expect(confirm).toHaveBeenCalledWith(CONFIRM);
+    expect(onResume).not.toHaveBeenCalled();
+    unmount();
+    confirm.mockClear();
+    render(<PausedPanel run={run({ ...RESERVE_PAUSED, hold_reason: null })} busy={false} canSteer onResume={onResume} onStop={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /resume/i }));
+    expect(confirm).not.toHaveBeenCalled();
+    expect(onResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the override line while reserve_exempt_until is in the future, and only then", async () => {
+    const future = new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString();
+    const { unmount } = render(<ReserveExemptLine run={run({ reserve_exempt_until: future })} />);
+    expect(document.querySelector("[data-reserve-exempt]")!.textContent).toMatch(/^Weekly usage reserve overridden until /);
+    unmount();
+    const none = render(<ReserveExemptLine run={run({ reserve_exempt_until: null })} />);
+    expect(none.container.firstChild).toBeNull();
+    none.unmount();
+    const past = render(<ReserveExemptLine run={run({ reserve_exempt_until: "2020-01-01T00:00:00Z" })} />);
+    expect(past.container.firstChild).toBeNull();
+  });
+
+  it("shows the override line for a live run but not a finished one that still carries a future stamp", () => {
+    // The server never clears reserve_exempt_until on completed/failed/cancelled runs.
+    const future = new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString();
+    for (const status of ["paused", "queued"] as const) {
+      const live = render(<ReserveExemptLine run={run({ status, reserve_exempt_until: future })} />);
+      expect(document.querySelector("[data-reserve-exempt]")).not.toBeNull();
+      live.unmount();
+    }
+    for (const status of ["completed", "failed", "cancelled"] as const) {
+      const done = render(<ReserveExemptLine run={run({ status, reserve_exempt_until: future })} />);
+      expect(done.container.firstChild).toBeNull();
+      done.unmount();
+    }
+  });
+
+  it("the page header carries the override line for a run with an active override", async () => {
+    renderPage({ status: "running", reserve_exempt_until: new Date(Date.now() + 86_400_000).toISOString() });
+    await screen.findByText("Add rate limiting");
+    expect(document.querySelector("[data-reserve-exempt]")).not.toBeNull();
+  });
+
+  it("HealthFlag shows the reserve reason for a held queued run, with a fallback and maintenance precedence", () => {
+    const held = { status: "queued" as const, queue_reason: "weekly_reserve" as const, health: "waiting_worker" as const,
+      health_since: "2026-10-25T12:00:00Z", health_reason: "waiting for a worker to pick up this run" };
+    const a = render(<HealthFlag run={run({ ...held, reserve_hold_reason: "weekly usage reserve: 85% >= 80%" })} />);
+    expect(a.container.querySelector('[data-queue-reason="weekly_reserve"]')!.textContent).toBe(
+      "waiting: weekly usage reserve: 85% >= 80%",
+    );
+    expect(a.container.textContent).not.toContain("stuck for");
+    expect(a.container.querySelector('[role="status"]')!.textContent).toBe("waiting: weekly usage reserve: 85% >= 80%");
+    a.unmount();
+    const b = render(<HealthFlag run={run(held)} />);
+    expect(b.container.querySelector('[data-queue-reason="weekly_reserve"]')!.textContent).toBe("waiting: weekly usage reserve");
+    b.unmount();
+    const c = render(<HealthFlag run={run({ ...held, queue_reason: "maintenance" })} />);
+    expect(c.container.querySelector('[data-queue-reason="weekly_reserve"]')).toBeNull();
+    expect(c.container.querySelector('[data-queue-reason="maintenance"]')).not.toBeNull();
   });
 });
 
@@ -2577,7 +2983,7 @@ describe("RunView incidental findings summary", () => {
     show({ id: "r/1 &", status: "completed", report_only: true, report_md: "Report result" });
     render(<MemoryRouter initialEntries={["/runs/r%2F1%20%26"]}><RunView /></MemoryRouter>);
     expect(await screen.findByText("Incidental findings: 2 open")).toBeTruthy();
-    expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r/1 &");
+    expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r/1 &", true);
     expect(screen.getByRole("link", { name: "View findings" }).getAttribute("href")).toBe("/findings?run=r%2F1%20%26");
     expect(screen.getByText("Report result")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Findings" })).toBeTruthy();
@@ -2587,7 +2993,7 @@ describe("RunView incidental findings summary", () => {
     mockApi.listFindings.mockResolvedValue(backlog([], "r1", 9));
     show({ status: "completed" });
     const view = render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
-    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1"));
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1", true));
     expect(screen.queryByText(/Incidental findings:/)).toBeNull();
     show({ status: "running" });
     view.rerender(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
@@ -2595,7 +3001,7 @@ describe("RunView incidental findings summary", () => {
     mockApi.listFindings.mockRejectedValue(new Error("offline"));
     show({ id: "r2", status: "failed" });
     view.rerender(<MemoryRouter initialEntries={["/runs/r2"]}><RunView /></MemoryRouter>);
-    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2"));
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2", true));
     expect(screen.queryByText(/Incidental findings:/)).toBeNull();
   });
 
@@ -2632,10 +3038,10 @@ describe("RunView incidental findings summary", () => {
       : Promise.resolve(backlog([], "r2")));
     show({ id: "r1", status: "completed" });
     const view = render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
-    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1"));
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1", true));
     show({ id: "r2", status: "completed" });
     view.rerender(<MemoryRouter initialEntries={["/runs/r2"]}><RunView /></MemoryRouter>);
-    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2"));
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2", true));
     await act(async () => resolveOld(backlog(["open"], "r1")));
     expect(screen.queryByText(/Incidental findings:/)).toBeNull();
   });
@@ -5214,7 +5620,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
         })}
       />,
     );
-    expect(container.textContent).toContain("Waiting for the forge");
+    expect(container.textContent).toContain("Forge retry scheduled");
     expect(container.textContent).toContain("2 of 5");
     // The retry time renders as a wall-clock HH:MM (locale/tz-formatted, so match loosely).
     expect(container.textContent).toMatch(/Retry at \d{1,2}:\d{2}/);
@@ -5242,7 +5648,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
       <RecoveryWaitPanel run={run({ status: "recovery_wait", recovery_wait_cause: null })} />,
     );
     expect(container.textContent).toContain("transient interruption");
-    expect(container.textContent).not.toContain("Waiting for the forge");
+    expect(container.textContent).not.toContain("Forge retry scheduled");
   });
 
   // Issue #1766: a vault_locked park (a Codex credential refresh or release found the run
@@ -5280,7 +5686,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     );
     expect(container.textContent).toContain("The run saved its work before parking");
     expect(container.textContent).not.toContain("transient interruption");
-    expect(container.textContent).not.toContain("Waiting for the forge");
+    expect(container.textContent).not.toContain("Forge retry scheduled");
     expect(container.textContent).not.toContain("2 of 5");
     // Unlock lives on the global banner: the panel offers no control of its own.
     expect(container.querySelector("button")).toBeNull();
@@ -5309,6 +5715,14 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
       expect(text).not.toContain("This run's vault");
       expect(text).not.toMatch(/as soon as|the instant|immediately/i);
     }
+  });
+
+  it("off viewers retain another owner's recovery state without their own unlock hint", () => {
+    mockUseAuth.mockReturnValue({ vaultUnlocked: false, vaultMode: "unprotected" } as unknown as ReturnType<typeof useAuth>);
+    const { container } = render(<RecoveryWaitPanel run={vaultPark()} />);
+    expect(container.textContent).toContain("The run owner's explicit vault unlock queues this run promptly");
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Waiting for vault unlock");
+    expect(container.textContent).not.toContain("If this is your run, unlock your vault with the banner at the top of the page.");
   });
 
   it("vault_locked with no retry stamp drops the time, not the sentence", () => {
@@ -5345,7 +5759,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     );
     expect(container.textContent).not.toContain("uzi freed");
     expect(container.textContent).not.toContain("transient interruption");
-    expect(container.textContent).not.toContain("Waiting for the forge");
+    expect(container.textContent).not.toContain("Forge retry scheduled");
     expect(container.textContent).not.toContain("4 of 5");
     expect(container.textContent).not.toMatch(/vault/i);
     expect(container.querySelector("button")).toBeNull();
@@ -5416,7 +5830,7 @@ describe("RecoveryWaitPanel: codex_account_unavailable (PRD #1590)", () => {
     // Only relogin_required sends the owner to Settings.
     expect(container.querySelector('a[href="/settings"]')).toBeNull();
     expect(container.textContent).not.toContain("transient interruption");
-    expect(container.textContent).not.toContain("Waiting for the forge");
+    expect(container.textContent).not.toContain("Forge retry scheduled");
   });
 
   it("renders relogin_required with the run's label and a link to the Codex credentials settings", () => {
@@ -7293,13 +7707,14 @@ describe("M1 plan cross-check detail refresh", () => {
     let current = run({ status: "running" });
     let messages: RunMessage[] = [];
     let resolve: (() => void) | undefined;
-    const refreshRun = vi.fn(() => new Promise<void>((done) => { resolve = done; }));
+    const refreshRunPassive = vi.fn(() => new Promise<void>((done) => { resolve = done; }));
+    const refreshRun = vi.fn();
     const router = createMemoryRouter([{ path: "/runs/:id", element: <RunView /> }], { initialEntries: ["/runs/r1"] });
     mockUseRunStream.mockImplementation(() => ({ run: current, messages, connected: true, error: "",
-      submit: vi.fn(), refreshRun, inputs: [], canSteer: false } as unknown as ReturnType<typeof useRunStream>));
+      submit: vi.fn(), refreshRun, refreshRunPassive, inputs: [], canSteer: false } as unknown as ReturnType<typeof useRunStream>));
     mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
     const r = render(<RouterProvider router={router} />);
-    return { ...r, router, refreshRun,
+    return { ...r, router, refreshRun, refreshRunPassive,
       async update(next: RunMessage[], detail?: Run["plan_cross_check_summary"]) {
         messages = next;
         if (detail) current = { ...current, plan_cross_check_summary: detail };
@@ -7311,15 +7726,15 @@ describe("M1 plan cross-check detail refresh", () => {
   }
   it("refreshes absent detail from an event without reload, deduplicates replay and coalesces bursts", async () => {
     const r = setup();
-    expect(r.refreshRun).not.toHaveBeenCalled();
+    expect(r.refreshRunPassive).not.toHaveBeenCalled();
     await r.update([message(3)]);
-    expect(r.refreshRun).toHaveBeenCalledTimes(1);
+    expect(r.refreshRunPassive).toHaveBeenCalledTimes(1);
     // useRunStream deduplicates replay frames before RunView receives messages.
     await r.update([message(3)]);
     await r.update([message(3), message(4), message(5)]);
-    expect(r.refreshRun).toHaveBeenCalledTimes(1);
+    expect(r.refreshRunPassive).toHaveBeenCalledTimes(1);
     await r.settle();
-    expect(r.refreshRun).toHaveBeenCalledTimes(2);
+    expect(r.refreshRunPassive).toHaveBeenCalledTimes(2);
     await r.settle();
     await r.update([message(3), message(4), message(5)], {
       round: 1, verdict: "approve", reason_class: "approve", findings: { summary: "# Refreshed evidence", items: null },
@@ -7327,7 +7742,9 @@ describe("M1 plan cross-check detail refresh", () => {
     });
     expect(screen.getByRole("heading", { name: "Refreshed evidence" })).toBeTruthy();
     await r.update([message(3), message(4), message(5)]);
-    expect(r.refreshRun).toHaveBeenCalledTimes(2);
+    expect(r.refreshRunPassive).toHaveBeenCalledTimes(2);
+    // Socket-driven reads stay passive so they never restore a vault keyslot (ADR-3508).
+    expect(r.refreshRun).not.toHaveBeenCalled();
   });
   it("M1 pending detail refreshes and non-plan events do not trigger reads", async () => {
     const r = setup();
@@ -7335,17 +7752,17 @@ describe("M1 plan cross-check detail refresh", () => {
       round: 1, verdict: "pending", reason_class: null, findings: null,
       checker_run_id: null, checker_model: null, checker_effort: null, checker_model_source: null, checker_effort_source: null, usage: null, historical: false,
     });
-    expect(r.refreshRun).not.toHaveBeenCalled();
+    expect(r.refreshRunPassive).not.toHaveBeenCalled();
     expect(screen.getByText("Checked candidate: Pending")).toBeTruthy();
     await r.update([message(2)]);
-    expect(r.refreshRun).toHaveBeenCalledTimes(1);
+    expect(r.refreshRunPassive).toHaveBeenCalledTimes(1);
     await r.settle();
     await r.update([message(2)], {
       round: 1, verdict: "revise", reason_class: "revise", findings: { summary: "New checker evidence", items: null },
       checker_run_id: null, checker_model: null, checker_effort: null, checker_model_source: null, checker_effort_source: null, usage: null, historical: false,
     });
     expect(screen.getByText("New checker evidence")).toBeTruthy();
-    expect(r.refreshRun).toHaveBeenCalledTimes(1);
+    expect(r.refreshRunPassive).toHaveBeenCalledTimes(1);
   });
   it("drops queued follow-ups after navigation and tracks sequence per run", async () => {
     const r = setup();
@@ -7354,14 +7771,45 @@ describe("M1 plan cross-check detail refresh", () => {
     r.changeRun("r2");
     await act(async () => { await r.router.navigate("/runs/r2"); });
     await r.settle();
-    expect(r.refreshRun).toHaveBeenCalledTimes(1);
+    expect(r.refreshRunPassive).toHaveBeenCalledTimes(1);
     await r.update([message(1)]);
-    expect(r.refreshRun).toHaveBeenCalledTimes(2);
+    expect(r.refreshRunPassive).toHaveBeenCalledTimes(2);
     await r.settle();
     r.changeRun("r1");
     await act(async () => { await r.router.navigate("/runs/r1"); });
     await r.update([message(4)]);
-    expect(r.refreshRun).toHaveBeenCalledTimes(2);
+    expect(r.refreshRunPassive).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("ADR-3508 status-driven reads stay passive", () => {
+  const extra = mockApi as unknown as Record<string, unknown>;
+  afterEach(() => { delete extra.listWorkers; });
+  it("a socket-driven status change fetches workers, settings and findings passively", async () => {
+    const listWorkers = vi.fn().mockResolvedValue({ workers: [] });
+    extra.listWorkers = listWorkers;
+    let current = run({ kind: "issue", status: "running" });
+    const refreshRun = vi.fn();
+    mockUseRunStream.mockImplementation(() => ({ run: current, messages: [], connected: true, error: "",
+      submit: vi.fn(), refreshRun, refreshRunPassive: vi.fn(), inputs: [], canSteer: true } as unknown as ReturnType<typeof useRunStream>));
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    mockApi.getMySettings.mockClear();
+    mockApi.listFindings.mockClear();
+    const router = createMemoryRouter([{ path: "/runs/:id", element: <RunView /> }], { initialEntries: ["/runs/r1"] });
+    render(<RouterProvider router={router} />);
+    expect(listWorkers).not.toHaveBeenCalled();
+    // A state frame moves the run to its plan gate, then to completed with an open MR.
+    current = { ...current, status: "awaiting_approval" };
+    await act(async () => { await router.navigate("/runs/r1"); });
+    await waitFor(() => expect(listWorkers).toHaveBeenCalled());
+    current = { ...current, status: "completed", mr_iid: 42, mr_state: "opened" };
+    await act(async () => { await router.navigate("/runs/r1"); });
+    await waitFor(() => expect(mockApi.getMySettings).toHaveBeenCalled());
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalled());
+    expect(listWorkers.mock.calls.every(call => call[0] === true)).toBe(true);
+    expect(mockApi.getMySettings.mock.calls.every(call => call[0] === true)).toBe(true);
+    expect(mockApi.listFindings.mock.calls.every(call => call[3] === true)).toBe(true);
+    expect(refreshRun).not.toHaveBeenCalled();
   });
 });
 
@@ -7457,4 +7905,51 @@ describe("RunView rejection presentation", () => {
     const pill = screen.getByText(label === "failed" ? "needs landing" : label);
     expect(pill.classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
   });
+});
+
+
+describe("HealthFlag Codex admission", () => {
+  it.each([["rate_limit", "a rate limit"], ["overload", "overload"]] as const)("shows %s from read-time fields and clears on expiry", (cls, words) => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-27T12:00:00Z"));
+    try {
+      const at = "2026-10-27T12:01:37Z";
+      const r = run({ status: "queued", health: "waiting_worker", codex_admission_class: cls,
+        codex_admission_eligible_at: at, health_reason: `waiting: provider reported a rate limit; account admission eligible after ${at}` });
+      const { container, unmount } = render(<HealthFlag run={r} />);
+      expect(container.textContent).toContain(`waiting: provider reported ${words}; account admission eligible after ${at}`);
+      expect(container.textContent).not.toContain("stuck for");
+      unmount();
+      now.mockReturnValue(Date.parse(at));
+      const expired = render(<HealthFlag run={r} />);
+      expect(expired.container.textContent).toContain("waiting for worker");
+      expect(expired.container.textContent).not.toContain("provider reported");
+    } finally { now.mockRestore(); }
+  });
+  it("keeps maintenance primary and eligibility in its tooltip", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const { container } = render(<HealthFlag run={run({ status: "queued", queue_reason: "maintenance",
+        codex_admission_class: "overload", codex_admission_eligible_at: "2026-10-27T12:01:37Z" })} />);
+      const pill = container.querySelector('[data-queue-reason="maintenance"]')!;
+      expect(pill.textContent).toBe("waiting: uzi is in maintenance mode");
+      expect(pill.getAttribute("title")).toBe("waiting: provider reported overload; account admission eligible after 2026-10-27T12:01:37Z");
+    } finally { now.mockRestore(); }
+  });
+});
+
+
+it.each([
+  "handoff setup has not finished",
+  "your vault is locked, so this run can't start",
+  "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+  "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+  "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",
+])("HealthFlag Codex admission keeps %s primary", (reason) => {
+  const now = vi.spyOn(Date, "now").mockReturnValue(0);
+  try {
+    const { container } = render(<HealthFlag run={run({ status: "queued", health: "waiting_worker", health_reason: reason,
+      codex_admission_class: "overload", codex_admission_eligible_at: "2026-10-27T12:01:37Z" })} />);
+    expect(container.textContent).toContain(reason);
+    expect(container.querySelector("[title]")!.getAttribute("title")).toBe("waiting: provider reported overload; account admission eligible after 2026-10-27T12:01:37Z");
+  } finally { now.mockRestore(); }
 });

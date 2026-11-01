@@ -28,7 +28,7 @@ The release + deploy runbook for uzi (PRD #52). Three deploy topologies:
   `127.0.0.1:8080`, real `./.env` secrets. See the repo `README.md` /
   `ARCHITECTURE.md`. Workers still run here (`docker compose --profile agent`).
 - **compose (VPS)** — signed release images from the dedicated
-  [server Compose file](compose/compose.yml), versioned with the code. For a single
+  [server Compose file](compose/compose.yaml), versioned with the code. For a single
   VPS without Kubernetes, follow the [VPS guide](../docs/vps-deployment.md) for HTTPS,
   administrator bootstrap, a base-agent worker, and backups. Optional DinD services
   are excluded from this file.
@@ -48,14 +48,14 @@ deploys. uzi follows the Model-B release shape.
 
 | | compose (laptop) | compose (VPS) | k8s (dev-cluster) |
 | --- | --- | --- | --- |
-| Configuration | root `docker-compose.yml` | [compose/compose.yml](compose/compose.yml); [VPS guide](../docs/vps-deployment.md) | `chart/` + GitOps values |
-| Brought up by | `docker compose up` | `docker compose -f compose.yml up -d --no-build db api web` | ArgoCD (auto-sync) from `argo-apps` `apps/uzi/` |
+| Configuration | root `docker-compose.yml` | [compose/compose.yaml](compose/compose.yaml); [VPS guide](../docs/vps-deployment.md) | `chart/` + GitOps values |
+| Brought up by | `docker compose up` | `docker compose -f compose.yaml up -d --no-build db api web` | ArgoCD (auto-sync) from `argo-apps` `apps/uzi/` |
 | web / api images | built locally | `ghcr.io/vtmocanu/uzi/{web,api}:${UZI_VERSION}` | `ghcr.io/vtmocanu/uzi/{web,api}:<tag>` |
 | controller / agent images | n/a (compose runs no controller) | no controller; `ghcr.io/vtmocanu/uzi/agent-base:${UZI_VERSION}` | `ghcr.io/vtmocanu/uzi/controller:<tag>`, `ghcr.io/vtmocanu/uzi/agent-{base,jvm}:<tag>` (PRD #58 M6) |
 | Postgres | `postgres:17` container | digest-pinned `postgres:17` container | CNPG `Cluster` (`postgres-uzi-cluster`, 1 instance, `standard`) |
 | Secrets | `./.env` | private `/opt/uzi/.env`; worker token mounted as a Compose secret | Infisical (`/uzi` folder) + CNPG-generated `-app` creds |
 | Public URL | `http://127.0.0.1:8080` | `https://your_domain` through an existing TLS proxy to loopback web | `https://uzi.example.com` (ingress-nginx, `*.example.com` wildcard TLS) |
-| Worker | `docker compose --profile agent` | `docker compose -f compose.yml --profile agent up -d --no-build agent` | laptop workers unchanged; **hosted workers ship but are OFF** — see [Hosted workers](#hosted-workers-prd-58) |
+| Worker | `docker compose --profile agent` | `docker compose -f compose.yaml --profile agent up -d --no-build agent` | laptop workers unchanged; **hosted workers ship but are OFF** — see [Hosted workers](#hosted-workers-prd-58) |
 
 The ArgoCD `Application` is **multi-source** (example-app precedent): the released
 chart from the public GHCR OCI registry + the per-cluster values from the argo-apps GitOps
@@ -90,6 +90,170 @@ the whole publish on a mismatch — a lagging `Chart.yaml` blocks the release
 atomically, it does not ship a half-version.
 
 ## Release procedure
+
+Standard releases use `.github/workflows/release-auto.yml` on main, with manual
+dispatch and opt-in nightly RC attempts. The shared scripts below
+remain the local fallback. [ADR-3512](../adr/3512-release-automation.md) records the
+accepted authorization boundary and staged recovery work.
+
+Before the first live dispatch, the maintainer configures and verifies:
+
+| Control | Required configuration |
+|---|---|
+| RC App | Repository-only installation, contents write, no workflows permission |
+| Stable App | Separate repository-only installation, contents write, no main bypass |
+| `release-rc` | Main-only Environment; `RELEASE_APP_ID` variable, `RELEASE_APP_KEY` secret |
+| `release-stable` | Main-only; same variable/secret names, required maintainer reviewer, prevent self-review off for the solo-maintainer case |
+| `RELEASE_DISPATCHERS` | Repository variable, comma/space-separated exact GitHub logins |
+| `RELEASE_NIGHTLY_ENABLED` | Repository variable; only exact `true` enables nightly RC attempts, unset/false pauses them |
+| Main review rules | Pull requests/checks; admin and RC App bypass |
+| Main integrity rules | Deletion/non-fast-forward; admin bypass only |
+| Stable-tag creation | `v*` excluding `v*-rc.*`; admin and stable App bypass |
+| RC-tag creation | `v*-rc.*`; admin and RC App bypass |
+| Tag integrity | All `v*` updates/deletion/non-fast-forward; admin bypass only |
+
+The existing `release` publisher Environment is unchanged. The workflow never
+creates or modifies these settings. Verify that the RC App cannot create stable
+tags, either App cannot update/delete tags or force/delete main, the stable App
+cannot write main, and rejecting one ref rejects the whole atomic push. A dry-run
+or source review alone is not evidence that server rules are active.
+
+For an explicitly authorized RC, dispatch `release-auto.yml` with `kind=rc`.
+Optional `version` chooses a base; `abandon_train=true` needs a higher version.
+`supersede` must name the latest failed/missing-publication candidate. It waives
+only that publication refusal, never pin, coverage, oracle, metadata or adoption
+checks. Manual RC dispatch preserves empty-delta respins; the cutter still decides
+releasability. Review the run summary and its exact parent/release/tag identifiers.
+
+Only the human dispatches `kind=stable`, supplying the newest `rc_tag` and its full
+peeled `rc_sha`, then approves `release-stable`. Agents never perform either act.
+The request expires 24 hours after the original run creation, including approval
+wait. Promotion uses the candidate and ignores current-main CI and
+advancement. The summary links first-parent main changes observed during preparation.
+
+Codex lock changes in the planned range require the adoption read and a local cut.
+On abandon the range starts at the highest stable, so a previously adopted change
+can still block automated abandon until a local cut. There is no CI attestation
+parser or model access. Before any local fallback, finish/stop CI release work,
+inspect remote main/tags and resolve interrupted publication on the same tag.
+
+The prepared bundle is validated in a separate job without repository checkout
+before the App token is minted. RC metadata and tag push atomically, without force.
+A lost push receipt is investigated against the prepared tag/SHA, never by cutting
+a replacement. Prepare and push refuse when the run attempt is greater than one: re-dispatch
+instead, after inspecting remote refs when a push receipt is uncertain. Never
+rerun prepare or push in the same run. Watch and report may rerun against the
+exact existing tag/SHA. The inspection bundle is retained for one day; watch
+and report recovery use the existing tag and stored outputs, not a new bundle
+or a second push. Each watch rerun starts its own bounded recovery operation;
+retry budgets cannot replenish within one operation. The local watch/verify scripts remain available for
+manual same-tag recovery. Only a confirmed publication and `release-verify.sh` success mean
+done; deployment health is a separate check. Problems use one `Release automation
+failures` tracking issue; expected no-ops remain in the summary.
+
+Prepare streams the cutter's output and logs tip SHA, CI run/attempt/state changes,
+elapsed time and its deadline. Failure summaries name the phase and planned tag,
+with bounded uncited commit/PR identities; unavailable fields are `null`.
+A green `report` job confirms incident delivery, not a successful release: the
+failed prepare or watch job keeps the run red. Receipt/publication uncertainty
+fails watch; an issue-delivery failure fails report.
+An unconfirmed push receipt stops watch before publication recovery and
+verification, so automatic publication retries do not run in that branch.
+Inspect remote refs, then use local watch/verify against the same tag/SHA.
+
+Keep a tip intended for release eligible for CI. When a recognized skip
+instruction leaves exact main-push proof absent, manual preparation and the
+local cutter's point check refuse immediately with `skip-ci-tip`. Scheduled
+attempts stay unheld and keep waiting for a newer tip within the existing
+budget; progress logs show `skip_ci_tip=true`. A newer green CI-bearing tip
+can be cut in that same operation. If the budget expires while the selected
+tip still lacks proof because of a skip instruction, the scheduled attempt
+defers with `skip-ci-tip`. Planning no-ops retain priority. There is no
+parent-proof exemption for docs or PRDs: their changed text has not passed its
+own checks. Automation does not dispatch CI, create a repair commit or select
+an older tip.
+
+Nightly attempts are scheduled for 04:47 Europe/Bucharest using GitHub's native
+timezone support, after the local maintenance window, aiming to cut near 05:00
+when on time. They are
+off until the user decides to activate and the maintainer sets
+`RELEASE_NIGHTLY_ENABLED=true`. Unset it or set it to `false` to pause nightly
+attempts; manual dispatch still works. Enablement is rechecked at job boundaries,
+so a not-yet-pushed attempt may stop there, possibly red with `nightly-disabled`.
+Cancel an in-flight run explicitly for an immediate stop. Disabling the whole workflow
+also disables manual dispatch. Scheduled authorization pins repository, main ref
+and event/run metadata, without treating the scheduler as an allowlisted human.
+
+The shared cutter's read-only plan decides nightly eligibility: at least one
+non-metadata shipping first-parent change since the newest open-train RC or
+previous stable, with releasable notes. Notes-only and exempt-only ranges can be
+reported no-ops; they do not wait for CI or create a bundle. Failed previous
+publication and other blocked plans still refuse. Manual RC respins preserve
+the cutter's existing empty-delta behavior.
+
+The provisional push cutoff is strictly before 13:00 on the original run's
+Bucharest calendar date. A queued run does not gain a fresh window tomorrow.
+Scheduled tip waiting uses the lesser of three hours and the remaining time
+until 12:50, reserving a provisional 600 seconds from the existing cutter timeout,
+not a measured cut duration. An on-time 04:47 attempt can wait until 07:47; a late
+10:47 attempt can wait until 12:50. Waiting holds a runner under the 20-job cap.
+The prepare ceiling stays 210 minutes (180 waiting, ten cutting, 20 overhead).
+Manual waits remain 7200 seconds and their cutter timeout remains 600 seconds;
+the job ceiling stays 210 minutes. Push/watch ceilings remain 15/125 minutes.
+The key job checks the window before
+minting and independently again immediately before the atomic update, validating
+numeric epochs and the Bucharest offset. Creation timestamps tolerate 60 seconds
+of clock skew; the 13:00 push cutoff has no grace period. A missed window stops
+with `missed-target` and no push; a tip not green in its budget is reported
+separately. Main races never cause automatic rebasing or an older-tip fallback.
+Expected no-ops stay in the summary; misses and failures update the tracking
+issue. Once a tag is pushed, recovery ignores the cutoff and pause flag.
+Verification recorded after the 14:00 local target produces a late warning,
+retaining verified success without opening an extra incident. These times are
+best-effort targets, subject to Actions delays and the shared non-cancelling queue.
+
+The wider window accommodates observed schedule delays of roughly six hours;
+[ADR-3512](../adr/3512-release-automation.md) cites the public E2E and release
+run timestamps. This is not a guaranteed delay. Late attempts may run during
+daytime merges, so exact-tip CI may take longer to settle within the same cap.
+
+Manual tip selection is bounded at 120 minutes plus 10 minutes for cutting.
+Publication watching retains its 60-minute bound within the 120-minute recovery
+allowance. One publication watcher owns the existing per-workflow retry budgets
+and records a bounded attempt journal, including failing jobs/steps and retry
+reservations/results. The first failed job's detail is retained. The journal
+keeps every observed attempt and explicitly counts omitted detail when it reaches
+32,768 source bytes; unavailable evidence is not proof of recovery.
+Release-commit main CI is report-only, with one observation and no automatic reruns. Automatic
+recovery was deliberately excluded: publication uses strict inherited coverage,
+the next RC needs a newer CI-bearing tip, and rerun isolation would change main
+cancellation behavior. Protected CI opts into two infrastructure-only tagged
+KinD retries and one targeted `assert-tag-smoke` rerun after real smoke succeeds.
+Build/install/readiness/product checks, mixed/unknown failures and cancellation
+are not retried. Existing publication budgets stay separate and never reset.
+First-week contention measurements remain a rollout check.
+Read-only journal lookup failures do not stop publication observation; retries
+still require fresh complete evidence. Incident audits are capped at 64 rows and
+8,192 encoded bytes with explicit counts, while the prepare summary stays full.
+Main-CI observation errors cannot replace the publication result, but an in-flight
+API request can still consume the existing watcher job ceiling; no new timeout
+or transport isolation is added.
+Terminal journal write failures preserve the publication result and label any
+surviving attempt records incomplete. Retry requests still require a saved reservation.
+KinD retries require matching tagged/controller KinD workflow definitions;
+assertion recovery requires both KinD and release definitions to match.
+Older candidates after workflow updates, or RC tips whose workflow changed during
+the wait, need manual exceptional recovery; normal watching and verification stay
+available. All writes in recovery mode, including ordinary publication retries,
+require unchanged remote tag identity and no superseding stable. A watcher-start
+monotonic 120-minute backstop forbids new writes only,
+with no remote cancellation or extra wait window. The shared 60-tick publication
+window and 125-minute job ceiling remain; transport hangs use that job ceiling.
+For deliberate local same-tag exceptional recovery, opt in with
+`--recover-tag-smoke` plus `--journal`, `--operation`, `--repository`, `--sha`,
+`--kind` and the exact remote `--tag-oid`. Finish or stop the CI operation first.
+The default local watcher remains publication-only. No recovery path cuts a tag.
+The procedures below are the local path.
 
 **Releases are cut RC-first** (ADR-1265, PRD #1265). `release-cut X.Y.Z`
 (`.agents/skills/uzi-release/`) cuts a release **candidate** `vX.Y.Z-rc.1` by default: it
@@ -200,10 +364,10 @@ registry layers are reused when their inputs match; release image identity check
    the OCI chart (`oci://ghcr.io/vtmocanu/uzi/uzi:<tag>`, published LAST). Homebrew is a separate
    `v*`-triggered run (`brew.yml`).
 
-   > **The tag publishes everything UNATTENDED — there is no approval gate.** The old
-   > `release`-environment required-reviewer was removed 2026-08-20; access control is now the
-   > `protect-release-tags` tag ruleset, so only a repo admin can create a `v*` tag and the tag
-   > push itself is the authorization. (`publish-*` jobs keep `environment: release` only for
+   > **Tag publication remains unattended after authorization.** The release-auto
+   > stable review happens before its App creates the tag. Configured tag rulesets
+   > admit the corresponding App and admin local fallback; the existing `release`
+   > publisher Environment has no required reviewer. (`publish-*` jobs keep `environment: release` only for
    > deployment tracking; `brew.yml` keeps it to scope the `HOMEBREW_TAP_TOKEN` secret. Neither
    > carries a reviewer.) After `git push origin v0.1.0`, the run builds the images, then the
    > chart, then the GitHub Release, with no pause:
@@ -273,17 +437,15 @@ before the first deploy. Each mirrors an existing example-app step.
    GitLab↔Harbor integration, and no `HARBOR_USERNAME`/`HARBOR_PASSWORD` to provision.
    The credential-isolation property Decision 2 wanted still holds: PR builds run
    `--no-push` and never touch the registry, and the push-capable token exists only on
-   the `v*`-tag run, which the tag ruleset below restricts to admins. So an
+   the `v*`-tag run, whose creation is restricted by the split rulesets above. So an
    agent-authored PR that edits a workflow file cannot reach a push credential.
 
-2. **Protected `v*` tags — admin-create-only (`protect-release-tags` ruleset).** The
-   agent/worker PAT lacks the `workflow` scope and cannot create a `v*` tag, and the
-   ruleset restricts `v*` tag creation to a repo admin (admin `bypass_actors`, same
-   shape as `protect-main`). Cutting a release tag — the thing that triggers the
-   unattended publish — is therefore an admin-only action; the tag push itself is the
-   authorization, and there is no approval gate anywhere. Combined with `main` being
-   protected, this closes the agent-MR loop. (Replaces the old GitLab "Maintainer-only
-   protected tags" step and the since-removed `release`-environment reviewer.)
+2. **Protected release refs.** Apply the split rulesets above before live CI use.
+   RC and stable Apps have distinct creation authority, while only admin retains
+   tag update/deletion and force/delete-main bypass. The stable App has no main
+   bypass. The worker PAT still lacks workflow scope and release authority. The
+   existing publisher Environment has no second approval gate; stable review is
+   before the separate stable App creates its tag.
 
 3. **GHCR packages are anonymous-pullable, so the cluster needs no image pull secret.**
    The `ghcr.io/vtmocanu/uzi/*` images and chart are public. The only pull secret still
@@ -435,6 +597,18 @@ the effective Docker `dindDataSize`. Defaults cover 20 restricted workers at
 (`10 x (40 + 20)`), with a PVC ceiling of at least 40Gi. Its chart guard also checks
 run-bound data overrides. Allow budget for existing claims and their requested growth.
 
+The `l-highmem` worker size (#3383) requests 24Gi and is limited to 32Gi of memory.
+Before using it, raise any per-cluster override of `limitRange.max.memory` on all
+three tiers (`workers.limitRange`, `workers.docker.limitRange`,
+`workers.isolatedLane.limitRange`) to at least 32Gi; the chart default is now 32Gi
+(was 20Gi). CPU max, `maxPVCStorage` and all quotas are unchanged, and the
+controller has no boot-time memory check, so a lower ceiling leaves `l-highmem`
+pods inadmissible. Quotas are shared budgets sized on `l`; each `l-highmem` worker
+consumes more of them, and a fleet is not guaranteed to fit. Check node
+allocatable memory (24Gi plus sidecars) and namespace quota headroom first. A quota
+hit shows as the worker Deployment's `ReplicaFailure`. Existing workers are not
+resized.
+
 For each existing L or run-bound worker's data PVC, inspect its request and StorageClass:
 
 ```sh
@@ -562,6 +736,7 @@ which takes uzi down. It fails closed, but the blast radius is the whole product
 | `workers.drainDeadline` | `"24h"` | Compatible Go duration (`"1h"`, `"30m"`), with unchanged positive-only parsing; exposed as `UZI_WORKER_DRAIN_DEADLINE`. Now bounds only independent **nondrifted** pressure/nix-size maintenance, which can interrupt busy runs and delete /data unless custody-held. No elapsed timer permits busy spec-hash/generation replacement or associated recycle, even with no pacing entry/plain drain; shortening this value no longer forces image upgrades. No new knob. |
 | `workers.forceRoll` | `false` | **Global** emergency bypass of pacing, holds, incarnation proof and busy deferral for drifted workers, plus busy deferral for independent maintenance. May interrupt runs and lose all capacity; neither targeted nor a recovery guarantee. Custody-held data and independent DinD readiness/identity/pod-absence guards remain authoritative; DinD has no deadline or ForceRoll bypass. No automatic rollback. Restore `false` after the emergency. |
 | `workers.storageClass` | `""` (cluster default) | `standard` on dev-cluster. |
+| `workers.nodeSelector` | `kubernetes.io/arch: amd64` | Rendered onto every hosted worker pod (plain, docker, isolated), next to the docker tier's soft anti-affinity. The default exists because the published agent images are amd64 only. With your own arm64-capable `workers.image.repository`, override it or clear it with `nodeSelector: null` (`{}` does not clear it: Helm merges it into the default). Changing it re-hashes every worker's pod template: persistent workers roll through the normal paced drain, while run-bound workers are outside pacing but keep the busy-drift deferral. |
 
 ### Deploying paced hosted rolls (#1470)
 
@@ -799,6 +974,205 @@ is itself a kubelet eviction trigger (see [ADR-1598](../adr/1598-codex-command-s
 and `specs/ai.md` §480). It is not a trust boundary: every command root for a
 run shares one uid, so treat its contents as untrusted, never reused across
 runs. See [adr/1598-codex-command-storage.md](../adr/1598-codex-command-storage.md).
+
+### Pod-epoch shadow reclaim (PRD #3430)
+
+Hosted Docker workers now participate in epoch ownership and can report a
+read-only `pod_epoch_reclaim` verdict before run admission. **The shadow pass
+does not delete attempt trees, release holds or remove stopped containers.**
+Existing startup reapers and DinD maintenance are separate. Compose and
+non-Docker lanes are unchanged. See the [worker overview](../docs/worker-docker.md#pod-epoch-shadow-reclaim)
+and [design and implementation evidence](../prds/3430-pod-epoch-lock-shadow.md).
+
+**Runtime declaration is an operator attestation, not autodetection.**
+`workers.docker.podEpochReclaim.runtime` defaults to `""` (unset). The chart
+accepts exactly `containerd-runc` or `crio-crun` when set. The pass runs by
+default, and keeping trees needs no declaration: with the value unset it keeps
+every tree, logs `deferred` / `runtime_not_declared` without waiting for evidence
+and reports no candidates, while still taking part in lifetime epoch locking.
+Candidate inventory needs a declared value. Setting a value attests the
+**full audited runtime/storage contract** below for the nodes eligible for these
+workers (a future hosted-Docker deletion under PRD #3431 will require it). The
+declaration does not verify versions or storage itself; the controller and worker
+only cross-check it against observations (see *Reading verdicts*). This release
+deletes nothing either way.
+
+| Declaration | Audited stack |
+|---|---|
+| `containerd-runc` | containerd **2.3.4**, runc **1.5.1**, kubelet **1.37.1** |
+| `crio-crun` | CRI-O **1.36.2**, classic conmon with `runtime_type: oci` (unset resolves to `oci`), default crun **1.28 or 1.30.1**, conmon **2.1.10–2.2.1**, kubelet **1.35.3**; no namespace-adjusting NRI plugin |
+
+Leave the value unset for unaudited versions, other runtime handlers or any
+`runtimeClassName`. CRI-O conmon-rs, runtimeVM and runc handlers are unsupported.
+The [CRI-O source audit](../prds/3430-pod-epoch-crio-audit.md) distinguishes
+read evidence from inference and unverified node facts; its function-level
+comparisons do not widen the declaration's crun version.
+
+| Prerequisite | Operator responsibility |
+|---|---|
+| Storage exclusion | Use node-local or attach-enforced data storage so overlapping pods share one kernel's lock view. Shared storage without attach enforcement, including NFS/CephFS, is unsupported. |
+| Kubelet/CSI ownership | Verify the actual driver honors matching-root skip semantics. A driver that recursively walks ownership despite a matching root is unsupported; application flock cannot fence kubelet/CSI. |
+| Mounted data-root posture | Prepare a trusted root/worker-owned directory with gid **10001**, owner and group permissions covering **0770**, setgid, and no world write. Participating initializers preserve this posture; a root mismatch fails startup rather than being repaired. |
+| Node/runtime evidence | Verify installed packages, `/proc` options, NRI configuration and the audit's conmon PID-namespace inference before declaring. Verify the image's util-linux flock as part of the image proof. |
+
+See the [pinned storage audit](../prds/3430-pod-epoch-storage-audit.md) for the
+matching-root predicate and CSI delegation boundary. Rendering
+`OnRootMismatch` alone does not establish the driver's behavior.
+
+**Default-off still participates.** On ext4/xfs, a Docker worker holds shared
+epoch ownership for its process lifetime even with runtime unset, no evidence
+projection, an already-consumed pod UUID or a full consumption ledger. A fresh
+default-off pod logs `deferred` / `runtime_not_declared` immediately after the
+existing startup reapers, without an evidence wait. An absent projection likewise
+defers without waiting. Process restart of a consumed pod does not evaluate again.
+
+Protected pre-Node initializers take temporary shared ownership before their
+writes; Node acquires epoch ownership before its data-volume writers, startup
+reapers and Docker requests. The bounded read-only maintenance `/proc` snapshot
+is the explicit pre-lock exception. An ext4/xfs candidate tries exclusive
+ownership first and holds it through reaping and shadow evaluation, then settles
+its work and reacquires shared ownership before admission.
+
+The filesystem gate permits ext4/xfs. Unsupported filesystems uniformly skip
+**epoch-file** flock and defer evaluation; their bounded ledger metadata still
+uses its serialization mutex, which supplies no epoch-exclusion authority.
+Other participation failures fail closed: missing/unsafe state, flock errors
+and uncertain ledger durability refuse startup without admission.
+
+| Bound | Behavior |
+|---|---|
+| Epoch shared acquisition | **120 s**, including protected initialization; busy tentative EX defers and falls back to bounded SH. |
+| Ledger metadata mutex | **5 s**; validation and durable consumption precede evaluation/admission. |
+| Controller startup synchronization | **60 s**; incomplete synchronization supplies no positive handoff. |
+| Worker evidence wait | **115 s soft / 120 s hard**, including a **5 s** settlement reserve. Negative or invalid evidence defers. |
+| Whole shadow pass | **595 s soft / 600 s hard**, including evidence waiting and settlement; cleanup is joined under EX. Uncertain settlement is fatal, retaining EX until process exit. OS filesystem latency is not cancellable. |
+| Shared reacquisition after EX | Separate **120 s** wait after cleanup, before admission. |
+| Daemon inventory | **10 s** per request; **500 containers**, **500 volumes**, **50 plugins**; inspect concurrency **4**. |
+| Input bytes | Finite daemon bodies and finite subprocess output capped at **8 MiB**; cumulative event stream capped at **64 KiB**; projected evidence **8 KiB**. |
+| Retained-source discovery | **200 physical tree paths**, **4,096 directory entries**, **1,024 bare repositories**; metadata per bare **8 MiB / 4,096 records**. The operator inspector retains its independent **64-descriptor** default. |
+| Consumption history | **4,096 distinct pod UUIDs / 151,560 logical bytes**, on one immutable ledger inode, plus filesystem allocation overhead. No eviction, compaction or automatic reset. |
+
+**Reading verdicts.** `pod_epoch_reclaim` reports `eligible`, `deferred` or
+`partial`, a stable `reason`, `examined`, `would_delete`, `kept`,
+and `list` (up to **32** entries with sanitized run/path identifiers and sizes).
+`list_overflow` counts omitted selected entries. Discovery overflow is exact
+only when bounded discovery completed; consult `inventory_overflow_exact`
+and `inventory_complete` rather than assuming a complete census.
+`bytes_state` is `measured`, `partial` or `unknown`; measured entries do not
+make a partial inventory complete. Evidence-wait and pass durations accompany
+the verdict. Only a fresh durable consumer under EX evaluates; a new pod at
+ledger saturation reports `consumption_full` without evaluation while preserving
+SH startup.
+A would-delete entry requires terminal ownership, fresh empty holds and an
+eligible retained-source disposition; a verdict grants no deletion authority.
+
+**Authority and counts (PRD #3431 M1a).** The log line also carries
+`authority: {result, reason}`, `evidence_version` and, once version-2 binding
+and prefix checks pass, `observations.kernel`. `authority.result` is one of `undeclared`,
+`legacy_evidence`, `contradicted`, `unproven` or `attested`, with a fixed reason
+token; controller free text is never logged. Only `attested` runs the inventory,
+and authority falls back to `unproven` when the pass is invalidated
+(`entry_changed`, `daemon_veto` or `path_set_changed`).
+
+- Unset runtime keeps the zero-wait path: `deferred` / `runtime_not_declared`,
+  authority `undeclared`.
+- Version-1 evidence (an older controller) defers as `legacy_evidence` with no
+  inventory.
+- Version-2 evidence adds the successor's container IDs and a controller
+  `attestation`. The worker checks the binding first, refuses a `contradicted`
+  attestation (`attestation_contradicted`), then recomputes the container-ID
+  runtime prefixes itself (`containerd://` for `containerd-runc`, `cri-o://` for
+  `crio-crun`) and defers on a mismatch (`predecessor_runtime_prefix`,
+  `successor_runtime_prefix`). For `crio-crun` the successor node's kernel release
+  must be exactly `6.12.0-243.el10.x86_64` or `6.12.0-243.el10.aarch64`; anything
+  else defers as `kernel_unaudited`. For `containerd-runc` the kernel is only
+  recorded.
+- On an attested pass, candidates need a positive terminal lifecycle (read before
+  holds), known zero holds, a complete inspection and no local records, with basis
+  `discard` (the existing retained-source disposition) or `strict_plain` (a
+  ledger-`live` attempt whose active journal is exactly `runId`, `clonePath` and
+  `attemptId`, and which is the clone's sole namer; any extra journal field,
+  another namer, another non-retired ledger attempt on the clone key, pins, holds
+  or any other blocker keeps the source).
+- `would_delete` counts present candidate paths and `would_delete_bytes` their
+  bytes. `would_settle` counts candidate paths that are missing (metadata-only;
+  bytes are never counted). `by_basis` splits the two by `discard` and
+  `strict_plain`. Each `list` entry (up to **32**, present first) adds `presence`
+  and `basis`. `kept = examined - would_delete - would_settle`. A path seen with
+  conflicting presence, run, basis or bytes, or also named by a refused group, is
+  kept. `journal_extra_fields` counts candidates that are marker-less canonical
+  sources whose plain journal carries fields beyond `runId` and `clonePath`; they
+  keep their existing `discard` basis. Only the count is reported (list entries
+  carry no marker), so identify them by reading each candidate's journal before M1b.
+
+The cross-checks have limits. Matching observations never prove the
+unobservable OCI-handler, crun/conmon, NRI, attachment or ownership-walk facts,
+and the kernel observation covers the successor's node only. Nothing is deleted
+or settled; deletion and settlement are PRD #3431 M1b, later and separately
+gated.
+
+**Kernel allowlist (operator note).** Any kernel release outside the exact
+`crio-crun` allowlist above yields `kernel_unaudited` and defers, including after
+a node OS upgrade. The allowlist is refreshed only through a reviewed addendum to
+the [PRD #3430 CRI-O audit](../prds/3430-pod-epoch-crio-audit.md); check the
+successor node's kernel release before and after each node roll.
+
+**Evidence latency and worker pin.** The controller still sends negative handoff
+documents when the successor pod is first seen. A positive proof is frozen at that
+point but sent once, as a version-2 document, at the first later pod update that
+carries the successor's own container IDs, so positive evidence waits for those
+IDs. If they never appear (or the pod is deleted, tainted, terminal or superseded
+first) nothing is sent and the worker reports `partial` / `evidence_timeout`
+(authority `unproven`) without an inventory. The single
+PATCH is unchanged: no retry, and a 409 conflict consumes it. No new RBAC is
+needed. `workers.image.tag` is decoupled from the controller: a new controller
+with old workers is normal until the pin moves, and an old worker refuses
+version 2 (`evidence_invalid`), so it reports no shadow data. A new worker with
+an old controller reports `legacy_evidence`.
+
+**The daemon check is a veto, not an event-subscription proof.** Read-only GET
+inventory requires stopped/created containers, no running/restarting/paused
+containers, restart policy `no`, inactive Swarm, live-restore off, no enabled
+plugins and local volumes with empty options. The unfiltered `since` event
+stream aborts on events, malformed data, EOF or transport failure. HTTP headers
+or a silent stream prove neither subscription liveness nor writer exclusion.
+The exclusion argument rests on the no-client interval, restore/restart-policy
+predicate and stopped-state proof described in the PRD.
+
+**Rollout and repair.** Runtime changes use the existing **Recreate** rollout.
+Plan for initialization lock waits, evidence latency, the bounded pass and
+shared reacquisition before the replacement admits work. A wedged EX holder can
+make a successor reach its bounded SH wait and exit nonzero for restart/retry.
+Do not unlink or replace `/data/.uzi-epoch.lock` or
+`/data/.uzi-epoch-consumed` to fix contention. The ledger records historical
+one-shot consumption: do not automatically delete, truncate or reset it,
+including when full. Torn/corrupt state, uncertain fsync and unsafe metadata
+require operator-owned repair. Positively stop the writers that can reach the
+volume before considering repair; stopping them alone does not establish that
+resetting historical consumption is safe. This guide provides no automatic
+reset or generic safe repair procedure.
+
+**Acceptance remains pending.** The accepted residual is an older pod's writer
+surviving its own termination and continuing after a later evidenced epoch;
+the immediate predecessor/overlap proof does not exclude every historical
+writer. Both base and JVM final-head image proofs remain with the lander on
+the storage host: follow the [exact-head image-proof handoff](../prds/3430-pod-epoch-image-proof.md).
+Live acceptance remains operator-owned: attest the node/storage prerequisites,
+then observe several graceful rolls and record handoff capture, projection
+latency, pass times and verdict/list agreement with actual trees and holds, as
+specified in the [acceptance boundary](../prds/3430-pod-epoch-lock-shadow.md#delivery-acceptance-and-closure).
+The local full-agent gate also remains red, with inconclusive bounded
+base/candidate controls; exact-head PR CI is still pending. Before delivery,
+a formal owner partial decision must name the actual milestone IDs and the
+outstanding M1/M2c image/full-gate criteria and M3 live acceptance. Continuation
+guidance does not waive these checks. These pending proofs are not production
+verification; deletion remains later work under #3431.
+
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1a's widened live acceptance is
+also pending: on real rolls, check strict-plain eligibility, protected and shared
+refusals, present versus missing classification, the declaration, contradiction
+and legacy-evidence behavior, and the measured caps. PRD #3430's items above stay
+pending.
 
 ### M4/M5 runbook: known items before go-live
 

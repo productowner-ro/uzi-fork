@@ -84,6 +84,13 @@ type AppSetting struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type AuthorizedForgeOrigin struct {
+	RepoID       uuid.UUID `json:"repo_id"`
+	UserID       uuid.UUID `json:"user_id"`
+	ConnectionID uuid.UUID `json:"connection_id"`
+	Origin       string    `json:"origin"`
+}
+
 type AutopilotTrigger struct {
 	RepoID      uuid.UUID          `json:"repo_id"`
 	IssueIid    int64              `json:"issue_iid"`
@@ -204,6 +211,24 @@ type CliToken struct {
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
 
+type CodexAccountAdmissionThrottle struct {
+	UserID                 uuid.UUID          `json:"user_id"`
+	ProviderAccountID      uuid.UUID          `json:"provider_account_id"`
+	RateStep               int32              `json:"rate_step"`
+	RateExpiry             pgtype.Timestamptz `json:"rate_expiry"`
+	RateLastQualifying     pgtype.Timestamptz `json:"rate_last_qualifying"`
+	OverloadStep           int32              `json:"overload_step"`
+	OverloadExpiry         pgtype.Timestamptz `json:"overload_expiry"`
+	OverloadLastQualifying pgtype.Timestamptz `json:"overload_last_qualifying"`
+	ObservationClock       pgtype.Timestamptz `json:"observation_clock"`
+	Receipts               []byte             `json:"receipts"`
+	OverloadVotes          []byte             `json:"overload_votes"`
+	EpisodeID              pgtype.UUID        `json:"episode_id"`
+	SpreadWidthMs          int32              `json:"spread_width_ms"`
+	EffectiveExpiry        pgtype.Timestamptz `json:"effective_expiry"`
+	RecoveryFloor          pgtype.Timestamptz `json:"recovery_floor"`
+}
+
 type CodexAccountRateLimit struct {
 	UserID                     uuid.UUID          `json:"user_id"`
 	ProviderAccountID          uuid.UUID          `json:"provider_account_id"`
@@ -217,6 +242,13 @@ type CodexAccountRateLimit struct {
 	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
 	EnablementSig              pgtype.Text        `json:"enablement_sig"`
+}
+
+type CodexActiveRunCooldown struct {
+	RunID                     uuid.UUID          `json:"run_id"`
+	UserID                    uuid.UUID          `json:"user_id"`
+	AccountCooldownClass      string             `json:"account_cooldown_class"`
+	AccountCooldownEligibleAt pgtype.Timestamptz `json:"account_cooldown_eligible_at"`
 }
 
 type CodexCredentialState struct {
@@ -255,6 +287,13 @@ type CodexProviderAccount struct {
 	RecoveryCause            pgtype.Text        `json:"recovery_cause"`
 }
 
+type CodexQueuedRunAdmission struct {
+	RunID                    uuid.UUID          `json:"run_id"`
+	UserID                   uuid.UUID          `json:"user_id"`
+	CodexAdmissionClass      string             `json:"codex_admission_class"`
+	CodexAdmissionEligibleAt pgtype.Timestamptz `json:"codex_admission_eligible_at"`
+}
+
 type CodexRefreshIntent struct {
 	OperationID       uuid.UUID          `json:"operation_id"`
 	UserID            uuid.UUID          `json:"user_id"`
@@ -263,6 +302,8 @@ type CodexRefreshIntent struct {
 	State             string             `json:"state"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	ProviderErrorAt   pgtype.Timestamptz `json:"provider_error_at"`
+	ReuseAttemptedAt  pgtype.Timestamptz `json:"reuse_attempted_at"`
 }
 
 type ControllerReportStatus struct {
@@ -312,6 +353,7 @@ type CrossCheck struct {
 	Dispositions            []byte             `json:"dispositions"`
 	FinalizedAt             pgtype.Timestamptz `json:"finalized_at"`
 	RepoInstructionsCommit  pgtype.Text        `json:"repo_instructions_commit"`
+	Coverage                []byte             `json:"coverage"`
 }
 
 type CustodyEpisodeNotice struct {
@@ -381,6 +423,23 @@ type ForgeConnection struct {
 	PrivilegeCheckedAt pgtype.Timestamptz `json:"privilege_checked_at"`
 	PrivilegeStatus    pgtype.Text        `json:"privilege_status"`
 	HumanUsername      pgtype.Text        `json:"human_username"`
+}
+
+type ForgeOriginCooldown struct {
+	UserID                        uuid.UUID          `json:"user_id"`
+	WorkerID                      uuid.UUID          `json:"worker_id"`
+	Origin                        string             `json:"origin"`
+	Incarnation                   uuid.UUID          `json:"incarnation"`
+	ObservationVersion            int64              `json:"observation_version"`
+	FailureStep                   int32              `json:"failure_step"`
+	CooledUntil                   pgtype.Timestamptz `json:"cooled_until"`
+	LastReason                    string             `json:"last_reason"`
+	ObservedAt                    pgtype.Timestamptz `json:"observed_at"`
+	ReservationRunID              pgtype.UUID        `json:"reservation_run_id"`
+	ReservationGeneration         pgtype.Int8        `json:"reservation_generation"`
+	ReservationIncarnation        pgtype.UUID        `json:"reservation_incarnation"`
+	ReservationVersion            pgtype.Int8        `json:"reservation_version"`
+	ReservationObservationVersion pgtype.Int8        `json:"reservation_observation_version"`
 }
 
 type GithubProjectItem struct {
@@ -457,6 +516,24 @@ type IncidentalFinding struct {
 	Labels        []byte             `json:"labels"`
 	Confidence    string             `json:"confidence"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type InstanceIntakePause struct {
+	ID       bool               `json:"id"`
+	Active   bool               `json:"active"`
+	Since    pgtype.Timestamptz `json:"since"`
+	ByUserID pgtype.UUID        `json:"by_user_id"`
+	ByLabel  pgtype.Text        `json:"by_label"`
+	Reason   pgtype.Text        `json:"reason"`
+}
+
+type InstanceIntakePauseEvent struct {
+	ID       uuid.UUID          `json:"id"`
+	At       pgtype.Timestamptz `json:"at"`
+	ByUserID pgtype.UUID        `json:"by_user_id"`
+	ByLabel  pgtype.Text        `json:"by_label"`
+	Action   string             `json:"action"`
+	Reason   pgtype.Text        `json:"reason"`
 }
 
 type Issue struct {
@@ -860,6 +937,43 @@ type RecoveryCustodyHoldFact struct {
 	DecisionNeeded      bool      `json:"decision_needed"`
 }
 
+type RecoveryPrerequisiteClosure struct {
+	ID                     uuid.UUID          `json:"id"`
+	CaptureID              uuid.UUID          `json:"capture_id"`
+	HoldID                 uuid.UUID          `json:"hold_id"`
+	RunID                  uuid.UUID          `json:"run_id"`
+	UserID                 uuid.UUID          `json:"user_id"`
+	RepoID                 uuid.UUID          `json:"repo_id"`
+	LiveRunID              pgtype.UUID        `json:"live_run_id"`
+	Checksum               string             `json:"checksum"`
+	PrerequisiteShas       []string           `json:"prerequisite_shas"`
+	PinRef                 string             `json:"pin_ref"`
+	State                  string             `json:"state"`
+	Reason                 string             `json:"reason"`
+	LastError              string             `json:"last_error"`
+	Attempts               int32              `json:"attempts"`
+	ReconciliationAttempts int32              `json:"reconciliation_attempts"`
+	NextAttemptAt          pgtype.Timestamptz `json:"next_attempt_at"`
+	AttemptDeadline        pgtype.Timestamptz `json:"attempt_deadline"`
+	InvokedAt              pgtype.Timestamptz `json:"invoked_at"`
+	InvokedDeadline        pgtype.Timestamptz `json:"invoked_deadline"`
+	PinTip                 pgtype.Text        `json:"pin_tip"`
+	ConnectionID           pgtype.UUID        `json:"connection_id"`
+	ForgeKind              pgtype.Text        `json:"forge_kind"`
+	NormalizedBaseUrl      pgtype.Text        `json:"normalized_base_url"`
+	ProjectID              pgtype.Int8        `json:"project_id"`
+	DefaultBranch          pgtype.Text        `json:"default_branch"`
+	CleanupAttempts        int32              `json:"cleanup_attempts"`
+	CleanupDeadline        pgtype.Timestamptz `json:"cleanup_deadline"`
+	CleanupExhaustedAt     pgtype.Timestamptz `json:"cleanup_exhausted_at"`
+	AbsentSince            pgtype.Timestamptz `json:"absent_since"`
+	AbsencePassID          pgtype.UUID        `json:"absence_pass_id"`
+	AuditNextAt            pgtype.Timestamptz `json:"audit_next_at"`
+	LastAuditPassID        pgtype.UUID        `json:"last_audit_pass_id"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Repo struct {
 	ID                                uuid.UUID          `json:"id"`
 	ConnectionID                      uuid.UUID          `json:"connection_id"`
@@ -878,6 +992,7 @@ type Repo struct {
 	FoldImproveUziBacklog             bool               `json:"fold_improve_uzi_backlog"`
 	CodeCrossCheckGuidance            pgtype.Text        `json:"code_cross_check_guidance"`
 	CrossCheckRepoInstructionsEnabled bool               `json:"cross_check_repo_instructions_enabled"`
+	IgnoredInferredCapabilities       []string           `json:"ignored_inferred_capabilities"`
 }
 
 type RepoToolProfile struct {
@@ -1086,6 +1201,19 @@ type Run struct {
 	CheckpointAttestedSource    pgtype.Text        `json:"checkpoint_attested_source"`
 	SourcePublicationIntent     []byte             `json:"source_publication_intent"`
 	ContinuedIssueIid           pgtype.Int8        `json:"continued_issue_iid"`
+	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
+	RetainedParkCount           int32              `json:"retained_park_count"`
+	IgnoredInferredCapabilities []string           `json:"ignored_inferred_capabilities"`
+	ReserveHoldReason           pgtype.Text        `json:"reserve_hold_reason"`
+	ReserveExemptUntil          pgtype.Timestamptz `json:"reserve_exempt_until"`
+	ReserveExemptGrantedAt      pgtype.Timestamptz `json:"reserve_exempt_granted_at"`
+	ReserveExemptCredentialID   pgtype.UUID        `json:"reserve_exempt_credential_id"`
+	ReserveExemptWindowReset    pgtype.Timestamptz `json:"reserve_exempt_window_reset"`
+	ReserveExemptPriorPct       pgtype.Int2        `json:"reserve_exempt_prior_pct"`
+	HintedCapabilities          []string           `json:"hinted_capabilities"`
+	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
+	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
+	ForgeAdmission              []byte             `json:"forge_admission"`
 }
 
 type RunCompletionAttempt struct {
@@ -1170,6 +1298,17 @@ type RunFetchReservation struct {
 	SettledAt       pgtype.Timestamptz `json:"settled_at"`
 }
 
+type RunForgeOrigin struct {
+	RunID                  uuid.UUID   `json:"run_id"`
+	UserID                 uuid.UUID   `json:"user_id"`
+	WorkerID               uuid.UUID   `json:"worker_id"`
+	Generation             int64       `json:"generation"`
+	ConnectionID           uuid.UUID   `json:"connection_id"`
+	Origin                 pgtype.Text `json:"origin"`
+	ReservationIncarnation pgtype.UUID `json:"reservation_incarnation"`
+	ReservationVersion     pgtype.Int8 `json:"reservation_version"`
+}
+
 type RunGatePresentation struct {
 	RunID          uuid.UUID          `json:"run_id"`
 	PresentationID uuid.UUID          `json:"presentation_id"`
@@ -1202,6 +1341,26 @@ type RunHeldPublication struct {
 	NextAttemptAt   pgtype.Timestamptz `json:"next_attempt_at"`
 	LastError       pgtype.Text        `json:"last_error"`
 	RefusalReason   pgtype.Text        `json:"refusal_reason"`
+}
+
+type RunLeadConfig struct {
+	RunID                  uuid.UUID          `json:"run_id"`
+	ClaimGeneration        int64              `json:"claim_generation"`
+	Phase                  string             `json:"phase"`
+	PhaseEntry             int16              `json:"phase_entry"`
+	Seq                    int16              `json:"seq"`
+	Harness                string             `json:"harness"`
+	RequestedModel         pgtype.Text        `json:"requested_model"`
+	RequestedModelSource   string             `json:"requested_model_source"`
+	ObservedModel          pgtype.Text        `json:"observed_model"`
+	ObservedModelEvidence  pgtype.Text        `json:"observed_model_evidence"`
+	RequestedEffort        pgtype.Text        `json:"requested_effort"`
+	RequestedEffortMode    string             `json:"requested_effort_mode"`
+	RequestedEffortSource  string             `json:"requested_effort_source"`
+	ObservedEffort         pgtype.Text        `json:"observed_effort"`
+	ObservedEffortEvidence pgtype.Text        `json:"observed_effort_evidence"`
+	Truncated              bool               `json:"truncated"`
+	ReportedAt             pgtype.Timestamptz `json:"reported_at"`
 }
 
 type RunMessage struct {
@@ -1494,53 +1653,59 @@ type ToolAllowlist struct {
 }
 
 type User struct {
-	ID                      uuid.UUID          `json:"id"`
-	Email                   string             `json:"email"`
-	PasswordHash            pgtype.Text        `json:"password_hash"`
-	DisplayName             pgtype.Text        `json:"display_name"`
-	IsAdmin                 bool               `json:"is_admin"`
-	IsActive                bool               `json:"is_active"`
-	TokenVersion            int32              `json:"token_version"`
-	CreatedAt               pgtype.Timestamptz `json:"created_at"`
-	LastLogin               pgtype.Timestamptz `json:"last_login"`
-	DefaultModel            pgtype.Text        `json:"default_model"`
-	AutopilotEnabled        bool               `json:"autopilot_enabled"`
-	Theme                   pgtype.Text        `json:"theme"`
-	SlackMemberID           pgtype.Text        `json:"slack_member_id"`
-	SlackNotify             bool               `json:"slack_notify"`
-	SlackResolvedID         pgtype.Text        `json:"slack_resolved_id"`
-	SlackLinkConfirmedAt    pgtype.Timestamptz `json:"slack_link_confirmed_at"`
-	OidcIssuer              pgtype.Text        `json:"oidc_issuer"`
-	OidcSubject             pgtype.Text        `json:"oidc_subject"`
-	JudgeEnabled            bool               `json:"judge_enabled"`
-	JudgeAnthropicSecretID  pgtype.UUID        `json:"judge_anthropic_secret_id"`
-	WaitOnLimit             bool               `json:"wait_on_limit"`
-	CiAutofixEnabled        pgtype.Bool        `json:"ci_autofix_enabled"`
-	SidebarTokenIds         []uuid.UUID        `json:"sidebar_token_ids"`
-	JudgeModel              pgtype.Text        `json:"judge_model"`
-	SummaryModel            pgtype.Text        `json:"summary_model"`
-	EphemeralWorkersEnabled bool               `json:"ephemeral_workers_enabled"`
-	DefaultEffort           pgtype.Text        `json:"default_effort"`
-	MrReworkEnabled         pgtype.Bool        `json:"mr_rework_enabled"`
-	AttributionEnabled      bool               `json:"attribution_enabled"`
-	NotifyEarlyLimitReset   bool               `json:"notify_early_limit_reset"`
-	SchedulesPaused         bool               `json:"schedules_paused"`
-	SchedulesPausedUntil    pgtype.Timestamptz `json:"schedules_paused_until"`
-	JudgeAnthropicBindMode  string             `json:"judge_anthropic_bind_mode"`
-	AppearanceMode          pgtype.Text        `json:"appearance_mode"`
-	LightTheme              pgtype.Text        `json:"light_theme"`
-	DarkTheme               pgtype.Text        `json:"dark_theme"`
-	Typeface                pgtype.Text        `json:"typeface"`
-	DefaultHarness          pgtype.Text        `json:"default_harness"`
-	SidebarCodexAccountIds  []uuid.UUID        `json:"sidebar_codex_account_ids"`
-	DefaultClaudeModel      pgtype.Text        `json:"default_claude_model"`
-	DefaultCodexModel       pgtype.Text        `json:"default_codex_model"`
-	DefaultCodexEffort      pgtype.Text        `json:"default_codex_effort"`
-	EphemeralDockerEnabled  bool               `json:"ephemeral_docker_enabled"`
-	PlanCrossCheckEnabled   bool               `json:"plan_cross_check_enabled"`
-	NowSummaryEnabled       pgtype.Bool        `json:"now_summary_enabled"`
-	CodeCrossCheckEnabled   bool               `json:"code_cross_check_enabled"`
-	CodexJudgeModel         pgtype.Text        `json:"codex_judge_model"`
+	ID                        uuid.UUID          `json:"id"`
+	Email                     string             `json:"email"`
+	PasswordHash              pgtype.Text        `json:"password_hash"`
+	DisplayName               pgtype.Text        `json:"display_name"`
+	IsAdmin                   bool               `json:"is_admin"`
+	IsActive                  bool               `json:"is_active"`
+	TokenVersion              int32              `json:"token_version"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	LastLogin                 pgtype.Timestamptz `json:"last_login"`
+	DefaultModel              pgtype.Text        `json:"default_model"`
+	AutopilotEnabled          bool               `json:"autopilot_enabled"`
+	Theme                     pgtype.Text        `json:"theme"`
+	SlackMemberID             pgtype.Text        `json:"slack_member_id"`
+	SlackNotify               bool               `json:"slack_notify"`
+	SlackResolvedID           pgtype.Text        `json:"slack_resolved_id"`
+	SlackLinkConfirmedAt      pgtype.Timestamptz `json:"slack_link_confirmed_at"`
+	OidcIssuer                pgtype.Text        `json:"oidc_issuer"`
+	OidcSubject               pgtype.Text        `json:"oidc_subject"`
+	JudgeEnabled              bool               `json:"judge_enabled"`
+	JudgeAnthropicSecretID    pgtype.UUID        `json:"judge_anthropic_secret_id"`
+	WaitOnLimit               bool               `json:"wait_on_limit"`
+	CiAutofixEnabled          pgtype.Bool        `json:"ci_autofix_enabled"`
+	SidebarTokenIds           []uuid.UUID        `json:"sidebar_token_ids"`
+	JudgeModel                pgtype.Text        `json:"judge_model"`
+	SummaryModel              pgtype.Text        `json:"summary_model"`
+	EphemeralWorkersEnabled   bool               `json:"ephemeral_workers_enabled"`
+	DefaultEffort             pgtype.Text        `json:"default_effort"`
+	MrReworkEnabled           pgtype.Bool        `json:"mr_rework_enabled"`
+	AttributionEnabled        bool               `json:"attribution_enabled"`
+	NotifyEarlyLimitReset     bool               `json:"notify_early_limit_reset"`
+	SchedulesPaused           bool               `json:"schedules_paused"`
+	SchedulesPausedUntil      pgtype.Timestamptz `json:"schedules_paused_until"`
+	JudgeAnthropicBindMode    string             `json:"judge_anthropic_bind_mode"`
+	AppearanceMode            pgtype.Text        `json:"appearance_mode"`
+	LightTheme                pgtype.Text        `json:"light_theme"`
+	DarkTheme                 pgtype.Text        `json:"dark_theme"`
+	Typeface                  pgtype.Text        `json:"typeface"`
+	DefaultHarness            pgtype.Text        `json:"default_harness"`
+	SidebarCodexAccountIds    []uuid.UUID        `json:"sidebar_codex_account_ids"`
+	DefaultClaudeModel        pgtype.Text        `json:"default_claude_model"`
+	DefaultCodexModel         pgtype.Text        `json:"default_codex_model"`
+	DefaultCodexEffort        pgtype.Text        `json:"default_codex_effort"`
+	EphemeralDockerEnabled    bool               `json:"ephemeral_docker_enabled"`
+	PlanCrossCheckEnabled     bool               `json:"plan_cross_check_enabled"`
+	NowSummaryEnabled         pgtype.Bool        `json:"now_summary_enabled"`
+	CodeCrossCheckEnabled     bool               `json:"code_cross_check_enabled"`
+	CodexJudgeModel           pgtype.Text        `json:"codex_judge_model"`
+	WeeklyReservePct          pgtype.Int2        `json:"weekly_reserve_pct"`
+	WeeklyReservePauseRunning bool               `json:"weekly_reserve_pause_running"`
+	VaultMode                 string             `json:"vault_mode"`
+	VaultEpoch                int64              `json:"vault_epoch"`
+	VaultAutoReunlock         bool               `json:"vault_auto_reunlock"`
+	VaultSlotGeneration       int64              `json:"vault_slot_generation"`
 }
 
 type UserCrossCheckPin struct {
@@ -1575,6 +1740,18 @@ type UserVault struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	LockNotifiedAt pgtype.Timestamptz `json:"lock_notified_at"`
+}
+
+type VaultBrowserSlot struct {
+	ID           uuid.UUID          `json:"id"`
+	UserID       uuid.UUID          `json:"user_id"`
+	BrowserID    uuid.UUID          `json:"browser_id"`
+	WrappedDek   []byte             `json:"wrapped_dek"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
+	TokenVersion int32              `json:"token_version"`
+	VaultEpoch   int64              `json:"vault_epoch"`
+	Generation   int64              `json:"generation"`
 }
 
 type Worker struct {
@@ -1648,6 +1825,10 @@ type Worker struct {
 	RegisteredPodUid         pgtype.UUID        `json:"registered_pod_uid"`
 	RollHeartbeatAt          pgtype.Timestamptz `json:"roll_heartbeat_at"`
 	DrainingReason           pgtype.Text        `json:"draining_reason"`
+	ManualCordonedAt         pgtype.Timestamptz `json:"manual_cordoned_at"`
+	ManualCordonedBy         pgtype.UUID        `json:"manual_cordoned_by"`
+	ManualCordonedByLabel    pgtype.Text        `json:"manual_cordoned_by_label"`
+	ManualCordonReason       pgtype.Text        `json:"manual_cordon_reason"`
 }
 
 type WorkerActiveRun struct {
@@ -1660,6 +1841,23 @@ type WorkerActiveRun struct {
 	SnapshotEpoch        int64              `json:"snapshot_epoch"`
 	ReportedAt           pgtype.Timestamptz `json:"reported_at"`
 	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
+	CooldownOperation    []byte             `json:"cooldown_operation"`
+	CooldownClass        pgtype.Text        `json:"cooldown_class"`
+	CooldownEpisodeID    pgtype.UUID        `json:"cooldown_episode_id"`
+	CooldownEligibleAt   pgtype.Timestamptz `json:"cooldown_eligible_at"`
+	CooldownObservedAt   pgtype.Timestamptz `json:"cooldown_observed_at"`
+	CooldownUntil        pgtype.Timestamptz `json:"cooldown_until"`
+}
+
+type WorkerCordonEvent struct {
+	ID         uuid.UUID          `json:"id"`
+	OwnerID    uuid.UUID          `json:"owner_id"`
+	WorkerID   uuid.UUID          `json:"worker_id"`
+	ActorID    uuid.UUID          `json:"actor_id"`
+	ActorLabel string             `json:"actor_label"`
+	Action     string             `json:"action"`
+	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
+	Reason     pgtype.Text        `json:"reason"`
 }
 
 type WorkerPendingOutcomeIdentity struct {

@@ -19,7 +19,7 @@ func (h *Handler) mountWorkersRoutes(r chi.Router, hostedLimiter *mw.Limiter) {
 	// strictly worse than writing one). Hosted routes are out of scope (cookie).
 	r.Route("/workers", func(r chi.Router) {
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Use(h.requireUser())
 			r.Get("/", h.ListWorkers)
 			// PATCH rebinds a worker between the OWNER'S OWN Anthropic tokens
 			// (PRD #104 M3, D8). RequireUser, unlike the POST below: it mints
@@ -29,13 +29,15 @@ func (h *Handler) mountWorkersRoutes(r chi.Router, hostedLimiter *mw.Limiter) {
 			// ownership check holding, which is why the composite FK enforces it in
 			// the schema too.
 			r.Patch("/{id}", h.PatchWorker)
+			r.Post("/{id}/cordon", h.CordonWorker)
+			r.Delete("/{id}/cordon", h.UncordonWorker)
 			// DELETE stays swapped: destroying a worker exfiltrates nothing and the
 			// loss is the owner's own. hostedLimiter runs AFTER RequireUser (B.4) and
 			// covers BOTH worker kinds (the middleware cannot see the row's kind).
 			r.With(hostedLimiter.PerUserMiddleware).Delete("/{id}", h.DeleteWorker)
 		})
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Use(h.requireAuth())
 			r.Post("/", h.CreateWorker)
 			// Hosted workers (PRD #58), out of scope for v1 CLI. Static paths matched
 			// ahead of /{id}. Both exist regardless of WORKER_HOSTING_ENABLED:

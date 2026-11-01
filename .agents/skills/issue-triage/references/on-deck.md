@@ -29,9 +29,10 @@ Rewrite the body before queuing, in the maintainer's words:
 ## Problem      1-3 sentences; anchors as path:symbol, never line numbers
 ## Fix          pinned direction per site
 ## Out of scope what the run must not touch
-## Acceptance   testable checks; regression test watched both ways; gate to run
+## Acceptance   testable checks; regression test watched both ways; gate to run (agent/uzi: boundary below)
 ```
 
+- **Agent/uzi acceptance**: an issue sent to uzi touching `agent/**` must not name `task gate:agent` or `task gate` as acceptance. State the in-run integration gate and separate CI boundary from [AGENTS.md Run economy](../../../../AGENTS.md#run-economy-agents), using the exact label `full agent suite: exact-head PR CI`; the full unit suite stays **pending CI** after focused checks, a landing obligation the plan lists in its "Landing obligations" section, outside its milestones. This default applies to newly approved plans only, without waiving explicit issue requirements or frozen completion criteria.
 - Rewrite a non-maintainer body (bot `agent-found` included) this way; the run plans from the body alone.
 - **Split**: when only part of an issue qualifies, file that part as a new issue with this body and "Split from #N", trim the parent body to the remainder, and comment on the parent with the link.
 
@@ -44,6 +45,7 @@ The buddy reviews the exact final body (pin its hash) and the label set; `review
 Standing user grant for issues a session files in this repo. It does not cover backlog triage, schedule changes or merging.
 
 - A new issue meeting every criterion gets `on-deck` + `uzi` + `reviewed` + `area::*`/`priority::*` at filing, once the buddy approved its exact title, body and labels. Post body and labels together; never add `bug` or `Planned`.
+- If you will land its sweep run, arm `uzi-watcher`'s `watch-issue.sh` at filing with a pre-queue baseline, repo selector and verified completion route.
 - A newly filed issue whose change belongs to one harness carries its matching `harness::codex` or `harness::claude` label, never both. This is an explicit filing decision; runtime selection does not infer a harness from file paths. These labels select the automatic-start harness, not a sweep lane or eligibility signal; include them in the buddy's label review.
 - Before requesting that approval, run the freshness check and settle routine implementation choices yourself. Ask the user only for unavailable evidence or a product/design decision. A body change needs fresh approval.
 - Anything else (PRD, large or multi-outcome work, an excluded risk class, a failed criterion): name the reason and ask the user for its disposition unless already given: hold, gated dispatch (uzi-watcher), local work, or an explicitly authorized sweep. Never fall back to `bug`/`Planned` on your own.

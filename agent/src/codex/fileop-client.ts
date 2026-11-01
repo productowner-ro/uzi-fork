@@ -76,6 +76,16 @@ function coerceResponse(value: unknown): FileopResponse {
   }
   return {
     ok,
+    ...(o.ok === false && typeof o.code === "string" ? { origin: "helper" as const } : {}),
+    tail: typeof o.tail === "number" ? o.tail : undefined,
+    fromEnd: typeof o.fromEnd === "boolean" ? o.fromEnd : undefined,
+    partialFirstLine: typeof o.partialFirstLine === "boolean" ? o.partialFirstLine : undefined,
+    offset: typeof o.offset === "number" ? o.offset : undefined,
+    linesReturned: typeof o.linesReturned === "number" ? o.linesReturned : undefined,
+    partialLastLine: typeof o.partialLastLine === "boolean" ? o.partialLastLine : undefined,
+    incomplete: typeof o.incomplete === "boolean" ? o.incomplete : undefined,
+    ...(Object.hasOwn(o, "reason") ? { reason: o.reason } : {}),
+    scannedBytes: typeof o.scannedBytes === "number" ? o.scannedBytes : undefined,
     code: typeof o.code === "string" ? o.code : undefined,
     size: typeof o.size === "number" ? o.size : undefined,
     data: typeof o.data === "string" ? o.data : undefined,
@@ -83,6 +93,7 @@ function coerceResponse(value: unknown): FileopResponse {
     type: typeof o.type === "string" ? o.type : undefined,
     entries,
     truncated: typeof o.truncated === "boolean" ? o.truncated : undefined,
+    ...(Object.hasOwn(o, "truncated") && typeof o.truncated !== "boolean" ? { truncatedInvalid: true as const } : {}),
   };
 }
 
@@ -137,6 +148,9 @@ export class FileopHelperClient implements FileopClient {
       if (request.newPath !== undefined) frame.newPath = request.newPath;
       if (request.data !== undefined) frame.data = request.data;
       if (request.old !== undefined) frame.old = request.old;
+      if (request.offset !== undefined) frame.offset = request.offset;
+      if (request.limit !== undefined) frame.limit = request.limit;
+      if (request.tail !== undefined) frame.tail = request.tail;
       let line: string;
       try {
         line = `${JSON.stringify(frame)}\n`;

@@ -34,7 +34,7 @@ func (q *Queries) DeleteRateLimits(ctx context.Context, userID uuid.UUID) (int64
 
 const getAnthropicTokenToPoll = `-- name: GetAnthropicTokenToPoll :one
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev, s.anthropic_success_generation
+       s.enablement_rev, s.anthropic_success_generation, u.vault_epoch
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.user_id = $1 AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
@@ -55,6 +55,7 @@ type GetAnthropicTokenToPollRow struct {
 	NotifyEarlyLimitReset      bool      `json:"notify_early_limit_reset"`
 	EnablementRev              int64     `json:"enablement_rev"`
 	AnthropicSuccessGeneration int64     `json:"anthropic_success_generation"`
+	VaultEpoch                 int64     `json:"vault_epoch"`
 }
 
 // The single-token sibling of ListAnthropicTokensToPoll for the out-of-band poke
@@ -74,6 +75,7 @@ func (q *Queries) GetAnthropicTokenToPoll(ctx context.Context, arg GetAnthropicT
 		&i.NotifyEarlyLimitReset,
 		&i.EnablementRev,
 		&i.AnthropicSuccessGeneration,
+		&i.VaultEpoch,
 	)
 	return i, err
 }
@@ -114,7 +116,7 @@ func (q *Queries) GetRateLimitsForToken(ctx context.Context, arg GetRateLimitsFo
 
 const listAnthropicTokensToPoll = `-- name: ListAnthropicTokensToPoll :many
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev, s.anthropic_success_generation
+       s.enablement_rev, s.anthropic_success_generation, u.vault_epoch
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
@@ -129,6 +131,7 @@ type ListAnthropicTokensToPollRow struct {
 	NotifyEarlyLimitReset      bool      `json:"notify_early_limit_reset"`
 	EnablementRev              int64     `json:"enablement_rev"`
 	AnthropicSuccessGeneration int64     `json:"anthropic_success_generation"`
+	VaultEpoch                 int64     `json:"vault_epoch"`
 }
 
 // Every anthropic_token secret to poll each tick (PRD #104 M5): the token's id and
@@ -174,6 +177,7 @@ func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropi
 			&i.NotifyEarlyLimitReset,
 			&i.EnablementRev,
 			&i.AnthropicSuccessGeneration,
+			&i.VaultEpoch,
 		); err != nil {
 			return nil, err
 		}
@@ -340,6 +344,7 @@ SELECT
     u.id            AS user_id,
     u.email         AS email,
     u.display_name  AS display_name,
+    u.vault_mode,
     s.id            AS user_secret_id,
     s.label         AS label,
     s.is_default    AS is_default,
@@ -363,6 +368,7 @@ type ListRateLimitsRow struct {
 	UserID           uuid.UUID          `json:"user_id"`
 	Email            string             `json:"email"`
 	DisplayName      pgtype.Text        `json:"display_name"`
+	VaultMode        string             `json:"vault_mode"`
 	UserSecretID     pgtype.UUID        `json:"user_secret_id"`
 	Label            pgtype.Text        `json:"label"`
 	IsDefault        pgtype.Bool        `json:"is_default"`
@@ -415,6 +421,7 @@ func (q *Queries) ListRateLimits(ctx context.Context) ([]ListRateLimitsRow, erro
 			&i.UserID,
 			&i.Email,
 			&i.DisplayName,
+			&i.VaultMode,
 			&i.UserSecretID,
 			&i.Label,
 			&i.IsDefault,
@@ -516,6 +523,73 @@ func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) (
 			&i.SevenDayPct,
 			&i.SevenDayResetsAt,
 			&i.Source,
+			&i.SyncedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listReserveClaudeTokens = `-- name: ListReserveClaudeTokens :many
+SELECT s.id            AS user_secret_id,
+       s.is_default    AS is_default,
+       s.auto_eligible AS auto_eligible,
+       (s.anthropic_rejected_at IS NOT NULL)::boolean AS rejected,
+       (rl.user_secret_id IS NOT NULL)::boolean AS has_reading,
+       rl.seven_day_pct,
+       rl.seven_day_resets_at,
+       rl.synced_at
+FROM user_secrets s
+LEFT JOIN anthropic_rate_limits rl
+       ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
+WHERE s.user_id = $1
+  AND s.kind = 'anthropic_token'
+  AND s.disabled_at IS NULL
+ORDER BY s.id
+`
+
+type ListReserveClaudeTokensRow struct {
+	UserSecretID     uuid.UUID          `json:"user_secret_id"`
+	IsDefault        bool               `json:"is_default"`
+	AutoEligible     bool               `json:"auto_eligible"`
+	Rejected         bool               `json:"rejected"`
+	HasReading       bool               `json:"has_reading"`
+	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
+	SevenDayResetsAt pgtype.Timestamptz `json:"seven_day_resets_at"`
+	SyncedAt         pgtype.Timestamptz `json:"synced_at"`
+}
+
+// PRD #3522 M3: every ENABLED anthropic_token one user holds with the 7-day reading the weekly
+// usage reserve evaluates (usagereserve.EvaluateClaude), plus the two facts the reserve's lane
+// resolution needs: is_default (the credential an unbound lane opens), auto_eligible (the
+// pooled set an auto lane draws from) and rejected (a probe-rejected token is skipped by the auto
+// picker, autoselect.Floor, so it is not a permitted pooled token however fresh its reading). Driven from user_secrets so a token with no reading
+// still appears (has_reading false, which the evaluator turns into "unknown", never "ok"). A
+// reading counts only at the token's current enablement revision, exactly like
+// ListAutoSelectCandidates, so a pre-disable reading cannot vouch for a re-enabled token. A
+// DISABLED token is not listed: it can never be opened, so the claim refuses it on its own.
+func (q *Queries) ListReserveClaudeTokens(ctx context.Context, userID uuid.UUID) ([]ListReserveClaudeTokensRow, error) {
+	rows, err := q.db.Query(ctx, listReserveClaudeTokens, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListReserveClaudeTokensRow{}
+	for rows.Next() {
+		var i ListReserveClaudeTokensRow
+		if err := rows.Scan(
+			&i.UserSecretID,
+			&i.IsDefault,
+			&i.AutoEligible,
+			&i.Rejected,
+			&i.HasReading,
+			&i.SevenDayPct,
+			&i.SevenDayResetsAt,
 			&i.SyncedAt,
 		); err != nil {
 			return nil, err

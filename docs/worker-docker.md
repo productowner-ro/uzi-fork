@@ -95,16 +95,34 @@ bytes or inodes across two fresh samples, runs a short, fixed sequence of
 cache prunes against the daemon: `docker image prune -f`, then
 `docker builder prune -f`, and — only if the volume is still over the
 threshold — `docker image prune -a -f --filter until=24h` (any unused image
-built more than a day ago). It only does this once the worker is provably
-idle: no active run, chat, or claim in flight, and the api has confirmed on a
-fresh heartbeat that the worker holds no unpublished work; any doubt skips
-the attempt rather than risking one. Look for `dind-prune-completed`,
+built more than a day ago). Before pruning, it closes claim admission,
+waits for in-flight claims to drain, checks for no tracked run, chat,
+cross-check or active-run registry entry, requires a fresh post-activity
+heartbeat reporting no custody, and checks `docker ps -q` for no running
+containers. These checks do not establish daemon-wide exclusion: accepted
+Docker work may still overlap. Unknown, missing, or stale custody skips the
+attempt. Look for `dind-prune-completed`,
 `dind-prune-failed`, `dind-prune-insufficient`, or `dind-prune-deferred` in
 the worker's logs to see what it did.
 
+Custody is **worker-wide at prune admission**: an open recovery hold keeps a
+new attempt out of this original cache/image-prune sequence, even when other
+runs created the eligible resources. Custody is checked once, before
+`docker ps -q`, and is not re-checked between the prune commands that follow.
+Classifying DinD as scratch does not alone supersede the D5 custody gate.
+The [M1 investigation](../adr/1759-dind-data-metering-and-prune.md#investigation-checkpoint--3653-m1-2026-10-30)
+found that native BuildKit protects acquired cache references, supporting a
+proposal for a narrow builder-only amendment at a new gate. That proposal
+is not activated policy or permission to prune while custody is held.
+
 **Cache prune leaves containers and volumes in place.** It is tried first when
-eligible, but a skip, failure, timeout, or deferral because containers are
-running does not prevent the separate **DinD maintenance** path below.
+eligible, but a skip, failure, timeout, or insufficient relief does not
+authorize maintenance readiness. Separately eligible **DinD maintenance**
+may proceed under its own terminal-run, custody, identity/readiness,
+anonymous-volume and PVC gates (#2257), unchanged below. Busy-worker
+deferral, a pending maintenance drain, and insufficient relief are distinct
+conditions. The investigation measured disposable fixtures; hosted reclaimed
+bytes remain unmeasured. Cache and maintenance thresholds are unchanged.
 
 ### DinD scratch and pressure recycle
 
@@ -115,7 +133,10 @@ can delete the entire `dind-data` PVC, including **named volumes**. That
 DinD maintenance recycle loses DinD state only: the shared run working
 directory (`/data/runner`) is on the `/data` volume and is kept (see
 [Run directory on the data volume](#run-directory-on-the-data-volume)). Keep deliverables in git, published checkpoints, or captured
-work. There is no preservation inventory or migration. An admin can opt out
+work. Authorized scratch cleanup can remove locally cached images that cannot
+be fetched again and state backed by build cache, preventing later image/tag
+reuse. There is no
+preservation inventory or migration. An admin can opt out
 before stop with `UZI_WORKER_DISK_RECYCLE_ENABLED=false`; an operation that
 has already started stopping completes safely even if disabled.
 
@@ -229,6 +250,56 @@ per-pod `emptyDir`.
   [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md)). It does not restore
   rootless-container writability.
 
+### Pod-epoch shadow reclaim
+
+Hosted Docker workers participate in a lifetime shared epoch lock on supported
+ext4/xfs data volumes, including when shadow evaluation is off. On replacement,
+a fresh pod can evaluate retained attempt trees before accepting runs and log
+`pod_epoch_reclaim`: `eligible`, `deferred` or `partial`, with a stable reason,
+examined/would-delete/would-settle/kept counts and up to 32 candidate entries
+with sizes, presence (`present` or `missing`) and basis (`discard` or
+`strict_plain`). `would_delete` counts present candidate paths; `would_settle`
+counts missing ones (metadata only, never counted in bytes); `by_basis` splits
+them; `journal_extra_fields` counts candidates whose marker-less plain journal
+carries extra fields (a count only; list entries carry no marker). Partial or unknown bytes and incomplete inventories are marked explicitly.
+The line also carries `authority` (`undeclared`, `legacy_evidence`,
+`contradicted`, `unproven` or `attested`, with a fixed reason),
+`evidence_version` and, once version-2 binding and prefix checks pass, the node's kernel release.
+
+**This is shadow reporting:** the pass deletes no attempt trees, settles no
+records, releases no recovery holds and removes no stopped containers. Existing
+startup reapers and DinD maintenance retain their separate behavior. Compose and
+non-Docker workers are unchanged. Deletion and settlement are later work under
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md) (M1b).
+
+The administrator's `workers.docker.podEpochReclaim.runtime` defaults to unset.
+A fresh default-off pod logs `deferred` / `runtime_not_declared` immediately
+after startup reaping, without waiting for predecessor evidence; keeping trees
+needs no declaration. Setting a value attests the full audited runtime/storage
+contract, and the worker cross-checks it against the controller's version-2
+evidence (container-ID runtime prefixes of both pods). Matching observations do
+not prove the facts they cannot see. The lifetime lock still applies. A consumed
+pod does not evaluate again on process restart.
+
+For `crio-crun`, the node's kernel release must be exactly `6.12.0-243.el10.x86_64`
+or `6.12.0-243.el10.aarch64`. Any other release, including after a node OS
+upgrade, reports `kernel_unaudited` and defers; the list is refreshed only through
+a reviewed addendum to the
+[PRD #3430 CRI-O audit](../prds/3430-pod-epoch-crio-audit.md).
+
+The worker image pin (`workers.image.tag`) moves separately from the controller.
+An old worker refuses version-2 evidence and reports no shadow data; a new worker
+with an old controller reports `legacy_evidence`. Positive evidence is sent only
+once the successor reports its first container IDs, so it can arrive later than
+the negative case.
+
+Rolls can take longer while startup waits for epoch ownership or evidence.
+A lock timeout refuses startup and retries through a nonzero exit; deleting
+lock or ledger files is not a contention remedy. See the
+[operator prerequisites, bounds and recovery cautions](../deploy/README.md#pod-epoch-shadow-reclaim-prd-3430)
+before declaring a runtime. Final-head base/JVM image proofs and live shadow
+acceptance remain pending; this is not production-verification evidence.
+
 ### Upgrading and rolling back
 
 - **Upgrade order.** A worker image that carries the runner-shared layout
@@ -237,8 +308,16 @@ per-pod `emptyDir`.
   bumps that pin when the agent changed. A new controller with an old image
   fails closed: the `runner-init` init container refuses the pod (it stays
   in `Init:CrashLoopBackOff` and the roll health names the init container)
-  before it, dind or the worker touch the run directory. The `seed-nix`
-  init container runs earlier and behaves as before. An old controller with a new image works.
+  before it, dind or the worker touch the run directory. On a Docker worker
+  the `seed-nix` init container runs earlier and now calls the image's
+  pod-epoch helper (`/usr/local/lib/uzi/pod-epoch-init.cjs`) to record the
+  pod before seeding, so it needs the new image too: on an old image it
+  fails closed the same way (`Init:CrashLoopBackOff`, named by the roll
+  health) before `runner-init`. An old controller with a new image boots
+  (image skew). Rolling the controller back after the layout migration is a
+  different case: drain recovery custody first, and recovery records for
+  migrated clones read as missing until you roll forward again (see
+  **Rolling back the controller** below and ADR-3153 D10).
 - **Custody-held workers migrate later.** A Docker worker that holds
   recovery custody for a run stays on its old pod layout (the `emptyDir`)
   until custody releases, so its unpublished clone is not lost by the

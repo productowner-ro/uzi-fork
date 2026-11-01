@@ -155,6 +155,11 @@ timeout is at most 10 minutes; other hosts have their own limits.
 <this skill's directory>/scripts/watch-run.sh RUN completed,failed,cancelled 60   # to the end only
 ```
 
+For a sweep issue you will land, capture `SINCE=$(jq -nr now)` before queueing and arm
+`<this skill's directory>/scripts/watch-issue.sh --repo PATH_OR_UUID --since "$SINCE" ISSUE` at filing with a verified
+completion route. Keep that baseline on re-arms. It discovers a new run, even if already
+terminal, then delegates to `watch-run.sh` with the remaining poll budget and no plan watermark.
+
 For post-approval delivery, prefer the lander's full stop set (new plan, question,
 pause and terminal states), approved-plan watermark and explicit MAX covering the
 remaining budget. A terminal-only watch can miss a parked duty. Observation expiry
@@ -168,25 +173,48 @@ Preserve the log in a private owner-chosen path, not only the harness's shell-ou
 
 It also exits 4 with `STOP=needs_attention` and final `RESULT=attention` plus evidence when a non-terminal run keeps a
 non-ok health (not `slow`) or a stale worker heartbeat for `WATCH_ATTENTION_POLLS` (default 3)
-consecutive polls; `0` disables. It means investigate, not dead. Exit 4 ends coverage: in the
+consecutive polls, or sits in `recovery_wait` with cause `data_volume_full` (a counted disk park;
+each park is its own episode, `data_volume_full@park<N>`, so the next park alerts again; act
+before the run reaches its park cap by freeing the worker's `/data`); `0` disables. It means investigate, not dead. Exit 4 ends coverage: in the
 same turn, investigate, then launch the printed `REARM=` line in the background. It acks that
 health episode, so a run that stays stalled in it (a long test suite) stops only on a park,
 a terminal state, a new episode or a stale heartbeat. A missed re-arm is how a question parks unseen.
+For exit 4 with `health_reason` "your vault is locked", hand the owner `! uzi vault unlock`
+(requires their password); only they can unlock it. After unlock, launch the printed `REARM=` in the background.
 
 The thirteen run statuses and which are terminal are in the `uzi-cli` skill. A run at
 `awaiting_input` asked a question: read it from `uzi run logs RUN --json` (a `question`
 message) and answer with `uzi run answer`. A completion-interlock question is different: a
 plain answer cannot exempt a frozen milestone. Record the decision with `uzi run decide RUN`
 (`--continue`, `--partial <kept ids> --reason '...'` or `--accept <ids> --reason '...'`), on the
-live question or on a run already parked in the completion hold. **Never answer with "keep waiting"**
+live question or on a run already parked in the completion hold. Then re-arm the poller with
+the answered question's seq as its 6th arg (`min-question-seq`, script header). **Never answer with "keep waiting"**
 (e.g. for a dependency PR to merge): an answer resumes the run, and a run with nothing to do spends
 its iteration budget on no-op turns and fails (#2657). Leave the question unanswered, or answer and
 immediately `uzi run pause RUN --now`. A run at `limit_wait` is parked on an Anthropic
 usage limit and resumes itself — keep waiting. `recovery_wait` with cause
 `worker_requeue_exhausted` never resumes itself: the poller always stops on it
 (`STOP=recovery_wait:worker_requeue_exhausted`, exit 0, whatever the stop set, even one naming `recovery_wait`). Back up the
-work (*Recovering a failed run's work*), then `uzi run resume` or cancel; other
-`recovery_wait` causes keep their existing polling behaviour. `uzi-lander` uses this same poller for its
+work (*Recovering a failed run's work*), then `uzi run resume` or cancel. It stops the same way on
+an owner-held `retained_recovery_exhausted` park (retry stamp explicitly null; retries capped):
+`STOP=recovery_wait:retained_recovery_exhausted`; custody is kept, so Resume or cancel. A stamped
+park of that cause retries itself and keeps polling. An integrity refusal,
+`retained_recovery_adoption_failed`, also stops the poller (exit 0,
+`STOP=recovery_wait:retained_recovery_adoption_failed`) regardless of retry timing:
+local work and custody are preserved, with no automatic retry. Back up available
+work, then ask the owner to Resume or Cancel; Resume requests a bounded attempt,
+not assured success, and another adoption failure holds again. Other
+`recovery_wait` causes keep polling under their existing rules. Every `worker_memory_pressure`
+park stops with `STOP=recovery_wait:worker_memory_pressure` (exit 0), regardless of `memory_hold`:
+remaining interventions do not authorize automatic retries. Back up available work first,
+then ask the owner to Resume or Cancel.
+An unsettled memory continuation (the predecessor's source use was never positively ended,
+and the journal records the park) re-parks at the same hold on Resume until #3639, so Cancel
+or an operator discard is the exit; a worker restart does not release it. Without a recorded
+park, a different worker process fails the run (`preservation_failed`); the same process
+retries until the requeue cap (`worker_requeue_exhausted` or `failed`).
+`backup-runs.sh` accepts the v1 `memoryPark` journal field.
+`uzi-lander` uses this same poller for its
 blind watch to terminal.
 
 **Watching for a REVISED plan (after `uzi run revise`) uses the plan-seq form.** The
@@ -224,6 +252,11 @@ as the poller's fifth argument.
 
 Check these traps before every approve:
 
+- **Landing or owner-only items as milestones.** A milestone consisting only of exact-head
+  PR CI (a landing obligation) or only owner-only live/hosted acceptance is a `revise`: move it
+  to the plan's "Landing obligations" / "Owner acceptance" section. A plan with Owner acceptance
+  items must say the delivery is `non_closing`. Worker obligations hidden in either section
+  are also a `revise`.
 - **Workflow-file edits.** grep the plan for `.github/workflows`. Any edit there means the
   run **will fail at push** (see *The workflow-scope guardrail*). `revise` the plan so the
   worker wires the change everywhere it CAN reach (e.g. `Taskfile.yml`) and leaves the

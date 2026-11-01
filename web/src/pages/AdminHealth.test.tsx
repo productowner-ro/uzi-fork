@@ -69,6 +69,22 @@ async function renderHealth(doc: HealthDoc, fleet: AdminWorker[] = [], strict = 
   return utils;
 }
 
+it("links a waiting run on the health detail surface", async () => {
+  const doc = ownerOnlyDoc();
+  const queue = doc.checks.find((c) => c.id === "queue.waiting")!;
+  queue.evidence = [Object.assign(
+    { label: "Waiting run", value: "Owner: Alex Example (22930000); waited 48m. This background run is no longer deprioritized, but has not yet been picked up." },
+    { run_id: ownerOnlyWaitingRunId, owner_id: ownerOnlyWaitingOwnerId },
+  )];
+  const { container } = await renderHealth(doc);
+  const item = attentionItem(container, "queue.waiting")!;
+  const link = within(item).getByRole("link", { name: "Run 22930000" });
+  expect(link.getAttribute("href")).toBe(`/runs/${ownerOnlyWaitingRunId}`);
+  expect(link.getAttribute("title")).toBe(`Run ${ownerOnlyWaitingRunId}`);
+  expect(within(item).getByTitle(`Owner ${ownerOnlyWaitingOwnerId}`).textContent).toBe(queue.evidence[0].value);
+  expect(item.textContent).not.toContain(ownerOnlyWaitingRunId);
+});
+
 // An attention item (or null) for a check id (the id has a dot, so an attribute selector).
 function attentionItem(container: HTMLElement, id: string): HTMLElement | null {
   return container.querySelector(`[id="c-${id}"]`);
@@ -133,9 +149,46 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("shows budget pressure with zero quota refusals as an owner housekeeping warning", async () => {
+    const doc = healthySilentDoc();
+    const storage = doc.checks.find((c) => c.id === "recovery.storage")!;
+    storage.severity = "warn";
+    storage.summary = "At least 80% of budget: per-owner recovery, instance recovery, shared stored files; 0 captures currently marked quota-refused.";
+    storage.evidence = [
+      { label: "Quota-refused captures", value: "0" },
+      { label: "Maximum owner recovery bytes", value: "80" },
+      { label: "Recovery bytes", value: "160" },
+      { label: "Shared stored bytes", value: "240" },
+      { label: "Recovery per-owner limit", value: "100 bytes" },
+      { label: "Recovery instance limit", value: "200 bytes" },
+      { label: "Shared stored-files limit", value: "300 bytes" },
+    ];
+    storage.action = "Reduce stored bytes or raise the pressured budgets before recovery uploads are refused.";
+    expect(storage.scope).toBe("owner");
+    expect(storage.group).toBe("housekeeping");
+    const pressured = retally(doc);
+    expect(pressured.status).toBe("warn");
+    expect(pressured.blocking).toBe(false);
+
+    const { container } = await renderHealth(pressured);
+    expect(attentionIds(container)).toEqual(["recovery.storage"]);
+    const item = attentionItem(container, "recovery.storage")!;
+    expect(within(item).getByText("Warn")).toBeTruthy();
+    expect(within(item).getByText("Recovery storage")).toBeTruthy();
+    expect(within(item).getByText(/· Housekeeping/)).toBeTruthy();
+    expect(within(item).getByText("At least 80% of budget: per-owner recovery, instance recovery, shared stored files; 0 captures currently marked quota-refused.")).toBeTruthy();
+    for (const e of storage.evidence) {
+      const label = within(item).getByText(e.label);
+      expect(label.nextElementSibling?.textContent).toBe(e.value);
+    }
+    expect(within(item).getByText(storage.action)).toBeTruthy();
+    expect(band("1 check needs attention").getAttribute("role")).toBe("status");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("shows both Codex pricing reasons and operator docs without blocking work", async () => {
     const doc = healthySilentDoc();
-    expect(doc.checks).toHaveLength(22);
+    expect(doc.checks).toHaveLength(23);
     const pricing = doc.checks.find((c) => c.id === "pricing.codex")!;
     pricing.severity = "warn";
     pricing.summary = "2 Codex models lack usable pricing";
@@ -161,15 +214,15 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect(container.querySelector('[role="alert"], [role="status"]')).toBeNull();
     expect(screen.queryByRole("heading", { name: /blocking|attention/ })).toBeNull();
     expect(attentionIds(container)).toEqual([]);
-    // Every check's shape carries its word; all 22 read OK, none Warn/Danger.
-    expect(screen.getAllByText("OK").length).toBe(22);
+    // Every check's shape carries its word; all 23 read OK, none Warn/Danger.
+    expect(screen.getAllByText("OK").length).toBe(23);
     expect(screen.queryByText(/^(Warn|Danger|Unknown)$/)).toBeNull();
     expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
 
   it("keeps owner danger evidence and action visible without claiming an instance block", async () => {
     const { container } = await renderHealth(ownerOnlyDoc());
-    expect(band("3 checks need attention; no instance-wide blocker detected").getAttribute("role")).toBe("alert");
+    expect(band("4 checks need attention; no instance-wide blocker detected").getAttribute("role")).toBe("alert");
     const capacity = attentionItem(container, "fleet.capacity")!;
     expect(within(capacity).getByText("2")).toBeTruthy();
     for (const id of ["fleet.capacity", "queue.waiting"]) {
@@ -178,7 +231,7 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
       expect(within(item).getByText(`run ${ownerOnlyWaitingRunId}; owner ${ownerOnlyWaitingOwnerId}; waited 36m; stored reason no online worker can run this — it needs a capability none of your workers has; provision a ca`)).toBeTruthy();
     }
     expect(within(capacity).getByText(/Recover or provision a worker/)).toBeTruthy();
-    expect(attentionIds(container)).toEqual(["fleet.capacity", "queue.waiting", "forge.ciwatch"]);
+    expect(attentionIds(container)).toEqual(["fleet.capacity", "queue.waiting", "forge.ciwatch", "recovery.storage"]);
   });
 
   it("warn (degraded): a warn status band and both warn items expanded with their action", async () => {
@@ -419,12 +472,12 @@ describe("AdminHealth — copy feedback lifecycle", () => {
 describe("AdminHealth — All checks inventory (M4)", () => {
   it("counts: header and per-group status, na excluded from every denominator", async () => {
     await renderHealth(healthySilentDoc());
-    expect(screen.getByText("22 of 22 passing")).toBeTruthy();
+    expect(screen.getByText("23 of 23 passing")).toBeTruthy();
     // workers (6, fleet.rundisk, fleet.quarantine and fleet.memory_authority included), queue (2), control (4),
-    // integrations (3), housekeeping (7).
+    // integrations (3), housekeeping (8, maintenance.active included).
     // Exact per-string tallies: integrations reads "all 3 passing", control "all 4 passing".
     expect(screen.getAllByText("all 6 passing").length).toBe(1);
-    expect(screen.getByText("all 7 passing")).toBeTruthy();
+    expect(screen.getByText("all 8 passing")).toBeTruthy();
     expect(screen.getAllByText("all 2 passing").length).toBe(1);
     expect(screen.getAllByText("all 3 passing").length).toBe(1);
     expect(screen.getAllByText("all 4 passing").length).toBe(1);
@@ -433,7 +486,7 @@ describe("AdminHealth — All checks inventory (M4)", () => {
 
   it("incident: attention groups read 'K of N need attention'", async () => {
     await renderHealth(incidentDoc());
-    expect(screen.getByText("18 of 22 passing")).toBeTruthy();
+    expect(screen.getByText("19 of 23 passing")).toBeTruthy();
     expect(screen.getByText("2 of 6 need attention")).toBeTruthy(); // workers: fleet.rundisk, fleet.quarantine and fleet.memory_authority stay ok
     expect(screen.getByText("1 of 2 need attention")).toBeTruthy(); // queue
     expect(screen.getByText("1 of 3 need attention")).toBeTruthy(); // integrations
@@ -504,7 +557,7 @@ describe("AdminHealth — All checks inventory (M4)", () => {
     expect(screen.getByText("All systems normal.")).toBeTruthy();
     // fleet.roll, controller.report, db.size and slack.socket are N/A (never green, never gone).
     expect(screen.getAllByText("N/A").length).toBe(4);
-    expect(screen.getByText("18 of 18 passing, 4 not applicable")).toBeTruthy();
+    expect(screen.getByText("19 of 19 passing, 4 not applicable")).toBeTruthy();
     expect(screen.getByText("all 5 passing, 1 not applicable")).toBeTruthy(); // workers (fleet.rundisk, fleet.quarantine and fleet.memory_authority apply)
     expect(screen.getAllByText("all 2 passing, 1 not applicable").length).toBe(1); // integrations
     expect(screen.getAllByText("all 2 passing, 2 not applicable").length).toBe(1); // control
@@ -522,7 +575,7 @@ describe("AdminHealth — All checks inventory (M4)", () => {
   it("a group whose checks are all N/A reads 'not applicable'", async () => {
     await renderHealth(withSeverity(noHostedWorkersDoc(), { "forge.ciwatch": "na", "forge.sync": "na" }));
     expect(screen.getByText("not applicable")).toBeTruthy();
-    expect(screen.getByText("16 of 16 passing, 6 not applicable")).toBeTruthy();
+    expect(screen.getByText("17 of 17 passing, 6 not applicable")).toBeTruthy();
   });
 
   it("no interactive element is nested inside another", async () => {
@@ -598,6 +651,30 @@ async function fleetRow(name: string): Promise<HTMLElement> {
   if (!tr) throw new Error(`no row for ${name}`);
   return tr;
 }
+
+it("keeps offline fleet manual attribution beside automatic fences and blocking details, read-only", async () => {
+  await renderHealth(healthySilentDoc(), [fleetWorker({
+    name: "manual-fleet", status: "offline", retaining_unpublished_work: true,
+    draining_since: "2026-10-20T12:00:00Z", active_runs: 1,
+    manual_cordoned_at: "2026-10-21T12:00:00Z",
+    manual_cordoned_by: "actor-id", manual_cordoned_by_label: "\u001b[31mAda\u001b[0m\u202e",
+    manual_cordon_reason: "check\n\t<b>disk</b>\u001b]0;hidden\u0007",
+    upgrade_status: "upgrade_failed", upgrade_detail: "roll blocked",
+    upgrade_blocking_container: "worker", upgrade_blocking_reason: "ImagePullBackOff",
+  })]);
+  const row = await fleetRow("manual-fleet");
+  expect(within(row).getByText("draining")).toBeTruthy();
+  expect(within(row).getByText("cordoned (manual)").title).toBe(
+    "Cordoned (manual) — Ada · 2026-10-21T12:00:00Z · check<b>disk</b>",
+  );
+  expect(within(row).getByTitle("Ada").textContent).toBe("Ada");
+  expect(within(row).getByTitle("check<b>disk</b>").textContent).toBe("Reason: check<b>disk</b>");
+  expect(row.querySelector("time")?.getAttribute("datetime")).toBe("2026-10-21T12:00:00.000Z");
+  expect(within(row).getByText("worker: ImagePullBackOff")).toBeTruthy();
+  expect(within(row).getByText("roll blocked")).toBeTruthy();
+  expect(row.querySelectorAll("button, input")).toHaveLength(0);
+  expect(row.querySelector("b")).toBeNull();
+});
 
 describe("AdminHealth — Fleet card (M5)", () => {
   it.each(["up_to_date", "upgrading", "unknown", "upgrade_failed"] as const)(

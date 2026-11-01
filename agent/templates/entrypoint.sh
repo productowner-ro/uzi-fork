@@ -41,6 +41,130 @@ CHMOD=/bin/chmod
 MKDIR=/bin/mkdir
 RM=/bin/rm
 FIND=/usr/bin/find
+NODE=/usr/local/bin/node
+EPOCH_HELPER=/usr/local/lib/uzi/pod-epoch-init.cjs
+EPOCH_BOOTSTRAP=/tmp/uzi-epoch-bootstrap
+EPOCH_SECRET_PREFIX=/run
+DATA_DIR=/data
+BUSYBOX=/bin/busybox
+
+epoch_refuse() {
+  echo "uzi-entrypoint: epoch startup refused: $*" >&2
+  exit 1
+}
+case "${UZI_EPOCH_LOCK-}" in
+  ''|1) ;;
+  *) epoch_refuse 'UZI_EPOCH_LOCK must be unset or 1' ;;
+esac
+
+# Reject loader/config injection BEFORE invoking even the plain-JS validator.
+# Environment names are inspected as data; no value is evaluated.
+epoch_environment() {
+  [ "$#" -eq 3 ] && [ "$1" = npm ] && [ "$2" = run ] && [ "$3" = start ] \
+    || epoch_refuse 'expected npm run start'
+  [ "${HOME-}" = /home/worker ] || epoch_refuse 'unexpected HOME'
+  [ "${TMPDIR-}" = "$DATA_DIR/runner/.tmp" ] || epoch_refuse 'unexpected runtime TMPDIR'
+  [ -z "${UZI_EPOCH_RUNTIME_TMPDIR+x}" ] || epoch_refuse 'reserved runtime TMPDIR'
+  "$BUSYBOX" env | while IFS='=' read -r epoch_name _epoch_value; do
+    epoch_name=$(printf '%s' "$epoch_name" | "$BUSYBOX" tr '[:upper:]' '[:lower:]')
+    case "$epoch_name" in
+      node_version|node_extra_ca_certs) ;; # Image metadata or the validated controller CA below.
+      node_*|ld_*|dyld_*|openssl_conf|openssl_modules|npm_*|tsx_*|esbuild_binary_path|bash_env|env|shellopts|bashopts)
+        epoch_refuse 'unsupported loader or npm configuration' ;;
+    esac
+  done
+  # #1761: the controller supports a private API CA in its read-only Secret.
+  # Validate it with native tools BEFORE Node/OpenSSL reads the environment.
+  if [ -n "${NODE_EXTRA_CA_CERTS-}" ]; then
+    epoch_ca="$NODE_EXTRA_CA_CERTS"
+    epoch_token="${UZI_WORKER_TOKEN_FILE:-/run/secrets/worker_token}"
+    [ "$epoch_ca" = "${epoch_token%/*}/ca.crt" ] || epoch_refuse 'CA must be the controller Secret ca.crt'
+    epoch_ca_mount="${epoch_ca%/ca.crt}"
+    case "$epoch_ca_mount" in
+      "$EPOCH_SECRET_PREFIX"/*) epoch_ca_leaf="${epoch_ca_mount#"$EPOCH_SECRET_PREFIX"/}" ;;
+      *) epoch_refuse 'CA Secret must be directly under /run' ;;
+    esac
+    case "$epoch_ca_leaf" in
+      ''|*[!a-z0-9._-]*|[!a-z0-9]*) epoch_refuse 'invalid CA Secret directory' ;;
+    esac
+    [ -f "$epoch_ca" ] || epoch_refuse 'CA target must be a regular file'
+    epoch_ca_real="$("$BUSYBOX" readlink -f "$epoch_ca")" || epoch_refuse 'cannot resolve CA target'
+    case "$epoch_ca_real" in
+      "$epoch_ca_mount"/*) ;;
+      *) epoch_refuse 'CA target escapes its Secret mount' ;;
+    esac
+    epoch_ca_posture="$("$BUSYBOX" stat -L -c '%u %g %a' "$epoch_ca")" || epoch_refuse 'cannot inspect CA target'
+    case "$epoch_ca_posture" in
+      "0 10001 440") ;;
+      *) epoch_refuse 'CA must retain root:worker mode 0440 Secret posture' ;;
+    esac
+  fi
+}
+
+# Read-only, image-baked Node, never tsx. All path components must be real directories.
+epoch_validate() {
+  "$NODE" - "$DATA_DIR" "$EPOCH_BOOTSTRAP" "$1" "${2-}" <<'EPOCH_JS'
+const fs = require('node:fs');
+const path = require('node:path');
+const [root, bootstrap, phase, runtime] = process.argv.slice(2);
+function directory(file) {
+  let cursor = '/';
+  for (const part of file.split('/').filter(Boolean)) {
+    cursor = path.join(cursor, part);
+    const s = fs.lstatSync(cursor);
+    if (!s.isDirectory() || s.isSymbolicLink()) throw new Error('non-real directory: ' + cursor);
+  }
+  return fs.lstatSync(file);
+}
+function privateDirectory(file, mode) {
+  const s = directory(file);
+  if (s.uid !== 10001 || s.gid !== 10001 || (s.mode & 0o7777) !== mode) {
+    throw new Error('unexpected owner/mode: ' + file);
+  }
+}
+const data = directory(root);
+if (data.gid !== 10001 || (data.mode & 0o2770) !== 0o2770 ||
+    (data.mode & 0o002) || ![0, 10001].includes(data.uid)) {
+  throw new Error('data root must preserve trusted fsGroup access and setgid');
+}
+privateDirectory(bootstrap, 0o700);
+const home = directory('/home/worker');
+if (home.uid !== 10001 || (home.mode & 0o022)) throw new Error('unsafe HOME');
+if (process.cwd() !== '/app') throw new Error('expected /app working directory');
+for (const file of ['/app/.npmrc', '/home/worker/.npmrc']) {
+  try { fs.lstatSync(file); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+  throw new Error('unsupported npm config: ' + file);
+}
+if (phase === 'single' || phase === 'split') {
+  const expected = root + '/runner/.tmp' + (phase === 'split' ? '/uzi-worker' : '');
+  if (runtime !== expected) throw new Error('unexpected saved runtime TMPDIR');
+  if (phase === 'split') privateDirectory(runtime, 0o700);
+  else {
+    const s = directory(runtime);
+    if (s.uid !== 10001 || s.gid !== 10001 || ![0o755, 0o3775].includes(s.mode & 0o7777)) {
+      throw new Error('unexpected single-uid scratch metadata');
+    }
+  }
+}
+EPOCH_JS
+}
+
+epoch_bootstrap() {
+  epoch_validate "$1" "$TMPDIR"
+  export UZI_EPOCH_RUNTIME_TMPDIR="$TMPDIR"
+  export TMPDIR="$EPOCH_BOOTSTRAP"
+  export TSX_DISABLE_CACHE=1
+  # npm and tsx use env-node shebangs; image Node must precede /nix here too.
+  export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+  # Pin npm's writable cache and configuration to the container-local bootstrap.
+  export npm_config_cache="$EPOCH_BOOTSTRAP"
+  export npm_config_userconfig=/dev/null npm_config_globalconfig=/usr/local/lib/uzi/epoch-global.npmrc
+  export npm_config_logs_max=0 npm_config_update_notifier=false npm_config_ignore_scripts=true
+}
+if [ "${UZI_EPOCH_LOCK-}" = 1 ]; then
+  epoch_environment "$@"
+  epoch_validate pre
+fi
 
 # --- PRD #58: tolerate a NON-ROOT start ---------------------------------------
 # Started non-root (k8s runAsUser: 10001, PRD #58 single-uid v1)? Then there is no
@@ -108,6 +232,12 @@ if [ "$uid" != "0" ]; then
   # sets a pod-spec TMPDIR for docker workers and relies on this branch leaving it unset so
   # `runnerTmpdir()` (= UZI_RUNNER_TMPDIR || TMPDIR) returns the pod-spec value.
   export UZI_RUNNER_PATH="$PATH"
+  if [ "${UZI_EPOCH_LOCK-}" = 1 ]; then
+    [ "$uid" = 10001 ] || epoch_refuse 'expected worker uid'
+    epoch_bootstrap single
+    exec 9>&-
+    set -- /usr/local/bin/npm run start
+  fi
   exec "$TINI" -- "$@"
 fi
 echo "uzi-entrypoint: A1 uid-split active (root-started) — dropping to worker after the startup window" >&2
@@ -143,13 +273,11 @@ NIX_OWNER=runner:runner
 
 # The two persisted volume roots and the join-token mount, as variables (the migration and
 # token logic below reference nothing else), so the shell tests can point them at a sandbox.
-DATA_DIR=/data
 NIX_DIR=/nix
-# busybox is the canonical absolute binary in the pinned node:24-alpine (the same base whose
+# busybox is the canonical absolute binary in the pinned node:26-alpine (the same base whose
 # /bin/{chown,chmod,mkdir} the constants above resolve). Its `stat`/`cat` applets back the
 # read-only-token posture + read checks; invoked via `busybox <applet>` so the exact applet
 # symlink location does not matter.
-BUSYBOX=/bin/busybox
 # The pod fsGroup == the `worker` gid; the PVC-root alignment below restores it on the
 # migrated mount roots so the kubelet skips its recursive fsGroup walk (PRD #1493 M2 change 5).
 FSGROUP=10001
@@ -161,6 +289,16 @@ FSGROUP=10001
 # step is a no-op, keeping compose behaviour byte-for-byte.
 NIX_HAD_FSGROUP=
 [ -g "$NIX_DIR" ] && NIX_HAD_FSGROUP=1
+
+# Protect the ENTIRE root write window, including /nix. prepare never creates state.
+# hold verifies shell FD9 against the prepared inode before and after bounded SH.
+if [ "${UZI_EPOCH_LOCK-}" = 1 ]; then
+  epoch_identity=$("$NODE" "$EPOCH_HELPER" prepare "$DATA_DIR")
+  if [ "$epoch_identity" != unsupported ]; then
+    exec 9<"$DATA_DIR/.uzi-epoch.lock"
+  fi
+  "$NODE" "$EPOCH_HELPER" hold "$DATA_DIR" "$epoch_identity" 9
+fi
 
 # --- (a) B4: migrate persisted named volumes to the current uid layout --------
 # agentnix (/nix) and agentdata (/data) seed from the image on first use and then
@@ -195,7 +333,16 @@ migrate_tree() {
   sentinel="$path/.uzi-migrated-${owner%:*}-${owner#*:}"
   [ -f "$sentinel" ] && return 0
   echo "uzi-entrypoint: ensuring $path ownership -> $owner [one-time]" >&2
-  "$CHOWN" -R "$owner" "$path"
+  if [ "${UZI_EPOCH_LOCK-}" = 1 ] && [ "$path" = "$DATA_DIR" ]; then
+    # Preserve the mount-root inode's fsGroup predicate; migrate every child,
+    # including epoch/ledger state (already worker:worker), under temporary SH.
+    for child in "$path"/* "$path"/.[!.]* "$path"/..?*; do
+      [ -e "$child" ] || [ -L "$child" ] || continue
+      "$CHOWN" -R "$owner" "$child"
+    done
+  else
+    "$CHOWN" -R "$owner" "$path"
+  fi
   : > "$sentinel" 2>/dev/null && "$CHOWN" "$owner" "$sentinel" 2>/dev/null \
     || echo "uzi-entrypoint: warning: could not persist $sentinel (re-runs next boot)" >&2
 }
@@ -269,7 +416,7 @@ for d in runner agent-home provision; do
   # 🔴 SC3067 IS A TRUE PORTABILITY STATEMENT AND A FALSE BUG REPORT AGAINST THIS
   # IMAGE, AND IT STOPS BEING FALSE THE MOMENT THE SHEBANG OR THE BASE IMAGE MOVES.
   # This file is `#!/bin/sh` and both worker Dockerfiles ship it on the same
-  # digest-pinned node:24-alpine with an exec-form ENTRYPOINT
+  # digest-pinned node:26-alpine with an exec-form ENTRYPOINT
   # (controller/internal/kube/render.go sets no `Command:` ON THE WORKER CONTAINER,
   # so k8s uses the image's own ENTRYPOINT. That file has five `Command:` fields on
   # OTHER containers, so the unqualified version of this sentence invited a reader
@@ -519,10 +666,11 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
     # devbox/nix, the chat SDK CLI) use this HOME's dot state, so each dot entry (dir OR file,
     # e.g. .claude.json) is re-owned wholesale to runner. A symlink entry is skipped (`[ -L ]`
     # first; a dangling one also fails `[ -e ]`). A symlink NESTED inside a dot dir is not
-    # followed by the recursive chown on the current image: its /bin/chown is BusyBox v1.37.0
-    # on the digest-pinned node:24-alpine base (no coreutils), and a BusyBox v1.37.0 `chown -R`
+    # followed by the recursive chown on the current image: its /bin/chown is BusyBox (no
+    # coreutils). On the then-pinned node:24-alpine base, a BusyBox v1.37.0 `chown -R`
     # measured 2026-09-25 re-owned a nested dir- or file-symlink itself and left its target
-    # untouched. That is a measurement of this binary, not a claim about chown in general.
+    # untouched. That is a measurement of that binary, not a claim about chown in general; the
+    # node:26-alpine base is on the same Alpine 3.24 but was not re-measured.
     # A top-level HARDLINK (a regular file with nlink > 1, e.g. one planted to a repos/<r>.git
     # file) is skipped too, as is anything that is neither a directory nor a regular file (fifo,
     # socket, device): only a real dir or a single-link regular file is re-owned. A failed stat
@@ -907,6 +1055,9 @@ require_real_carveout_root "$CODEX_CMD_CACHE_DIR"
 # at the new directory. The posture checks below are identical wherever the file lives.
 TOKEN="${UZI_WORKER_TOKEN_FILE:-/run/secrets/worker_token}"
 if [ -e "$TOKEN" ] || [ -L "$TOKEN" ]; then
+  if [ "${UZI_EPOCH_LOCK-}" = 1 ] && [ ! -f "$TOKEN" ]; then
+    epoch_refuse 'token target must be a regular file'
+  fi
   if "$CHOWN" 0:0 "$TOKEN" 2>/dev/null; then
     "$CHMOD" 0400 "$TOKEN"
     "$CHOWN" "$WORKER_OWNER" "$TOKEN"
@@ -951,7 +1102,9 @@ align_pvc_root() {
 }
 if [ -n "$NIX_HAD_FSGROUP" ]; then
   align_pvc_root "$NIX_DIR" runner
-  align_pvc_root "$DATA_DIR" "$WORKER_USER"
+  if [ "${UZI_EPOCH_LOCK-}" != 1 ]; then
+    align_pvc_root "$DATA_DIR" "$WORKER_USER"
+  fi
 fi
 
 # --- (c) drop root -> worker, keeping ONLY setuid/setgid (ambient) -------------
@@ -974,6 +1127,12 @@ export TMPDIR="$WORKER_TMPDIR"
 export UZI_UID_SPLIT=1
 export UZI_RUNNER_PATH="$IMAGE_PATH"
 export UZI_RUNNER_TMPDIR="$RUNNER_TMPDIR"
+if [ "${UZI_EPOCH_LOCK-}" = 1 ]; then
+  epoch_bootstrap split
+  # All initializer children above are synchronous. No shell lock crosses exec.
+  exec 9>&-
+  set -- /usr/local/bin/npm run start
+fi
 exec "$SETPRIV" \
   --reuid "$WORKER_USER" --regid "$WORKER_USER" --init-groups \
   --bounding-set -all,+setuid,+setgid \

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 )
 
 // rateLimitWindow (apitypes.RateLimitWindow), rateLimitDTO (apitypes.RateLimitDTO)
@@ -110,14 +113,21 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 	}
 	users := make([]apitypes.AdminRateLimitRowDTO, 0)
 	for _, u := range rows {
-		// A new user starts a new group. vaultUnlocked is looked up once per user, on
-		// the first row, not once per token.
+		// Resolve one coordinated mode/lock snapshot on the first row per user.
 		if len(users) == 0 || users[len(users)-1].ID != u.UserID.String() {
+			mode, locked, err := h.adminRateVaultSnapshot(r.Context(), u.UserID, u.VaultMode)
+			if err != nil {
+				slog.Error("rate limits: vault status unavailable", "user", u.UserID)
+				w.Header().Set("Cache-Control", "private, no-store")
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
 			users = append(users, apitypes.AdminRateLimitRowDTO{
 				ID:          u.UserID.String(),
 				Email:       u.Email,
 				Name:        u.DisplayName.String, // "" when the user has no display name
-				VaultLocked: !h.vaultUnlocked(u.UserID),
+				VaultMode:   mode,
+				VaultLocked: locked,
 				Tokens:      []apitypes.TokenRateLimitDTO{},
 			})
 		}
@@ -162,13 +172,33 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"users": users})
 }
 
+// adminRateVaultSnapshot keeps metadata mode and lock state in the same lifecycle
+// observation. Only fixtures without a core use the conservative session fallback.
+func (h *Handler) adminRateVaultSnapshot(ctx context.Context, ownerID uuid.UUID, fallbackMode string) (string, bool, error) {
+	if h.vault == nil {
+		status := h.vaultStatus(ctx, store.User{ID: ownerID, VaultMode: fallbackMode})
+		return status.Mode, status.Mode == store.VaultModeProtected && !status.Unlocked, nil
+	}
+	status, err := h.vault.Status(ctx, ownerID)
+	if err != nil {
+		return "", false, err
+	}
+	return status.Mode, status.Mode == store.VaultModeProtected && !status.Unlocked, nil
+}
+
 // okRateLimitDTO builds the "ok" union branch from the stored gauge columns. stale
 // is computed server-side (D3); resets are rendered as epoch seconds (D7).
 func (h *Handler) okRateLimitDTO(fivePct pgtype.Int2, fiveReset pgtype.Timestamptz, sevenPct pgtype.Int2, sevenReset pgtype.Timestamptz, source pgtype.Text, syncedAt pgtype.Timestamptz) apitypes.RateLimitDTO {
 	stale := h.rateLimitStale(syncedAt)
+	// A NULL five_hour_pct means the account has no 5-hour window (plans where
+	// Anthropic removed it): FiveHour stays nil and is omitted from the JSON.
+	var five *apitypes.RateLimitWindow
+	if fivePct.Valid {
+		five = &apitypes.RateLimitWindow{Pct: int(fivePct.Int16), ResetsAt: epochPtr(fiveReset)}
+	}
 	return apitypes.RateLimitDTO{
 		Status:   rateLimitStatusOK,
-		FiveHour: &apitypes.RateLimitWindow{Pct: int(fivePct.Int16), ResetsAt: epochPtr(fiveReset)},
+		FiveHour: five,
 		SevenDay: &apitypes.RateLimitWindow{Pct: int(sevenPct.Int16), ResetsAt: epochPtr(sevenReset)},
 		Source:   source.String,
 		SyncedAt: syncedAt.Time.UTC().Format(time.RFC3339),
@@ -181,14 +211,7 @@ func (h *Handler) okRateLimitDTO(fivePct pgtype.Int2, fiveReset pgtype.Timestamp
 // existing rows are still served but always marked stale, since nothing refreshes
 // them.
 func (h *Handler) rateLimitStale(syncedAt pgtype.Timestamptz) bool {
-	interval := h.cfg.UsagePollInterval
-	if interval <= 0 {
-		return true
-	}
-	if !syncedAt.Valid {
-		return true
-	}
-	return time.Since(syncedAt.Time) > 3*interval
+	return usagereserve.Stale(syncedAt.Time, syncedAt.Valid, h.cfg.UsagePollInterval, time.Now())
 }
 
 // epochPtr renders a stored reset timestamp as epoch seconds, or nil (→ JSON null)

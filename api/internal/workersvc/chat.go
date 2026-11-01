@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -87,10 +89,14 @@ const (
 // Like ClaimPayload it is returned only over the claim response and must never be
 // logged.
 type ChatClaimPayload struct {
-	MemoryEpisode           int64         `json:"memory_episode"`
-	MemoryInterventionCount int32         `json:"memory_intervention_count"`
-	MemoryPolicy            *MemoryPolicy `json:"memory_policy"`
-	RunID                   string        `json:"run_id"`
+	// WorkerRecoveryEpisode has the same projected meaning as ClaimPayload.WorkerRecoveryEpisode.
+	WorkerRecoveryEpisode int64 `json:"worker_recovery_episode"`
+	// WorkerRecoveryOwnerEpisode is the stored owner-authorized episode, including zero.
+	WorkerRecoveryOwnerEpisode int64         `json:"worker_recovery_owner_episode"`
+	MemoryEpisode              int64         `json:"memory_episode"`
+	MemoryInterventionCount    int32         `json:"memory_intervention_count"`
+	MemoryPolicy               *MemoryPolicy `json:"memory_policy"`
+	RunID                      string        `json:"run_id"`
 	// Kind is always "chat" — the worker's chat lane asserts it, and it keeps the
 	// two lanes' payloads self-describing.
 	Kind string `json:"kind"`
@@ -139,8 +145,8 @@ type ChatClaimConfig struct {
 	MaxTurns           int     `json:"max_turns"`
 	DefaultModel       *string `json:"default_model,omitempty"`
 	// DefaultEffort carries the owner's per-user reasoning effort (PRD #617), or the
-	// uzi default `medium` when the owner has not chosen (NULL, issue #1157) — so it is
-	// populated on every chat claim now.
+	// uzi default `medium` when the owner has not chosen (NULL, issue #1157). It is nil
+	// (key omitted) when the owner's preference is Runtime default: no level is sent.
 	DefaultEffort *string `json:"default_effort,omitempty"`
 }
 
@@ -154,7 +160,7 @@ type ChatClaimConfig struct {
 // Claim's vault gate and assembly-error recovery, so a locked owner's chats wait
 // and a chat with no Anthropic token fails cleanly instead of wedging the loop.
 func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPayload, error) {
-	if s.vlt != nil && !s.vlt.Unlocked(wkr.UserID) {
+	if s.vlt != nil && s.vlt.RequiresUnlock(ctx, wkr.UserID) {
 		return nil, nil // idle: owner locked
 	}
 	// PRD #1906 M5 (Decision D-D): a chat run is never profile-bound (runs_egress_profile_not_chat),
@@ -164,7 +170,7 @@ func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPa
 	if wkr.IsolatedLane {
 		return nil, nil
 	}
-	run, err := s.q.ClaimChatRun(ctx, store.ClaimChatRunParams{
+	run, err := s.claimChatRun(ctx, wkr, store.ClaimChatRunParams{
 		WorkerID: pgconv.UUID(wkr.ID),
 		UserID:   wkr.UserID,
 		// PRD #529 Decision 4: an ephemeral (run-bound) worker never claims a chat.
@@ -374,6 +380,10 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		return nil, fmt.Errorf("harness model defaults lookup: %w", err)
 	}
 	defaultModel := lanes.DefaultClaudeModel
+	if defaultModel.Valid && agenttmpl.CodexRoleModels[strings.TrimSpace(defaultModel.String)] {
+		slog.Warn("chat claim: dropped Codex role model from Claude lane", "run_id", run.ID.String(), "model", strings.TrimSpace(defaultModel.String))
+		defaultModel = pgtype.Text{}
+	}
 
 	defaultEffort, err := s.q.GetUserDefaultEffort(ctx, run.UserID)
 	if err != nil {
@@ -393,18 +403,20 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		return nil, err
 	}
 	return &ChatClaimPayload{
-		RunID:                   run.ID.String(),
-		Kind:                    run.Kind,
-		Title:                   run.Title.String,
-		Status:                  run.Status,
-		SessionID:               textPtr(sessionID),
-		ResumeOfRunID:           uuidPtr(run.ResumeOfRunID),
-		LastSeq:                 run.LastSeq,
-		RequeueCount:            run.RequeueCount,
-		ClaimGeneration:         run.ClaimGeneration,
-		MemoryEpisode:           run.MemoryEpisode,
-		MemoryInterventionCount: run.MemoryInterventionCount,
-		MemoryPolicy:            frozenMemoryPolicy,
+		RunID:                      run.ID.String(),
+		Kind:                       run.Kind,
+		Title:                      run.Title.String,
+		Status:                     run.Status,
+		SessionID:                  textPtr(sessionID),
+		ResumeOfRunID:              uuidPtr(run.ResumeOfRunID),
+		LastSeq:                    run.LastSeq,
+		RequeueCount:               run.RequeueCount,
+		ClaimGeneration:            run.ClaimGeneration,
+		WorkerRecoveryEpisode:      claimRecoveryEpisode(run),
+		WorkerRecoveryOwnerEpisode: run.WorkerRecoveryEpisode,
+		MemoryEpisode:              run.MemoryEpisode,
+		MemoryInterventionCount:    run.MemoryInterventionCount,
+		MemoryPolicy:               frozenMemoryPolicy,
 		Secrets: ChatClaimSecrets{
 			AnthropicOAuthToken: string(anthropic),
 		},
@@ -833,4 +845,40 @@ func uuidPtr(u pgtype.UUID) *string {
 	}
 	s := uuid.UUID(u.Bytes).String()
 	return &s
+}
+
+// claimChatRun takes a fresh statement snapshot after locking the worker, matching
+// ordinary and checker intake. Assembly runs after commit, outside the worker lock.
+func (s *Service) claimChatRun(ctx context.Context, wkr store.Worker, params store.ClaimChatRunParams) (store.Run, error) {
+	if s.txBeginner == nil {
+		return s.q.ClaimChatRun(ctx, params)
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Run{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		return store.Run{}, err
+	}
+	q := store.New(tx)
+	if _, err := q.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+		return store.Run{}, err
+	}
+	current, err := q.GetWorkerByID(ctx, wkr.ID)
+	if err != nil {
+		return store.Run{}, err
+	}
+	params.IsEphemeral = current.Ephemeral
+	if current.IsolatedLane {
+		return store.Run{}, pgx.ErrNoRows
+	}
+	run, err := q.ClaimChatRun(ctx, params)
+	if err != nil {
+		return store.Run{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.Run{}, err
+	}
+	return run, nil
 }

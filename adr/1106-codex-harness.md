@@ -249,6 +249,11 @@ refresh operations and durable latest-state reconciliation remain production
 requirements; no prior-token reuse or concurrent-refresh guarantee follows from
 these unchanged M0 measurements.
 
+[ADR-3523](3523-codex-refresh-provider-error-reuse.md) adds one survivor retry
+for a durable receipt of an original non-rejection refresh error, outside the
+callback. It supersedes the no-reuse policy only for that case; these historical
+measurements still provide no live proof of prior-token reuse.
+
 ## Model and effort decision
 
 The refreshed server catalog visible to 0.153.2 contained:
@@ -271,6 +276,15 @@ models and returned the exact requested response. `persistent` failed, but the
 sanitized error could not distinguish unsupported effort from a narrower server
 or entitlement failure. The SDK's open model string and wider effort union are
 therefore transport types, not picker authority.
+
+**Amendment (2026-10-30, #3247).** A Runtime default preference omits the effort
+level entirely. For an explicit level, uzi reads the runtime's `model/list`
+catalog read-only (one bounded request per claim, before its first turn) and, when the
+matched model does not list the chosen level, shows one advisory warning in the
+run feed. uzi never rewrites, clamps or retries a level at another value; the
+level is sent unchanged and a provider rejection fails the turn normally. The
+closed product vocabulary above is unchanged. Rationale:
+[PRD #3247](../prds/3247-runtime-default-effort.md).
 
 **Amendment (2026-09-23, Codex 0.156.1 pin).** The picker adds `gpt-6-sol`. Its bundled
 0.156.1 catalog entry requires client `>= 0.155.0`, lists `low` through `ultra` (so uzi's
@@ -480,7 +494,43 @@ it admits no provider turn or normal callback, admission reopen, credential
 reconciliation, refresh or release, PAT, credential-bearing environment or overlay.
 Lost supervision or incomplete settlement grants no capture authority. This context
 mints neither a credentialed nor a completion permit. See the
-[remaining sink gaps](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+[sink contracts and remaining terminal gap](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+
+**Slice B contract, Refs #2852 (AI-synced 2026-10-23):** healthy Codex wall
+park, completion hold and ordinary recovery hold the existing process permit from
+before source inspection through capture and source-dependent settlement. The
+private authenticated capability is bound to its exact flight/executor and callback
+lifetime; Git children use the existing supervisor and await full cleanup. A's
+credential-free fallback starts only after the primary scope joins, within the
+same deadline. Unexpected Codex credential-switch entries retain without capture.
+B left Claude behavior and terminal disposal unchanged; subsequent C strengthens
+terminal disposal as described below. The linked
+[sink contract](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+records the budget, held-finalize continuation, publication and remaining writer limits.
+
+**Subsequent slice C contract, Refs #2852 (AI-synced 2026-10-24):**
+`tablesCleared` synchronously and irrevocably closes admission at disposal entry.
+`disposeTools` is single-flight; open/closing entry, pending launches/callbacks,
+unmatched poison, late roots/admission faults or unclean cleanup stays incomplete.
+The exact disposal result is revocable, bound to registry facts and successful
+facade cleanup; cleared tables or an optional killAgentTree call are not proof.
+Release-dependent coverage waits for disposal of the exact executor/facade.
+Skipped/incomplete/swapped proof retains clone, journal, inventory and paired skills
+with a distinct terminal-disposal diagnostic. A/B handler settlement defers this
+request without reacquiring either safety queue. Post-disposal source reads are
+inert and hardened; witness checks continue through destructive dispatches.
+Current-process completion bindings record exact executor/facade in memory before
+durable bind; knownCodex missing/non-disposed/swapped proof retains before inventory,
+with no legacy fallback. KnownClaude is unchanged. Owner decision 2026-10-24
+narrowed R1857-02(e): persisted/unknown-provenance sources kept the pre-C behavior for
+both harnesses. **Superseded by #3404 (2026-10-27):** after a restart such a source is
+released only when durable published authority proves it (`forgetCompletedGeneration` /
+`verifyDurableRetirement` in `agent/src/recovery.ts`); legacy and unproven sources are
+retained until guarded operator discard (see
+[ADR-1783's #3404 amendment](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement)).
+This is registered-process strengthening; Docker accepted invisible creates (#1860),
+unregistered/sibling writers and Claude terminal residuals remain. The canonical
+sink contract records the unchanged retention and ownership boundaries.
 
 Pre-start capture uses the existing capture-only facade. A later owned capture can
 also select a fresh production capture-only facade for the exact retired public
@@ -568,8 +618,12 @@ Trusted-worker bare Git keeps its worker identity;
 `worker_pat` is the historical identity name, not evidence of credential presence.
 Credential presence is checked separately; free capture does not downgrade bare
 Git to the isolated clone identity. Blanket refusal of free capture was rejected:
-it leaves uncaptured work in an ephemeral clone instead of moving capturable work
-into the persistent worker bare and regresses verified park/pause preservation.
+it strands capturable work, including work awaiting verified capture, in the source
+clone instead of moving verified bytes into the persistent worker bare and regresses
+verified park/pause preservation. Older Docker emptyDir layouts could lose that source
+on pod replacement; [ADR-3153](3153-runner-shared-pvc-subpath.md) migrated workers
+keep it on the data PVC. Neither layout nor successful capture grants deletion authority
+(AI-synced 2026-10-23).
 Local capture alone proves neither origin publication nor permission to dispose
 of the source. Worker-provided global Git
 config may configure drivers; ordinary seeding trust is unchanged. These
@@ -966,3 +1020,268 @@ and the stable-to-stable source diff for the consumed paths:
 agreement of pins, not execution of 0.163.0. Installed receipt/probe acceptance,
 real worker-UID and M4 execution remain separate evidence required before
 accepting the upgrade.
+
+## Runtime adoption: 0.164.0 (2026-10-31)
+
+The stable upgrade is 0.163.0 to 0.164.0; there are no intervening stable tags.
+The [release notes](https://github.com/openai/codex/releases/tag/rust-v0.164.0)
+and consumed source paths were compared between both tags. The target tag resolves
+to `6aaac694803004a63c6f393d153c96d22521a6b9`; both package SHA256 values match
+the official release asset metadata. This adoption stays at the requested version,
+although 0.166.0 was the latest stable release when checked.
+
+- Native utility registration no longer depends on a selected environment.
+  Shell and image features remain explicitly disabled by uzi. Native apply-patch
+  still resolves a selected environment before filesystem access; uzi supplies
+  `environments: []`. Registration is not execution authority. Real-binary native
+  denial and cold-resume checks remain required; pin parity alone proves neither.
+- Dynamic tool handlers now support parallel calls. The callback wire contract is
+  unchanged; worker-owned identity, role, phase and tool admission remain the
+  boundary. The full harness and packaged proof must cover this runtime change.
+- Incremental tools default on for Responses Lite, MCP OAuth refresh coordination
+  defaults on, and the Bedrock setup wizard defaults on. Uzi does not configure
+  native MCP servers or use the interactive setup wizard. Incremental declarations
+  do not replace the worker callback checks. New runtime-agent registration,
+  executor discovery V2, environment copying and message wake features default off.
+- Resume restores saved model settings, compressed rollout lookup is repaired,
+  failed compaction preserves history, and closed background-compaction receivers
+  no longer panic. Uzi continues to send its explicit thread/turn policy. These
+  are runtime fixes, not a change to uzi's retained-custody or resume guarantees.
+- Protocol additions include experimental thread sampling/cancellation, local
+  diagnostic export and optional Responses metadata patches. Image-generation
+  items can carry attachment references; no image-generation contract is adopted
+  here. The bundled model catalog is unchanged, including shell type, service
+  tier and minimum-client metadata. Removed TUI compatibility flags are not used.
+
+Adoption candidates are thread sampling and local diagnostic export; neither is
+enabled or integrated by this version-pin change. Native execution policy, tool
+grants, authentication selection and provider retries are unchanged in uzi.
+
+Local validation covers dependency freshness plus pin sync/parity/coordination,
+configuration and runtime-probe unit tests. Actual 0.164.0 binary execution is
+pending exact-head CI: M4, worker UID, strict amd64 packaged proof and the arm64
+package-exec lane. Arm64 worker images/full packaged proof, arm64 code-mode host
+execution, receipt validation and live provider entitlement were not run locally.
+
+## Amendment: temporary account admission (#3530, 2026-10-27)
+
+The account admission policy is **no standing limit; temporary cooldown after rate-limit or repeated-overload evidence.**
+The retired one-run-per-seat policy above stays retired. Credential selection
+([ADR-0035](0035-run-limit-retry.md)), worker slots
+([ADR-0042](0042-worker-run-concurrency.md)) and preservation
+([ADR-0759](0759-protect-run-work-usage-limit-park.md)) keep their existing boundaries.
+The user contract is [Temporary account admission waits](../docs/rate-limits.md#temporary-account-admission-waits);
+[installation](../docs/installation.md#codex-account-admission-upgrades)
+owns rollout, rollback and reporting-loss guidance.
+
+### Evidence and persisted policy
+
+State is keyed by user and canonical linked Codex subscription account,
+independent of saved alias, credential refresh or re-import. Another
+authorized account remains independent, without automatic rotation.
+Bound thread/turn errors and terminals use the closed `codexErrorInfo` map:
+`rateLimitExceeded` or accepted structured model HTTP 429 supplies rate
+evidence; `serverOverloaded` supplies overload. Overload requires two distinct
+run IDs within five minutes. Same-run retries cannot supply the second vote;
+repeating a vote does not refresh its time. Idle/silence, generic transport
+errors or 5xx, usage quota, auth and meter GET 429 do not qualify.
+Retry-After is not consulted.
+
+The independent schedules start at 30 seconds for rate and 15 seconds for
+overload, double to caps of 15 minutes and five minutes before persisted
+positive 0–20% jitter, and reset after 30 and 15 minutes quiet respectively.
+Quiet clocks track qualifying unique class observations. In-episode evidence
+does not extend the class expiry or advance its step. Later class expiry
+controls, with rate winning a tie.
+
+A common recovery episode gives each run a stable spread in 0..W, where W
+is the smaller of the opening duration and 60 seconds. Recovery floors prevent
+a new episode from shortening prior eligibility. Admission is unlimited after
+the finite recovery window. Migration 00364 persists transitions/eligibility;
+00365 projects active queued admission. Receipt and overload-vote ledgers
+are each bounded at 256; receipts retain at least the 60-second retry horizon.
+Capacity overflow refuses the observation rather than manufacturing evidence.
+
+### Claim, lifecycle and trust boundaries
+
+Claim and provisioning use database statement snapshots. Queued runs keep
+status, claim generation and custody. An already in-flight statement may
+admit after evidence commits; there is no custody-lock guarantee. The signal
+path takes a run SHARE lock against lifecycle/generation changes, then checks
+owned active subscription claims, enabled linked credentials, material/account
+revisions and canonical identity in the following INSERT snapshot. It does
+not lock account/alias rows; credential replacement committed after that
+snapshot may race acceptance. See the enforcing
+[queries](../api/internal/store/queries/codex_admission.sql) and
+[service](../api/internal/workersvc/codex_admission.go).
+
+This adds no standing seat lock, ceiling or active-count policy, per-request
+limiter, mid-turn pause or force-park. Already dispatched turns and preservation
+continue; supported new dispatches, including retries and live approval/revision
+continuations, now use the [durable model-operation boundary](#durable-model-operation-boundary-3531-2026-10-28).
+Usage and account-unavailability parked policies are independent. Resume,
+restart, schedules, same-account aliases and provisioning pass through the next
+claim gate. Checker deadlines include queued/setup time without exemption or
+extension. API keys, Claude, chat, versioned jobs and isolated-lane eligibility
+keep their prior policy.
+
+The queued owner-only read-time class and eligibility including spread appear
+on run detail/list/board and CLI; foreign shared/admin summaries redact them.
+Active operation waits use the separate owner projection described below.
+Finite expiry clears the copy on subsequent reads. Maintenance and account
+unavailability retain precedence with independent admission details.
+Eligibility is not a promised start. There is no per-run Slack burst,
+account panel, settings control or Resume now override.
+
+### Best-effort reporter and acceptance boundary
+
+The evidence-reporting feature is `codex_account_admission_signal_v1`,
+independent of strict `codex_account_operation_admission_v1`. Reporter loss or
+an ACK neither revokes nor grants model-operation authority. References below
+to claims/execution continuing concern telemetry loss; an engaged operation
+flight still requires the fresh authorization described below.
+[The reporter](../agent/src/codex/admission-signal.ts) queues without awaiting
+network from provider/lifecycle handlers. It permits two HTTP attempts capped
+at three seconds each within ten seconds monotonic total. The implementation
+starts the budget at observation, including queue time, stricter than the
+first-send contract. The 32-entry bound includes the active send; overflow
+drops evidence. Nonclosing `running`/`awaiting_approval` state sends, pause
+intent and completion attempts seal queued work and unsent retries, leaving
+active HTTP to finish within its existing three-second attempt and ten-second
+observation bounds under the server's live-state fence. Ending authority
+permanently closes reporting and aborts active HTTP, allowing loss of the last
+attempt. Lifecycle and preservation do not wait for a reporting ACK. This
+signal path does not retain raw provider text.
+
+Correction to the reported lifetime cutoff (AI-synced 2026-10-27):
+[the client](../agent/src/client.ts) bounds `codexAdmission` at 1,024 live
+reporters and `codexAdmissionClosed` at 1,024 recent closed/refused run-generation
+high-water marks in FIFO order. Closing retires the live reporter and frees
+capacity for future bindings; there is no permanent lifetime run cutoff.
+Concurrent live overflow drops the telemetry binding but records its generation
+to fence older pending claim responses. Closed-cache eviction rotates
+`codexAdmissionEpoch`, so pre-eviction responses cannot rebind forgotten old
+authority; this may also drop unrelated pending telemetry bindings. It does
+not drop claims or execution. A fresh server `ClaimRun` increments
+`claim_generation`; retained closed handles stay inert.
+
+Registration and temporarily missing feature support seal pending work and
+suspend new reporting while support is absent; fresh attempts on live reporters
+resume when support is advertised. Claims started before registration or feature
+invalidation are ignored for telemetry binding through the observation epoch,
+without changing execution. Permanently closed, refused or stale-generation
+reporters remain closed; old workers still obey server admission.
+
+The supported API deployment remains singleton Recreate. Deploy the additive
+schema/API before workers. Application rollback leaves the schema in place;
+an old API admits new claims without reading this state, while already engaged
+operation flights remain closed to fresh dispatch until admission service
+returns or existing controls/deadlines settle them. Roll-forward uses still-live
+finite state and the normal quiet-reset policy. Mixed old/new replicas outside
+the singleton carry no enforcement promise. The M4 separate-pool/service
+reconstruction test models persisted recovery, not a binary/Kubernetes
+restart; execution evidence belongs to the integration handoff.
+
+M5 remains external: **full agent suite: exact-head PR CI** requires
+maintainer/CI success for required `validate-agent`, both
+`test-agent-shard` legs and the worker-UID lane on the exact published head
+before merge. The worker cannot trigger hosted jobs before publication;
+these checks are not verified here. An optional operator rollout smoke
+check is unperformed here and does not substitute for required gates.
+The required `test-agent` aggregate is also pending; hosted queue/cache/rerun
+and critical-path costs remain unmeasured.
+
+### Durable model-operation boundary (#3531, 2026-10-28)
+
+[#3531](https://github.com/vtmocanu/uzi/issues/3531) extends the same canonical
+subscription-account cooldown policy to fresh supported model dispatches.
+The [scope inventory](../agent/src/codex-operation-scope.ts) connects four sinks:
+root `startTurnRpc`, worker-created `startChildTurn`, production advice
+`startTurnRpc`, and the plan/code checker `run` path. Coverage includes lead
+planning and initial implementation, human and automatic revisions,
+prose/clarification continuations, classified-provider retries and fresh-session
+fallbacks; child delegation; intent, plan, Now, delivery/PR-description summaries,
+judge and diff-review advice; and both checker stages. Every fresh supported
+dispatch reads authorization again; no admitted reply is reused across operations.
+Caller-key PR-description evaluation and offline checker replay have no worker
+subscription authority. Native HTTP retries, tool continuations and possible
+compaction/internal requests within an already dispatched turn have no
+demonstrated worker seam. This is not a gate on every upstream request.
+Native `multi_agent` and `multi_agent_v2` remain disabled.
+
+The [controller](../agent/src/codex-operation-controller.ts) waits in place,
+retaining flight/session, positive claim generation, custody, gate presentation
+and pending feedback in `claimed`, `running` or `awaiting_approval`. It holds
+no account seat lock and creates no standing limit, active counter, provider
+streak/backoff, rotation or Retry-After policy. A concurrent cooldown or
+credential/source update may race the authorization read and send: this is
+snapshot authorization, not atomic revocation. Already dispatched turns continue.
+
+Elapsed waiting is charged once to the existing wall or whole-call deadline.
+The idle watchdog is disarmed before dispatch; waiting fabricates no model
+processing, progress or productivity and consumes/creates no owner recovery
+grant. Cancel, reject, replacement revision, pause, wall, vault and ownership
+routes remain effective; Resume grants no bypass. Only the lead consumes revision
+feedback and reject verdicts: child/advice source checks observe supersession
+without taking those controls, and the lead rechecks its source before accepting
+a completed turn's candidate. Capture/checkpoint, refresh
+needed for preservation, tool settlement, persistence and teardown are not
+gated. Children independently wait within deadlines including existing setup;
+there is no exemption, extension or parent-held permit. Notification reading
+and settlement continue without a demultiplexer deadlock. Optional summaries
+may time out without dispatch.
+
+`codex_account_operation_admission_v1` is negotiated independently of signal
+reporting and optional active snapshots. A never-negotiated flight retains
+legacy behavior; once negotiated, its latch survives feature loss, clear and
+re-registration. **Admission-service outage blocks the next dispatch of every
+negotiated subscription flight, including accounts with no known cooldown.**
+Already dispatched turns and preservation continue with existing controls,
+budgets and deadlines. Transport failures, 5xx, malformed/untyped responses and
+untyped route 404 are unavailable waits, not allows or provider failures.
+Strict typed authority/source refusals retain their existing control routes.
+Deploy API first, workers second; rollback keeps additive migrations and
+engaged flights closed until service returns or controls/deadlines settle them.
+See [installation](../docs/installation.md#codex-account-admission-upgrades).
+
+[Client reads](../agent/src/client.ts) have a three-second deadline, 4 KiB
+actual request and 8 KiB actual response limits including error bodies;
+the [server handler](../api/internal/handler/worker_codex_operation_admission.go)
+uses a 2.5-second context. One serialized read per run/generation shares the
+unsuccessful schedule across siblings and source replacements, so churn cannot
+bypass it. Cooldown rechecks take 1–15 seconds from server-clock eligibility;
+unavailable reads wait 15 seconds. Finite waits/extensions require a fresh read.
+The [service](../api/internal/workersvc/codex_operation_admission.go) and
+[authority query](../api/internal/store/queries/codex_operation_admission.sql)
+reuse existing episode/class policy and finite per-run spread.
+
+The owner projection carries `account_cooldown_class` (`rate_limit` or
+`overload`) and absolute `account_cooldown_eligible_at`, with exact reason
+`waiting for account cooldown` and health `waiting_account_cooldown`.
+Eligibility is earliest eligibility, not a promised dispatch. This is expected
+wait health, not lifecycle or `waiting_worker`. The
+[projection boundary](../api/internal/store/migrations/00378_account_cooldown_projection.sql)
+requires blocked required work, current positive generation, ownership,
+credential binding and revision source plus a 45-second accepted snapshot lease.
+Optional background advice cannot label a working root blocked.
+Omission/expiry or source/status change clears metadata at an accepted fresh
+read; foreign shared/admin summaries omit class and time. Missing/disabled
+optional snapshots or an old API leave specialized visibility unknown while
+operation enforcement remains independent. A read-time owner overlay can precede
+the periodic health sweep; an operation read does not recompute every health.
+Cooldown health remains quiet until a fresh health read, not an earliest-time
+timer that invents activity. Independent fault/freshness and near-spent wall
+signals outrank it; see [Run health](../docs/run-health.md#account-cooldown-waits).
+
+Entry, extension, refresh, expiry and exit create no per-run Slack nudge.
+Identical root-render deduplication is scoped to cooldown churn, not a broader
+notifier change; an unknown or faulted root can still need an edit and a later
+genuine fault can notify. The existing
+[actual root-path tests](../api/internal/slacksvc/account_cooldown_test.go)
+exercise state/health entry, exit, retries and direct-fault transitions.
+
+Queued maintenance/weekly-reserve precedence, credential selection and slots
+remain independent; waiting may occupy a worker slot. API keys, Claude, chat,
+versioned jobs and isolated-lane eligibility retain their prior policy.
+The M5 hosted exact-head acceptance and optional smoke boundaries above remain
+pending; this documentation does not establish them as passed.

@@ -71,6 +71,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -135,8 +136,8 @@ type serverContract struct {
 
 // liveSubscription carries the maintainer-injected REAL Codex subscription login and two
 // fixed-endpoint clients with distinct budgets. Initial identity establishment is outside the
-// app-server callback budget, while refreshClient preserves production's 2.5-second single-call
-// cap. A nil *liveSubscription selects the default canary seeding. The two tokens stay in memory
+// app-server callback budget, while refreshClient preserves production's 5-second OAuth
+// cap and 2.5-second nonrotating read cap. A nil *liveSubscription selects the default canary seeding. The two tokens stay in memory
 // and the sealed DB row — never written to a file.
 type liveSubscription struct {
 	accessToken    string
@@ -171,10 +172,13 @@ func buildLiveSubscription() *liveSubscription {
 		log.Fatal("codexm3btestserver: CODEX_M3B_LIVE_LOGIN_JSON must carry a non-empty access_token and refresh_token")
 	}
 	// Identity establishment seeds the fixture before any app-server callback exists, so it gets
-	// a separate bounded window. The refresh client retains production's 2.5-second single-call cap;
+	// a separate bounded window. The refresh client retains production's 5-second OAuth cap;
 	// otherwise a slow seed GET would force RELAX mode and silently stop testing the callback budget.
 	identityClient := codexauth.NewClient(codexauth.WithPerRequestTimeout(15 * time.Second))
-	refreshClient := codexauth.NewClient(codexauth.WithPerRequestTimeout(2500 * time.Millisecond))
+	refreshClient := codexauth.NewClient(
+		codexauth.WithPerRequestTimeout(2500*time.Millisecond),
+		codexauth.WithRefreshTimeout(5*time.Second),
+	)
 	if os.Getenv("CODEX_M3B_LIVE_RELAX_TIMEOUTS") == "1" {
 		identityClient = codexauth.NewClient()
 		refreshClient = codexauth.NewClient()
@@ -223,6 +227,9 @@ func main() {
 	q := store.New(pool)
 	box := newTestBox()
 	wsvc := workersvc.New(q, box, workersvc.Params{RunWallCeiling: 8 * time.Hour})
+	vlt := vault.NewPostgres(box, pool)
+	wsvc.SetVault(vlt)
+	wsvc.SetTxBeginner(pool)
 
 	seed, err := seedFixtures(ctx, pool, q, box, wsvc, live)
 	if err != nil {
@@ -234,6 +241,7 @@ func main() {
 	// config (WorkerHostingEnabled false), so the forge/privcheck/hub/settings collaborators
 	// are safely nil for this credential-only surface.
 	h := handler.New(pool, q, config.Config{}, box, nil, wsvc, nil, nil, nil)
+	h.SetVault(vlt)
 	router := h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
 
 	ln, err := net.Listen("tcp", *listenAddr)
@@ -325,7 +333,7 @@ func newTestBox() *secretbox.Box {
 func seedFixtures(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, wsvc *workersvc.Service, live *liveSubscription) (seedResult, error) {
 	ownerID, connectionID, repoID, workerID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 
-	if err := exec(ctx, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+	if err := exec(ctx, pool, `INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 		ownerID, fmt.Sprintf("codex-m3b-%s@example.test", uuid.NewString())); err != nil {
 		return seedResult{}, fmt.Errorf("insert user: %w", err)
 	}

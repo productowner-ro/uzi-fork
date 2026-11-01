@@ -33,10 +33,11 @@ import {
   runListItem,
 } from "../data";
 import { ensureLive, handleInput, startNewRun } from "../engine";
+import { foreignCooldownRun } from "../runProgress";
 import { getRun, nextRunId, patchRun, state } from "../store";
 import { delay, mockScenario, requireSession } from "./shared";
 import { LEAD_NAME_RE, templates } from "./agents";
-import { appSettings } from "./settings";
+import { appSettings, mockVaultRateFields } from "./settings";
 import { visibleCodexAccounts, visibleTokenMeters } from "./secrets";
 
 // Fixed at module load so refreshing usage does not reset the demo's elapsed clock.
@@ -309,7 +310,18 @@ function mockAdminListRuns(params?: {
     // other run belongs to the session admin. Before this map existed, EVERY
     // row here was stamped with the session email — the demo factory list was
     // 100% "mine", the exact duplication amendment 2 removes.
-    .map((r) => runListItem(r, mockOtherRunOwners[r.id] ?? requireSession().email));
+    .map((r) => {
+      const item = runListItem(r.id in mockOtherRunOwners ? foreignCooldownRun(r) : r, mockOtherRunOwners[r.id] ?? requireSession().email);
+      if (r.id in mockOtherRunOwners) {
+        delete item.account_cooldown_class;
+        delete item.account_cooldown_eligible_at;
+        delete item.codex_admission_class;
+        delete item.codex_admission_eligible_at;
+        if (item.queue_reason !== "maintenance") delete item.queue_reason;
+        item.health_reason = null;
+      }
+      return item;
+    });
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }
 
@@ -575,6 +587,9 @@ export const runsApi = {
       lifetime_unreported_run_count: 1,
       last7_subscription_run_count: 2,
       last7_unreported_run_count: 1,
+      // Mirrors the u-vlad row below ("you"): distinct PRs opened by non-chat runs.
+      lifetime_pr_count: 18,
+      last7_pr_count: 4,
     }),
   getAdminUsage: async () =>
     delay<AdminUsage>({
@@ -600,12 +615,17 @@ export const runsApi = {
         lifetime_unreported_run_count: 1,
         last7_subscription_run_count: 5,
         last7_unreported_run_count: 1,
+        // Distinct PRs: the sum of the four per-user counts below (24 + 18 + 14 + 5, 5 + 4 + 4 + 1).
+        lifetime_pr_count: 61,
+        last7_pr_count: 14,
       },
       users: [
         {
           user_id: "u-maria", email: "maria@example.com", usage: { input_tokens: 2_490_000, cache_read_tokens: 20_700_000, cache_creation_tokens: 400_000, output_tokens: 1_020_000, cost_usd: 37.83, cost_status: "metered" as const }, run_count: 31, outcomes: { finished: 38, completed: 30, cancelled: 2, plan_rejected: 1, base_diverged: 0, failed: 5, needs_landing: 1, ...demoFailureRecency(24, "agent_failure", 8), fail_origins: { agent_failure: 2, run_timeout: 1, finalize_base_align_conflict: 1, unknown: 1 } }, subscription_run_count: 12, unreported_run_count: 0,
           last_7_days: { input_tokens: 300000, cache_read_tokens: 3000000, cache_creation_tokens: 40000, output_tokens: 140000, cost_usd: 5.15, cost_status: "" as const },
           last7_run_count: 7,
+          pr_count: 24,
+          last7_pr_count: 5,
           last7_subscription_run_count: 3,
           last7_unreported_run_count: 0,
           last7_outcomes: { finished: 9, completed: 7, cancelled: 0, plan_rejected: 1, base_diverged: 0, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
@@ -614,6 +634,8 @@ export const runsApi = {
           user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 27.01, cost_status: "metered" as const }, run_count: 23, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, base_diverged: 0, failed: 5, needs_landing: 2, ...demoLinkedFailure, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 } }, subscription_run_count: 8, unreported_run_count: 1,
           last_7_days: { input_tokens: 280000, cache_read_tokens: 2800000, cache_creation_tokens: 40000, output_tokens: 120000, cost_usd: 5.16, cost_status: "" as const },
           last7_run_count: 6,
+          pr_count: 18,
+          last7_pr_count: 4,
           last7_subscription_run_count: 2,
           last7_unreported_run_count: 1,
           last7_outcomes: { finished: 8, completed: 6, cancelled: 1, plan_rejected: 0, base_diverged: 0, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
@@ -622,6 +644,8 @@ export const runsApi = {
           user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71, cost_status: "metered" as const }, run_count: 19, outcomes: { finished: 21, completed: 18, cancelled: 1, plan_rejected: 0, base_diverged: 0, failed: 2, needs_landing: 0, ...demoFailureRecency(72, "worker_lost", 3), fail_origins: { agent_failure: 1, worker_lost: 1 } }, subscription_run_count: 0, unreported_run_count: 0,
           last_7_days: { input_tokens: 260000, cache_read_tokens: 2800000, cache_creation_tokens: 30000, output_tokens: 120000, cost_usd: 4.7, cost_status: "" as const },
           last7_run_count: 6,
+          pr_count: 14,
+          last7_pr_count: 4,
           last7_subscription_run_count: 0,
           last7_unreported_run_count: 0,
           last7_outcomes: { finished: 7, completed: 6, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 1, needs_landing: 0, fail_origins: {"run_timeout": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
@@ -630,6 +654,8 @@ export const runsApi = {
           user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21, cost_status: "metered" as const }, run_count: 6, outcomes: { finished: 8, completed: 8, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 0, needs_landing: 0, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: {} }, subscription_run_count: 0, unreported_run_count: 0,
           last_7_days: { input_tokens: 60000, cache_read_tokens: 500000, cache_creation_tokens: 10000, output_tokens: 30000, cost_usd: 0.5, cost_status: "" as const },
           last7_run_count: 1,
+          pr_count: 5,
+          last7_pr_count: 1,
           last7_subscription_run_count: 0,
           last7_unreported_run_count: 0,
           last7_outcomes: { finished: 1, completed: 1, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 0, needs_landing: 0, fail_origins: {}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
@@ -652,7 +678,11 @@ export const runsApi = {
   },
   // PRD #1732 D9: the admin view shows no row and no count for a disabled credential.
   getAdminRateLimits: async () =>
-    delay({ users: mockAdminRateLimits.map((u) => ({ ...u, tokens: visibleTokenMeters(u.tokens) })) }, 60),
+    delay({ users: mockAdminRateLimits.map((u) => ({
+      ...u,
+      ...mockVaultRateFields(u.id),
+      tokens: visibleTokenMeters(u.tokens),
+    })) }, 60),
   // ── Codex per-account rate limits (PRD #1209 M3) ────────────────────────────
   // The caller's own Codex meters follow the persona (a demo login as a seeded
   // non-admin reaches pending / vault-locked / polling-off / no-subscription); the
@@ -666,7 +696,11 @@ export const runsApi = {
     delay(
       {
         users: mockAdminCodexRateLimits
-          .map((u) => ({ ...u, accounts: visibleCodexAccounts(u.accounts) }))
+          .map((u) => ({
+            ...u,
+            ...mockVaultRateFields(u.id),
+            accounts: visibleCodexAccounts(u.accounts, u.id),
+          }))
           .filter((u) => u.accounts.length > 0),
       },
       60,
@@ -685,11 +719,16 @@ export const runsApi = {
     // (a no-op for the default/unknown scenario, and for a run switched this session).
     // PRD #1429 M4a: layered with the harness overlay, so a "codex-only" run also
     // reads harness=codex on the detail page.
-    const decorated = harnessOverlay(credentialOverlay(run));
+    const decorated = { ...harnessOverlay(credentialOverlay(id in mockOtherRunOwners ? foreignCooldownRun(run) : run)) };
+    if (id in mockOtherRunOwners) {
+      delete decorated.account_cooldown_class;
+      delete decorated.account_cooldown_eligible_at;
+      decorated.health_reason = null;
+    }
     const history = (decorated.milestone_reconciliations ?? []).filter(r =>
       reconciliationBeforeGateRevision === undefined || (typeof r.gate_revision === "number" && r.gate_revision < reconciliationBeforeGateRevision));
     const page = history.slice(0, 50);
-    return delay({ run: { ...decorated, usage: runListItem(decorated).usage, own_agents,
+    return delay({ run: { ...decorated, repo_path: runListItem(decorated).repo_path, usage: runListItem(decorated).usage, own_agents,
       milestone_reconciliations: page,
       milestone_reconciliations_next_before_gate_revision: history.length > page.length
         ? page[page.length - 1]?.gate_revision as number : undefined,
@@ -952,14 +991,26 @@ export const runsApi = {
     if (!run) throw new ApiError(404, "run not found");
     if (id.startsWith("run-memory-hold") && mockScenario() === "memory-hold-nonowner")
       throw new ApiError(404, "run not found");
+    if (id.startsWith("run-forge-") && mockScenario() === "forge-hold-nonowner")
+      throw new ApiError(404, "run not found");
+    const forgeHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "forge_unreachable" && run.recovery_retry_not_before === null;
     const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
-    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld)
+    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld)
       throw new ApiError(409, `run is ${run.status}`);
     // Issue #3181: mirrors the server's ErrRunHoldSettling refusal; an unsettled hold resumes.
     const switchHold = credentialSwitchHold(run);
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
+    // PRD #3522: an owner resume of a reserve hold records the override until the next weekly
+    // reset (the mock stands in with seven days).
+    const reserveHeld = run.status === "paused" && run.hold_reason === "weekly_reserve";
     patchRun(id, { status: "queued", updated_at: new Date().toISOString(),
+      ...(reserveHeld
+        ? { hold_reason: null, reserve_exempt_until: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString() }
+        : {}),
       // The held-only projection disappears on Resume; the API owns the fresh episode.
+      ...(forgeHeld ? { recovery_wait_cause: null, recovery_retry_not_before: null,
+        health_reason: "Owner resumed one bounded forge attempt; origin cooldown and other admission limits may still block execution.",
+      } : {}),
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
       ...(switchHold === "unsettled" ? { hold_reason: null, status_since: new Date().toISOString() } : {}),
       ...(run.hold_reason === "provider_unavailable" ? {
@@ -994,6 +1045,8 @@ export const runsApi = {
   // SteerQueueCard renders every chip). A run with no sample inputs returns an empty
   // queue; a missing run 404s (which the card treats as "no queue", never an error).
   getRunInputs: async (id: string) => {
+    if (id.startsWith("run-forge-") && mockScenario() === "forge-hold-nonowner")
+      throw new ApiError(404, "run not found");
     if (id.startsWith("run-memory-hold") && mockScenario() === "memory-hold-nonowner")
       throw new ApiError(404, "run not found");
     if (!getRun(id)) throw new ApiError(404, "run not found");
@@ -1116,6 +1169,8 @@ export const runsApi = {
     reset?: MilestoneResetOptions,
   ) => {
     if (id.startsWith("run-memory-hold") && mockScenario() === "memory-hold-nonowner")
+      throw new ApiError(404, "run not found");
+    if (id.startsWith("run-forge-") && mockScenario() === "forge-hold-nonowner")
       throw new ApiError(404, "run not found");
     const current = getRun(id);
     if (!current) throw new ApiError(404, "run not found");

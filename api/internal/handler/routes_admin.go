@@ -28,11 +28,13 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 		// place. admin-ness resolves live from the row, so demoting the owner instantly
 		// kills a uza_ token's admin reads with no revocation step.
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Use(h.requireUser())
 			r.Use(mw.RequireAdminRO)
 			r.Get("/users", h.ListUsers)
 			// Instance settings (PRD #19): the configurable forge labels today.
 			r.Get("/settings", h.GetSettings)
+			// Instance maintenance (PRD #3454): pause state plus the drain readout.
+			r.Get("/maintenance", h.AdminGetMaintenance)
 			r.Get("/docker-allowlist-repos", h.AdminListDockerAllowlistRepos)
 			// Vault migration progress (PRD #32): count of still-master-sealed secrets.
 			r.Get("/vault-migration", h.VaultMigration)
@@ -148,7 +150,7 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 		})
 		// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Use(h.requireAuth())
 			r.Use(mw.RequireAdmin)
 			r.Patch("/users/{id}", h.PatchUser)
 			// Admin per-user run-judge toggle (PRD #46 Decision 7): actor authorized by
@@ -158,6 +160,9 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// RequireAdmin, target from the path, never the body.
 			r.Put("/users/{id}/ci-autofix", h.SetUserCIAutofixEnabled)
 			r.Put("/settings", h.UpdateSettings)
+			// Instance maintenance (PRD #3454): cookie-only like settings, so an admin read
+			// token is refused and CSRF applies; the actor is the session user.
+			r.Put("/maintenance", h.AdminPutMaintenance)
 			// Admin "All users" cross-user Mark done + its Undo (PRD #1184 M2): mark every
 			// user's OPEN member of a (category, target) coordinate done with set_via='admin'
 			// (ON CONFLICT DO NOTHING, so a human verdict is never overwritten), and delete only

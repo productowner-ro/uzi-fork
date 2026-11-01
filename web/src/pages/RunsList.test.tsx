@@ -531,6 +531,15 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
     expect(screen.getByText("queued")).toBeTruthy();
   });
 
+  it("off users with an uncached vault get the ordinary queued state", async () => {
+    vi.mocked(useAuth).mockReturnValue({ user: { is_admin: false }, vaultUnlocked: false, vaultMode: "unprotected" } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "q", issue_title: "Off queued run", status: "queued" })] });
+    renderRuns();
+    await screen.findByText("Off queued run");
+    expect(screen.getByText("queued")).toBeTruthy();
+    expect(screen.queryByText(/waiting for vault unlock/)).toBeNull();
+  });
+
   it("renders a plain queued pill when the vault is unlocked", async () => {
     vi.mocked(useAuth).mockReturnValue({
       user: { is_admin: false },
@@ -2106,4 +2115,61 @@ describe("RunRow rejection presentation", () => {
     render(<MemoryRouter><ul><RunRow run={aRun({ status: "failed", fail_origin, stop_kind, landing_state: "needs_landing" })} now={Date.now()} /></ul></MemoryRouter>);
     expect(screen.getByText(label).classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
   });
+});
+
+
+it.each([["rate_limit", "a rate limit"], ["overload", "overload"]] as const)("Codex admission run list row shows %s from a summary", (cls, words) => {
+  const at = "2026-07-05T12:05:37Z";
+  const { container, rerender } = render(<MemoryRouter><ul><RunRow run={aRun({ status: "queued", health: "waiting_worker",
+    codex_admission_class: cls, codex_admission_eligible_at: at })} now={Date.parse("2026-07-05T12:04:00Z")} /></ul></MemoryRouter>);
+  expect(container.textContent).toContain(`waiting: provider reported ${words}; account admission eligible after ${at}`);
+  rerender(<MemoryRouter><ul><RunRow run={aRun({ status: "queued", health: "waiting_worker",
+    codex_admission_class: cls, codex_admission_eligible_at: at })} now={Date.parse(at)} /></ul></MemoryRouter>);
+  expect(container.textContent).toContain("waiting for worker");
+  expect(container.textContent).not.toContain("provider reported");
+});
+
+
+it.each(["claimed", "running", "awaiting_approval"] as const)("account cooldown %s summary row keeps one visible wait", status => {
+  const at = "2026-07-05T12:05:37Z";
+  const r = aRun({ status, health: "waiting_account_cooldown", account_cooldown_class: "overload", account_cooldown_eligible_at: at,
+    progress: { state: "waiting", pct: null, milestone_done: 0, milestone_total: 0, active_milestone_id: "", phase: "" } });
+  const { container, rerender } = render(<MemoryRouter><ul><RunRow run={r} now={Date.parse("2026-07-05T12:04:00Z")} /></ul></MemoryRouter>);
+  const text = `waiting for account cooldown · overload · earliest eligibility ${at}`;
+  expect(screen.getByText(text).classList.contains("sr-only")).toBe(false);
+  expect(container.textContent).not.toMatch(/waits on you|⚠|stuck/);
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+  rerender(<MemoryRouter><ul><RunRow run={r} now={Date.parse(at)} /></ul></MemoryRouter>);
+  expect(container.textContent).not.toMatch(/waiting for account cooldown|provider reported|⚠|stuck|waits on you/);
+});
+
+it.each(["running", "awaiting_approval"] as const)("expired or missing cooldown metadata keeps %s row quiet until health refresh", status => {
+  const run = aRun({ status, health: "waiting_account_cooldown",
+    account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2026-07-05T12:03:59Z",
+    current_activity: { agent: "coder", agent_label: "Coder", tool: "Bash", detail: "retained cooldown activity", at: "2026-07-05T12:03:00Z", seq: 1 } });
+  const now = Date.parse("2026-07-05T12:04:00Z");
+  const { container, rerender } = render(<MemoryRouter><ul><RunRow run={run} now={now} /></ul></MemoryRouter>);
+  for (const metadata of [
+    {},
+    { account_cooldown_class: undefined },
+    { account_cooldown_eligible_at: undefined },
+  ]) {
+    rerender(<MemoryRouter><ul><RunRow run={{ ...run, ...metadata }} now={now} /></ul></MemoryRouter>);
+    expect(screen.getByText("waiting")).toBeTruthy();
+    expect(container.textContent).not.toMatch(/waiting for account cooldown|Coder/);
+    expect(container.querySelector("[data-live], [data-attention], .animate-pulse")).toBeNull();
+  }
+  rerender(<MemoryRouter><ul><RunRow run={{ ...run, health: "ok" }} now={now} /></ul></MemoryRouter>);
+  expect(screen.getByText("Coder")).toBeTruthy();
+  expect(container.querySelector(status === "running" ? "[data-live]" : "[data-attention]")).not.toBeNull();
+});
+
+it.each([false, true])("account cooldown suppresses row activity and attention (revising=%s)", is_revising => {
+  const run = aRun({ status: "awaiting_approval", is_revising, health: "waiting_account_cooldown",
+    account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2099-01-01T00:00:37Z",
+    current_activity: { agent: "coder", agent_label: "Coder", tool: "Bash", detail: "retained cooldown activity", at: new Date().toISOString(), seq: 1 } });
+  const { container } = render(<MemoryRouter><ul><RunRow run={run} now={Date.now()} /></ul></MemoryRouter>);
+  expect(container.textContent).toContain("waiting for account cooldown");
+  expect(screen.queryByText("Coder")).toBeNull();
+  expect(container.querySelector("[data-live], [data-attention], .animate-pulse")).toBeNull();
 });

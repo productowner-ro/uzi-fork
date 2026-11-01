@@ -144,6 +144,17 @@ describe("statusBadge", () => {
   });
 });
 
+describe("7-day-only reading (no five_hour)", () => {
+  const { five_hour: _omit, ...sevenOnly } = ok(0, 97) as Extract<MyRateLimits, { status: "ok" }>;
+  const seven = sevenOnly as Extract<MyRateLimits, { status: "ok" }>;
+
+  it("worstWindow and the state use only the 7-day window", () => {
+    expect(worstWindow(seven)).toMatchObject({ label: "7-day", pct: 97 });
+    expect(rowState(seven)).toBe("live_danger");
+    expect(statusBadge(seven, false)).toMatchObject({ label: "7d nearly out" });
+  });
+});
+
 describe("worstWindow (PRD #54)", () => {
   const okOnly = (limits: MyRateLimits) => limits as Extract<MyRateLimits, { status: "ok" }>;
 
@@ -407,4 +418,11 @@ describe("rowForecast (PRD #310 — render-side stale short-circuit)", () => {
   it("is silent for a stale row even with a would-be-over reading (no forecast off a frozen bar)", () => {
     expect(rowForecast(true, 58, RESET, W5, nowMs, "usage_endpoint")).toEqual({ state: "safe", projectedPct: 0 });
   });
+});
+
+
+it("off mode labels a stale reading without an unlock instruction", () => {
+  const stale = ok(25, 10, { stale: true });
+  expect(statusBadge(stale, true, "protected").label).toBe("🔒 vault locked");
+  expect(statusBadge(stale, true, "unprotected").label).toBe("stale");
 });

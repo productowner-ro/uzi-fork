@@ -66,7 +66,7 @@ var limiterNames = [...]string{
 	limOAuth,
 }
 
-// The limiter names, as constants so a typo in the 146-row table below is a compile
+// The limiter names, as constants so a typo in the 389-row table below is a compile
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
@@ -215,6 +215,9 @@ var limiterNames = [...]string{
 // /api/admin/guardrail-impact, 142 until PRD #122 M8 added POST
 // /api/worker/runs/{id}/publish, and 141 until `c309e8a0` added GET
 // /api/admin/cli-tokens.
+// PRD #3244 M1 added POST /api/worker/runs/{id}/lead-config (noLimiter, like decisions-memo);
+// the table had 388 rows after it. PRD #3244 M3 added GET /api/runs/{id}/lead-config (noLimiter, an
+// owner-or-admin read like /review), making it 389 rows. The earlier history figures above were not re-tallied.
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -261,12 +264,13 @@ type routeMount struct {
 // drift; the durable claim is that the list is COMPLETE, which is what
 // TestEveryRouteCarriesItsExpectedPerUserLimiter enforces in both directions.
 //
-// The two rows worth naming, because they are brute-force controls on a passphrase
-// endpoint: POST /api/vault/unlock and POST /api/vault/passphrase.
+// The vault's password/passphrase surfaces use authLimiter: POST /api/vault/unlock,
+// POST /api/vault/enable and POST /api/vault/passphrase. Disabling protection also
+// uses that limiter class to bound conversion requests.
 //
 // NOTE on authLimiter: it is mounted BOTH ways. Its per-IP Middleware sits on
-// /register, /login, /config, the OIDC pair and /cli/start; EIGHT routes take its
-// PerUserMiddleware — /cli/approve, /vault/unlock, /vault/passphrase,
+// /register, /login, /config, the OIDC pair and /cli/start. Its PerUserMiddleware
+// protects /cli/approve, /vault/unlock, /vault/enable, /vault/disable, /vault/passphrase,
 // /admin/cli-tokens, /admin/products, /admin/product-tokens, the product-token mint
 // POST /me/product-tokens/ and POST /v1/jobs (a per-route mount inside the /api/v1
 // subtree, whose own r.Use is v1Limiter since PRD #1908 D-B, so every /api/v1 route
@@ -386,6 +390,7 @@ var wantRouteMounts = []routeMount{
 	// call → noLimiter, like the agent-source GET beside it.
 	{"GET", "/api/admin/release-check", noLimiter},
 	{"GET", "/api/admin/settings", noLimiter},
+	{"GET", "/api/admin/maintenance", noLimiter},
 	{"GET", "/api/admin/docker-allowlist-repos", noLimiter},
 	{"GET", "/api/admin/slack/status", noLimiter},
 	{"GET", "/api/admin/usage", noLimiter},
@@ -472,6 +477,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/me/runs/in-progress-count", noLimiter},
 	// Schedule list/get (PRD #241 M4): owner-scoped reads, no forge → noLimiter.
 	{"GET", "/api/me/schedules/", noLimiter},
+	{"GET", "/api/maintenance/", noLimiter},
 	{"GET", "/api/schedules/{id}", noLimiter},
 	{"GET", "/api/schedules/{id}/ci-episodes", noLimiter},
 	// Pause-all singleton (PRD #1093 M2, D7): the user-level kill switch. All three are
@@ -536,6 +542,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/runs/{id}/held-publications", noLimiter},
 	{"POST", "/api/runs/{id}/held-publications/expire", noLimiter},
 	{"GET", "/api/runs/{id}/inputs", noLimiter},
+	{"GET", "/api/runs/{id}/lead-config", noLimiter},
 	{"GET", "/api/runs/{id}/messages", noLimiter},
 	{"GET", "/api/runs/{id}/review", noLimiter},
 	// PRD #400 M4a: the handoff task diff-review read. No limiter — a plain owner-or-admin
@@ -618,6 +625,8 @@ var wantRouteMounts = []routeMount{
 	// Schedule edit (PRD #241 M4): owner-scoped DB update, no forge → noLimiter.
 	{"PATCH", "/api/schedules/{id}", noLimiter},
 	{"PATCH", "/api/workers/{id}", noLimiter},
+	{"POST", "/api/workers/{id}/cordon", noLimiter},
+	{"DELETE", "/api/workers/{id}/cordon", noLimiter},
 	// PRD #66 M8 (D8): admin per-repo guardrail override set — an admin-only,
 	// unscoped-by-id DB write, no forge call → noLimiter.
 	{"POST", "/api/admin/repos/{id}/guardrail-override", noLimiter},
@@ -826,6 +835,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/skills/", noLimiter},
 	{"POST", "/api/skills/{id}/reset", noLimiter},
 	{"POST", "/api/tool-allowlist/", noLimiter},
+	{"POST", "/api/vault/disable", limAuth},
+	{"POST", "/api/vault/enable", limAuth},
 	{"POST", "/api/vault/lock", noLimiter},
 	{"POST", "/api/vault/passphrase", limAuth},
 	{"POST", "/api/vault/unlock", limAuth},
@@ -839,6 +850,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/memory/reserve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory/outcome", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/refresh", noLimiter},
+	{"POST", "/api/worker/runs/{id}/codex/admission-signal", noLimiter},
+	{"POST", "/api/worker/runs/{id}/codex/operation-admission", noLimiter},
+	// Authenticated, run-scoped advisory telemetry: no forge call or token spend.
+	{"POST", "/api/worker/runs/{id}/forge-clone-success", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/release", noLimiter},
 	// PRD #1226 M2: the completion-interlock permit-issue and same-lead attempt endpoints.
 	// Worker-authenticated, scoped to the worker's own run, no forge call → noLimiter, matching
@@ -896,6 +911,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/inputs/discarded", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/decisions-memo", noLimiter},
+	{"POST", "/api/worker/runs/{id}/lead-config", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/usage", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},
@@ -955,6 +971,7 @@ var wantRouteMounts = []routeMount{
 	// (set_via='admin', ON CONFLICT DO NOTHING), no forge call and no token spend → noLimiter.
 	{"PUT", "/api/admin/judge/recommendations/disposition", noLimiter},
 	{"PUT", "/api/admin/settings", noLimiter},
+	{"PUT", "/api/admin/maintenance", noLimiter},
 	{"PUT", "/api/admin/users/{id}/ci-autofix", noLimiter},
 	// PRD #1976 M1: allow one site list for a product — a cookie-only admin DB write → noLimiter.
 	{"PUT", "/api/admin/products/{id}/egress-profiles/{name}", noLimiter},
@@ -991,6 +1008,9 @@ var wantRouteMounts = []routeMount{
 	// makes no forge call, sends no DM at toggle time, and mints nothing — none of
 	// the three things the per-user limiters exist to bound. Cookie+CSRF gates it.
 	{"PUT", "/api/me/notify-early-reset", noLimiter},
+	// PRD #3522: the weekly usage reserve (SetUsageReserve). One owner-scoped UPDATE of two
+	// columns, no spend, no forge write, no fan-out: the same shape as /me/notify-early-reset.
+	{"PUT", "/api/me/usage-reserve", noLimiter},
 	// PRD #46: the run-judge consent toggle (SetJudgeEnabled). A single boolean
 	// UPDATE on the caller's own users row, spends no Anthropic token at toggle time
 	// — noLimiter, matching /me/autopilot and /me/ci-autofix beside it. Its route
