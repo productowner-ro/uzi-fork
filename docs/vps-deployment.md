@@ -8,7 +8,7 @@ audience: operator
 
 You can run uzi alongside the services already on your VPS, using your existing reverse proxy and backup routine. In this tutorial, we will publish uzi at `https://your_domain` and bring a worker online without exposing the API or database directly.
 
-The stack has four roles: `db` stores application data in PostgreSQL; `api` handles authentication, configuration, and work coordination; `web` serves the interface and proxies API requests; and `agent` runs work against your repositories. Docker Compose keeps their network, persistent volumes, and startup dependencies together while letting you start the worker separately. This repository's VPS recipe adapts the dedicated [server Compose file](../deploy/compose/compose.yml) and existing [environment initializer](../scripts/init-env.sh), originally written for local Compose, to a layout downloaded from a release tag. We will use signed images from that same release. The server Compose file uses the base-agent template and excludes the optional Docker-in-Docker (DinD) services; see [Worker setup](./worker-setup.md) for other worker options.
+The stack has four roles: `db` stores application data in PostgreSQL; `api` handles authentication, configuration, and work coordination; `web` serves the interface and proxies API requests; and `agent` runs work against your repositories. Docker Compose keeps their network, persistent volumes, and startup dependencies together while letting you start the worker separately. This repository's VPS recipe adapts the dedicated [server Compose file](../deploy/compose/compose.yaml) and existing [environment initializer](../scripts/init-env.sh), originally written for local Compose, to a layout downloaded from a release tag. We will use signed images from that same release. The server Compose file uses the base-agent template and excludes the optional Docker-in-Docker (DinD) services; see [Worker setup](./worker-setup.md) for other worker options.
 
 ## Prerequisites
 
@@ -44,7 +44,7 @@ Enter the deployment directory and run the remaining Compose commands from here:
 cd /opt/uzi
 ```
 
-Choose a release at [GitHub Releases](https://github.com/vtmocanu/uzi/releases) **that contains `deploy/compose/compose.yml`**. Set the shell variable below to your chosen release number **without the leading `v`**, replacing the placeholder before running it:
+Choose a release at [GitHub Releases](https://github.com/vtmocanu/uzi/releases) **that contains `deploy/compose/compose.yaml`**. Set the shell variable below to your chosen release number **without the leading `v`**, replacing the placeholder before running it:
 
 ```sh
 UZI_VERSION='<release-number-without-v>'
@@ -54,10 +54,10 @@ Download the three files from that same release. Run this block in Bash; `set -e
 
 ```bash
 set -e
-curl -fsSLo compose.yml "https://raw.githubusercontent.com/vtmocanu/uzi/v${UZI_VERSION}/deploy/compose/compose.yml"
-curl -fsSLo .env.example "https://raw.githubusercontent.com/vtmocanu/uzi/v${UZI_VERSION}/.env.example"
+curl -fsSLo compose.yaml "https://raw.githubusercontent.com/productowner-ro/uzi-fork/v${UZI_VERSION}/deploy/compose/compose.yaml"
+curl -fsSLo .env.example "https://raw.githubusercontent.com/productowner-ro/uzi-fork/v${UZI_VERSION}/.env.example"
 mkdir -p scripts
-curl -fsSLo scripts/init-env.sh "https://raw.githubusercontent.com/vtmocanu/uzi/v${UZI_VERSION}/scripts/init-env.sh"
+curl -fsSLo scripts/init-env.sh "https://raw.githubusercontent.com/productowner-ro/uzi-fork/v${UZI_VERSION}/scripts/init-env.sh"
 ```
 
 Initialize the deployment environment:
@@ -94,7 +94,7 @@ Verify the base-template worker image as well:
 cosign verify --certificate-identity "https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v${UZI_VERSION}" --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' "ghcr.io/vtmocanu/uzi/agent-base:${UZI_VERSION}"
 ```
 
-These commands verify registry images; see [Container signing](./container-signing.md) for the signing boundary and digest-based verification. Keep this directory name stable: changing it changes Compose's default project name and can make existing named volumes appear to be missing. Preserve this deployment's `.env` and local `compose.yml` edits during an upgrade; see [Upgrades](#upgrades).
+These commands verify registry images; see [Container signing](./container-signing.md) for the signing boundary and digest-based verification. Keep this directory name stable: changing it changes Compose's default project name and can make existing named volumes appear to be missing. Preserve this deployment's `.env` and local `compose.yaml` edits during an upgrade; see [Upgrades](#upgrades).
 
 You now have your selected release's configuration in a stable directory and have verified its three application images.
 
@@ -127,9 +127,9 @@ Your installation now has persistent secrets, a matching HTTPS origin and public
 
 ## Step 3 - Select release images and start the application
 
-The downloaded `compose.yml` already selects the release images using `UZI_VERSION` from `.env`.
+The downloaded `compose.yaml` already selects the release images using `UZI_VERSION` from `.env`.
 
-It publishes web at `127.0.0.1:8080`. If that port is occupied, edit the **single existing entry** under `services.web.ports` in `compose.yml` to:
+It publishes web at `127.0.0.1:8080`. If that port is occupied, edit the **single existing entry** under `services.web.ports` in `compose.yaml` to:
 
 ```yaml
       - "127.0.0.1:18080:8080"
@@ -140,7 +140,7 @@ Then use port `18080` in both proxy examples in Step 4.
 Render the configuration, including the worker profile, **before pulling or starting services**. The output contains resolved secrets, including database and seed credentials: inspect it privately and do not paste it into logs or support messages:
 
 ```sh
-docker compose -f compose.yml --profile agent config
+docker compose -f compose.yaml --profile agent config
 ```
 
 Check that `api`, `web`, and `agent` use the three verified images with your selected version; `web` publishes only your selected loopback port; `api` and `db` have no published ports; and `agent` retains its `agent` profile. Confirm `pgdata` mounts at `/var/lib/postgresql/data`, `agentdata` at `/data`, `agentnix` at `/nix`, and `worker_token` feeds `/run/secrets/worker_token` with `UZI_WORKER_TOKEN_FILE` pointing there. Stop and correct the configuration if these checks fail. The token source is intentionally empty at this stage.
@@ -148,19 +148,19 @@ Check that `api`, `web`, and `agent` use the three verified images with your sel
 Pull the database and three application images without activating the worker:
 
 ```sh
-docker compose -f compose.yml --profile agent pull db api web agent
+docker compose -f compose.yaml --profile agent pull db api web agent
 ```
 
 Start the database, API, and web service, forbidding local image builds:
 
 ```sh
-docker compose -f compose.yml up -d --no-build db api web
+docker compose -f compose.yaml up -d --no-build db api web
 ```
 
 Inspect their status and wait for the database and API health checks to pass:
 
 ```sh
-docker compose -f compose.yml ps
+docker compose -f compose.yaml ps
 ```
 
 The API runs database migrations during startup. If a service fails, inspect its logs privately with your usual operational tools before continuing; do not delete volumes to retry. Keep `pgdata`, `agentdata`, and `agentnix` attached to this project, and avoid `down -v`, which deletes persistent data.
@@ -244,7 +244,7 @@ Open `https://your_domain`. For the recommended seeded bootstrap, sign in using 
 For the alternative bootstrap, register your account while access remains restricted, confirm that it is admin, and immediately edit `.env` to set `UZI_REGISTRATION_ENABLED=false`. Recreate the API so it reads that change:
 
 ```sh
-docker compose -f compose.yml up -d --no-build --force-recreate api
+docker compose -f compose.yaml up -d --no-build --force-recreate api
 ```
 
 Confirm that registration is disabled and your account can still sign in before opening access more widely. In your browser's developer tools, inspect the `uzi_auth` cookie and confirm that it has `Secure` and `HttpOnly` set. **`FRONTEND_ORIGIN` controls the Secure flag** through its HTTPS scheme. `UZI_PUBLIC_BASE_URL` should match your public URL, but does not control that flag. If the cookie is not Secure, correct `FRONTEND_ORIGIN`, recreate the API with the command above, and sign in again.
@@ -257,7 +257,7 @@ We will issue a join token for your account and deliver it through the release's
 
 Open **Settings → Workers → Add a worker → Register your own worker**. Select the base template and copy the token, which is shown once. Edit the existing `UZI_WORKER_TOKEN=` entry in `.env` to contain that value, keeping the file private. This entry is the **source for the Compose secret**, not an environment variable to add to the agent container.
 
-The following excerpt is **already present in `compose.yml`**; inspect it rather than adding duplicate definitions. It connects the `.env` source to the file the worker reads:
+The following excerpt is **already present in `compose.yaml`**; inspect it rather than adding duplicate definitions. It connects the `.env` source to the file the worker reads:
 
 ```yaml
 services:
@@ -274,19 +274,19 @@ secrets:
 Render the configuration again in a private terminal to check that the source is populated and the secret/file wiring remains intact; the output may reveal the token as well as other credentials:
 
 ```sh
-docker compose -f compose.yml --profile agent config
+docker compose -f compose.yaml --profile agent config
 ```
 
 Start the image-based agent with its profile enabled and builds forbidden:
 
 ```sh
-docker compose -f compose.yml --profile agent up -d --no-build agent
+docker compose -f compose.yaml --profile agent up -d --no-build agent
 ```
 
 Inspect the worker container's status:
 
 ```sh
-docker compose -f compose.yml --profile agent ps
+docker compose -f compose.yaml --profile agent ps
 ```
 
 Return to **Settings → Workers** and wait for the worker to appear online. If it remains offline, check the issued token, secret source, and API connectivity before assigning work. See [Worker setup](./worker-setup.md) for troubleshooting and further worker options.
@@ -297,9 +297,9 @@ Your base-template worker is now online and registered to your account.
 
 We will preserve application data together with its encryption key. You can use your existing PostgreSQL-aware backup tool or the optional backup container below.
 
-Back up `.env` above all, including **the original `UZI_SECRET_KEY`**, along with your locally edited `compose.yml`, `.env.example`, `scripts/init-env.sh`, and your release version record. A database dump without its encryption key cannot recover the encrypted tokens. Preserve the worker volumes if you need its local repositories and caches; a database dump does not include them. Copy backups and protected configuration off-host using your existing routine.
+Back up `.env` above all, including **the original `UZI_SECRET_KEY`**, along with your locally edited `compose.yaml`, `.env.example`, `scripts/init-env.sh`, and your release version record. A database dump without its encryption key cannot recover the encrypted tokens. Preserve the worker volumes if you need its local repositories and caches; a database dump does not include them. Copy backups and protected configuration off-host using your existing routine.
 
-If you want a dedicated backup container, add the following `db-backup` service **under the existing `services` mapping in `compose.yml`**, alongside `db`, `api`, `web`, and `agent`. Do not add a second `services` key. This optional example uses [nfrastack/db-backup 5.0.5](https://nfrastack.com/db-backup/container), PostgreSQL settings, a first backup five minutes after startup, and a daily interval. Change the schedule and host directory to suit your routine. `/opt/uzi/backups` must be writable by its documented backup uid, `10000`; protect the directory and its archives. The service uses the default Compose network to reach `db`:
+If you want a dedicated backup container, add the following `db-backup` service **under the existing `services` mapping in `compose.yaml`**, alongside `db`, `api`, `web`, and `agent`. Do not add a second `services` key. This optional example uses [nfrastack/db-backup 5.0.5](https://nfrastack.com/db-backup/container), PostgreSQL settings, a first backup five minutes after startup, and a daily interval. Change the schedule and host directory to suit your routine. `/opt/uzi/backups` must be writable by its documented backup uid, `10000`; protect the directory and its archives. The service uses the default Compose network to reach `db`:
 
 ```yaml
   db-backup:
@@ -330,25 +330,25 @@ sudo install -d -m 0700 -o 10000 -g 10000 /opt/uzi/backups
 Render the configuration privately and inspect the added backup service's credentials, schedule, volume, and database target:
 
 ```sh
-docker compose -f compose.yml --profile agent config
+docker compose -f compose.yaml --profile agent config
 ```
 
 Pull the optional backup image:
 
 ```sh
-docker compose -f compose.yml pull db-backup
+docker compose -f compose.yaml pull db-backup
 ```
 
 Start the backup service without building images:
 
 ```sh
-docker compose -f compose.yml up -d --no-build db-backup
+docker compose -f compose.yaml up -d --no-build db-backup
 ```
 
 Run its built-in `backup-now` helper to test a backup immediately rather than wait for the schedule:
 
 ```sh
-docker compose -f compose.yml exec db-backup backup-now
+docker compose -f compose.yaml exec db-backup backup-now
 ```
 
 Inspect the backup logs and confirm that a completed archive exists under `/opt/uzi/backups`. See the upstream [backup recipes](https://nfrastack.com/db-backup/recipes/backup) for supported options and archive selection. The auto-generated configuration lives at `/config/db-backup.yml`; mounting an existing config there changes how environment-based configuration is applied, so this example leaves that path unmounted.
@@ -359,23 +359,23 @@ You now have a database backup and protected configuration to copy off-host usin
 
 ## Upgrades
 
-Before upgrading, take a database backup and protect an off-host copy of `.env` and your current `compose.yml`. Record the running version and review the target release's notes for migration requirements.
+Before upgrading, take a database backup and protect an off-host copy of `.env` and your current `compose.yaml`. Record the running version and review the target release's notes for migration requirements.
 
 Choose a target release containing the server manifest and set the shell `UZI_VERSION` to its number without `v`. Download its manifest, example environment, and initializer into a separate staging directory using the versioned URLs from Step 1. Compare them with your installed files before replacing anything. Carry forward local configuration edits, including the web port and optional `db-backup` service; merge any new required environment settings into your existing `.env`. Retain the original encryption key, database password, and other credentials. Do not regenerate `.env` or overwrite it with the new example.
 
 Update the existing `UZI_VERSION=` assignment in `.env` to match the shell variable, then repeat the three explicit `cosign verify` checks in Step 1 for the target release. Stop on verification failure. Inspect the configuration privately and pull the verified release before recreating services:
 
 ```sh
-docker compose -f compose.yml --profile agent config
-docker compose -f compose.yml --profile agent pull db api web agent
-docker compose -f compose.yml up -d --no-build db api web
+docker compose -f compose.yaml --profile agent config
+docker compose -f compose.yaml --profile agent pull db api web agent
+docker compose -f compose.yaml up -d --no-build db api web
 ```
 
 Let active worker runs finish before recreating the agent. If the release changes the worker's baked toolchain, the persisted `agentnix` volume can retain an old store: stop and remove only the agent container, then remove only this project's `agentnix` volume by its exact name before recreating the worker. Preserve `pgdata` and `agentdata`; never use `down -v` to refresh the toolchain.
 
 ```sh
-docker compose -f compose.yml --profile agent up -d --no-build agent
-docker compose -f compose.yml --profile agent ps
+docker compose -f compose.yaml --profile agent up -d --no-build agent
+docker compose -f compose.yaml --profile agent ps
 ```
 
 Confirm service health, administrator login, and worker connectivity. Keep the same deployment directory and volumes. Database migrations run at API startup; check release-specific rollback requirements before attempting to run an older image against a migrated database.
@@ -391,7 +391,7 @@ Current-branch evidence below explains the implementation boundaries. Compare it
 | Scope | File and line evidence | What to check |
 |---|---|---|
 | Current branch | [scripts/init-env.sh:20](../scripts/init-env.sh#L20), [22](../scripts/init-env.sh#L22), [35](../scripts/init-env.sh#L35), [57](../scripts/init-env.sh#L57), [61](../scripts/init-env.sh#L61), [104](../scripts/init-env.sh#L104) | Downloaded layout, existing-file guard, secret generation, private file creation, and final write. |
-| Current branch | [deploy/compose/compose.yml:26](../deploy/compose/compose.yml#L26), [117](../deploy/compose/compose.yml#L117), [119](../deploy/compose/compose.yml#L119), [124](../deploy/compose/compose.yml#L124), [125](../deploy/compose/compose.yml#L125), [136](../deploy/compose/compose.yml#L136), [140](../deploy/compose/compose.yml#L140), [162](../deploy/compose/compose.yml#L162), [173](../deploy/compose/compose.yml#L173) | Versioned application images, loopback port, worker profile, sizing, volumes, and secret wiring. |
-| Current branch | [deploy/compose/compose.yml:33](../deploy/compose/compose.yml#L33), [80](../deploy/compose/compose.yml#L80), [88](../deploy/compose/compose.yml#L88), [.env.example:11](../.env.example#L11) | Origin, public URL, empty trusted proxies, and encryption-key loss warning. |
+| Current branch | [deploy/compose/compose.yaml:26](../deploy/compose/compose.yaml#L26), [119](../deploy/compose/compose.yaml#L119), [121](../deploy/compose/compose.yaml#L121), [126](../deploy/compose/compose.yaml#L126), [127](../deploy/compose/compose.yaml#L127), [138](../deploy/compose/compose.yaml#L138), [142](../deploy/compose/compose.yaml#L142), [166](../deploy/compose/compose.yaml#L166), [177](../deploy/compose/compose.yaml#L177) | Versioned application images, loopback port, worker profile, sizing, volumes, and secret wiring. |
+| Current branch | [deploy/compose/compose.yaml:33](../deploy/compose/compose.yaml#L33), [80](../deploy/compose/compose.yaml#L80), [88](../deploy/compose/compose.yaml#L88), [.env.example:11](../.env.example#L11) | Origin, public URL, empty trusted proxies, and encryption-key loss warning. |
 | Current branch | [api/cmd/server/main.go:1982](../api/cmd/server/main.go#L1982), [api/internal/handler/auth.go:96](../api/internal/handler/auth.go#L96), [206](../api/internal/handler/auth.go#L206), [api/internal/config/config.go:1464](../api/internal/config/config.go#L1464) | Create-only seed, registration closure, first-user admin assignment, and Secure-cookie derivation. |
 | Current branch | [api/internal/middleware/ratelimit.go:229](../api/internal/middleware/ratelimit.go#L229), [239](../api/internal/middleware/ratelimit.go#L239), [web/nginx.conf:36](../web/nginx.conf#L36), [45](../web/nginx.conf#L45), [61](../web/nginx.conf#L61), [77](../web/nginx.conf#L77), [107](../web/nginx.conf#L107) | Direct-peer trust boundary, rightmost non-trusted hop, WebSocket route, and packaged forwarding-header overwrites. |
