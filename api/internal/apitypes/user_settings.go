@@ -22,7 +22,9 @@ type CrossCheckPinDTO struct {
 // decoding-tolerant mirror — the handler owning its own type is intentional; the
 // TUI only reads SidebarTokenIds today, the rest are carried for fidelity.
 type UserSettingsDTO struct {
-	CrossCheckPins []CrossCheckPinDTO `json:"cross_check_pins"`
+	// Browser re-unlock permission is decoded for fidelity; the CLI never holds a slot.
+	VaultAutoReunlock bool               `json:"vault_auto_reunlock"`
+	CrossCheckPins    []CrossCheckPinDTO `json:"cross_check_pins"`
 	// DefaultModel is DEPRECATED (PRD #1551 D2/D3): a legacy compatibility projection of the
 	// effective harness's lane, kept one release. New clients read the two lanes below.
 	DefaultModel *string `json:"default_model"`
@@ -71,4 +73,13 @@ type UserSettingsDTO struct {
 	DefaultCodexModel  *string `json:"default_codex_model"`
 	// JudgeModels is read-only (never sent on a PUT): one cell per harness, claude then codex.
 	JudgeModels []ModelSettingCellDTO `json:"judge_models"`
+	// EffortSettings is read-only (never sent on a PUT): the resolved ordinary effort
+	// preference per harness (PRD #3247), claude then codex.
+	EffortSettings []EffortSettingCellDTO `json:"effort_settings"`
+	// WeeklyReservePct and WeeklyReservePauseRunning mirror the weekly usage reserve (PRD
+	// #3522): the 7-day utilization percent (1..100) at which uzi stops spending the user's
+	// subscription (null = off), and whether a running run is also paused. They are NOT
+	// written through PUT /api/me/settings; PUT /api/me/usage-reserve owns the write.
+	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
+	WeeklyReservePauseRunning bool `json:"weekly_reserve_pause_running"`
 }

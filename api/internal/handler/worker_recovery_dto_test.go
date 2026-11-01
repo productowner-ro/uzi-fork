@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -57,6 +59,18 @@ func TestWorkerRecoveryRunDTO(t *testing.T) {
 	})
 }
 
+func TestRetainedRecoveryDTOUsesStoredEpisode(t *testing.T) {
+	for _, count := range []int32{0, 3} {
+		r := store.Run{RetainedParkCount: count, RecoveryWaitCause: pgtype.Text{String: "retained_recovery_exhausted", Valid: true},
+			RequeueCount: 7, RequeueEpisodeBaseline: 5}
+		dto := runToDTO(r, "normal", 0, 0, 0, dtoTestNow, 3)
+		if dto.WorkerRecovery == nil || dto.WorkerRecovery.Episode != 0 ||
+			dto.WorkerRecovery.EpisodeUsed != 2 || dto.WorkerRecovery.EpisodeRemaining != 1 {
+			t.Fatalf("retained count %d must not become worker-death allowance: %+v", count, dto.WorkerRecovery)
+		}
+	}
+}
+
 func TestWorkerRecoveryHistoricEvidenceDTO(t *testing.T) {
 	snapshot := []byte(`{"checkpoint_tip":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","available_capture":true,"publication_uncertain":false,"capture_uncertain":true,"custody_uncertain":false,"unknown":false,"recorded_at":"2026-01-02T03:04:05Z"}`)
 	run := store.Run{WorkerRecoveryEpisode: 1, WorkerRecoveryEvidence: snapshot}
@@ -80,5 +94,14 @@ func TestWorkerRecoveryHistoricEvidenceDTO(t *testing.T) {
 				t.Fatalf("malformed snapshot evidence=%+v", evidence)
 			}
 		})
+	}
+}
+
+func TestAdoptionFailureRecoveryDTO(t *testing.T) {
+	dto := runToDTO(store.Run{Status: "recovery_wait",
+		RecoveryWaitCause: pgtype.Text{String: "retained_recovery_adoption_failed", Valid: true}},
+		"normal", 0, 0, 0, dtoTestNow, 3)
+	if dto.WorkerRecovery == nil || dto.WorkerRecovery.Episode != 0 {
+		t.Fatal("adoption hold omitted stored owner episode")
 	}
 }

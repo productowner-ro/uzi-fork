@@ -4,6 +4,7 @@ package handler
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -47,11 +48,15 @@ import (
 
 // Handler bundles the dependencies shared by every HTTP handler.
 type Handler struct {
-	secretTestOnce    sync.Once
-	secretTestClients *secretTestClients
-	pool              *pgxpool.Pool
-	q                 *store.Queries
-	cfg               config.Config
+	// browserSessionRandom is a per-handler entropy seam for session preparation tests.
+	// Nil uses crypto/rand; it never changes the process-wide random source.
+	browserSessionRandom io.Reader
+	vaultUnlockLimiter   *mw.Limiter
+	secretTestOnce       sync.Once
+	secretTestClients    *secretTestClients
+	pool                 *pgxpool.Pool
+	q                    *store.Queries
+	cfg                  config.Config
 	// secretTestProbeContext is a test-only deadline arm; nil retains the real probe budget.
 	secretTestProbeContext func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 	// oauthBeginTx, when non-nil, replaces h.pool.Begin as the transaction source of the OAuth
@@ -59,6 +64,9 @@ type Handler struct {
 	// statement fails and prove a storage error answers 503 temporarily_unavailable at every step
 	// (PRD #1910 D7). nil in production: New leaves it unset.
 	oauthBeginTx func(ctx context.Context) (pgx.Tx, error)
+	// secretBeginTx supplies a real transaction for secret mutations in tests.
+	// Production uses pool.BeginTx; withSecretLock enforces READ COMMITTED.
+	secretBeginTx func(ctx context.Context) (pgx.Tx, error)
 	// tmplWriteStore, when non-nil, replaces h.q for the two builtin-definition/reset
 	// agent-template handlers so their DB touch can be faked in a unit test without a
 	// live database (issue #223). nil in production — New leaves it unset and the
@@ -72,16 +80,11 @@ type Handler struct {
 	// leaves them unset); read only through productTokenListBound.
 	myProductTokenRowsOverride    int32
 	adminProductTokenRowsOverride int32
-	// vaultNoticeStore, when non-nil, replaces h.q for VaultLock's pre-ack of the
-	// vault-lock notice (PRD #890 D6), so that one DB touch can be faked in a unit test
-	// without a live database. nil in production — the accessor falls back to h.q.
-	// Deliberately narrow (see vaultNoticeClaimer), mirroring tmplWriteStore.
-	vaultNoticeStore vaultNoticeClaimer
 	// forgeFactory, when non-nil, replaces h.svc.ForgeForConnection for the forge-view
 	// read routes (PRD #1255 M2a), so their handlers can be exercised against a
 	// forgetest.BaseFake without a live forge or a wired forgesvc.Service (the auth
 	// live-DB suite injects one). nil in production — New leaves it unset and
-	// forgeForConnection falls back to h.svc. Mirrors tmplWriteStore/vaultNoticeStore.
+	// forgeForConnection falls back to h.svc. Mirrors tmplWriteStore.
 	forgeFactory func(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error)
 	// forgeMemo folds duplicate forge reads under the forge-view routes (PRD #1255
 	// M2b, D4): a short-TTL + singleflight memo so N terminals polling one PR cost
@@ -525,6 +528,9 @@ func (h *Handler) recovery() *recovery.Service {
 			h.recoverySvc = recovery.New(h.q, h.pool, h.box, h.recoveryLimits(), h.now)
 			if h.wsvc != nil {
 				h.recoverySvc.SetCustodySettledHook(h.wsvc.SettleRetainedCheckpoint)
+				h.recoverySvc.SetPrerequisiteClosure(h.cfg.PrerequisiteClosureForges, func(userID, captureID uuid.UUID) {
+					h.wsvc.KickPrerequisiteClosure(userID, captureID)
+				})
 				// Issue #2545 step B: the held-ref listing goes through the same SSRF-gated
 				// derivation as step A's push.
 				heldRemote := h.wsvc.HeldRemote()
@@ -567,27 +573,6 @@ func (h *Handler) recoveryLimits() recovery.Limits {
 		CustodyHoldLimit:     h.settings.CustodyHoldLimit,
 		WorkerHeartbeatStale: h.cfg.WorkerHeartbeatStale,
 	}
-}
-
-// vaultNoticeClaimer is the narrow slice of *store.Queries VaultLock touches to pre-ack a
-// deliberate lock (PRD #890 D6). Kept narrow, and injectable via vaultNoticeStore, so the
-// pre-ack can be unit-tested without a live database. *store.Queries satisfies it.
-type vaultNoticeClaimer interface {
-	ClaimVaultLockNotice(ctx context.Context, userID uuid.UUID) (uuid.UUID, error)
-}
-
-// vaultLockNoticeStore returns the injected vault-notice claimer, or the real
-// *store.Queries. nil-safe both ways: it returns a nil INTERFACE (not a typed-nil
-// wrapper) when neither is set, so struct-literal test handlers with no store get a
-// clean nil the caller can compare against.
-func (h *Handler) vaultLockNoticeStore() vaultNoticeClaimer {
-	if h.vaultNoticeStore != nil {
-		return h.vaultNoticeStore
-	}
-	if h.q != nil {
-		return h.q
-	}
-	return nil
 }
 
 // Reconciler receives the "labels changed, resync everything" signal from the
@@ -709,6 +694,9 @@ func toDTO(u store.User) apitypes.UserDTO {
 		// "pinned" row whose pointer was nulled back to "default". Since SetUserJudgeBinding
 		// writes NULL for every non-"pinned" mode, the id always agrees with the mode.
 		JudgeAnthropicBindMode: effectiveBindMode(u.JudgeAnthropicBindMode, u.JudgeAnthropicSecretID),
+		// The weekly usage reserve (PRD #3522): a NULL threshold is JSON null (off).
+		WeeklyReservePct:          intPtrFromInt2(u.WeeklyReservePct),
+		WeeklyReservePauseRunning: u.WeeklyReservePauseRunning,
 	}
 	if u.DisplayName.Valid {
 		dto.DisplayName = &u.DisplayName.String
@@ -911,6 +899,7 @@ const ChatCreateRoutePattern = "/api/chats/"
 // per-IP budget on the OAuth token and revoke endpoints (PRD #1910 D7), which also keys a per-client
 // budget inside the handlers once the client has authenticated.
 func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter, v1Limiter, oauthLimiter *mw.Limiter) http.Handler {
+	h.vaultUnlockLimiter = authLimiter
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -960,7 +949,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// point.
 		r.Route("/runs", func(r chi.Router) {
 			r.Group(func(r chi.Router) {
-				r.Use(mw.RequireUser(h.q, h.cfg))
+				r.Use(h.requireUser())
 				// gzip-compress the run list and the message history: both are large,
 				// key-repetitive JSON that compresses dramatically (a 200-row list was
 				// 5.0 MB plain vs 1.4 MB gzipped, and the TUI board and web Runs list poll
@@ -986,6 +975,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// GetRunReviewPanel → GetRunForViewer-scoped, capped by the same
 				// RequireUser masking as GetRun.
 				r.Get("/{id}/review", h.GetRunReview)
+				// Lead-config history (PRD #3244 M3): every recorded lead model/effort row of the
+				// run across claim generations, for `uzi run lead-config`. Owner-or-admin via
+				// GetRunForViewer (404 otherwise); read-only, no token spend, so RequireUser.
+				r.Get("/{id}/lead-config", h.GetRunLeadConfigHistory)
 				// Task diff-review read (PRD #400 M4a): the handoff task's structured
 				// findings as JSON, for `uzi handoff review <id>`. Owner-or-admin, same
 				// GetRunForViewer scoping as the review read; no forge write, no token spend.
@@ -1086,7 +1079,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Post("/{id}/held-publications/expire", h.ExpireRunHeldPublications)
 			})
 			r.Group(func(r chi.Router) {
-				r.Use(mw.RequireAuth(h.q, h.cfg))
+				r.Use(h.requireAuth())
 				// Re-run judge (Decision 8/21): enqueue a fresh judge for a terminal run —
 				// cookie-only, since it mints a token-spending run. Owner-only spend
 				// (service-enforced, audit H3); behind a DEDICATED per-user judge spend
@@ -1112,7 +1105,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// per-run authz are enforced in ServeWS — read its docstring for why the one
 		// unchanged same-origin rule covers both credential paths.
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Use(h.requireUser())
 			r.Get("/ws", h.ServeWS)
 		})
 
@@ -1122,7 +1115,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// gate ownership. Owner-scoped in SQL by the caller's user id — NO run scope (this is
 		// the owner-wide list; the exact-hold DISCARD is the DELETE under /runs above).
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Use(h.requireUser())
 			r.Get("/recovery/holds", h.ListRecoveryHolds)
 		})
 
@@ -1197,6 +1190,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// NOT lane-allowlisted: an isolated-lane run is not a Claude run-lane flight that posts it.
 		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
+		r.Post("/runs/{id}/forge-clone-success", h.WorkerForgeCloneSuccess)
 		r.Post("/runs/{id}/memory/reserve", h.WorkerMemoryReserve)
 		r.Post("/runs/{id}/memory/outcome", h.WorkerMemoryOutcome)
 		// Bound semantic body-decoding work per worker, including while production enrollment is off.
@@ -1273,7 +1267,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 
 		// Checkpoint publish (PRD #122 M8): the worker POSTs a raw delta packfile +
 		// tip OID; the api derives repo/branch/PAT from the run row and pushes it
-		// NON-FORCED to refs/uzi-checkpoints/<branch>. Inherits RequireWorker; feeds
+		// NON-FORCED to refs/uzi-checkpoints/<checkpoint-key>. Inherits RequireWorker; feeds
 		// BOTH the plain and TLS listeners from this one mount.
 		//
 		// TODO(PRD#122 M8): rate-limit /publish. Deliberately unlimited today: the
@@ -1306,6 +1300,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// lineage. Both are gated by the decisions_memo_enabled admin setting, failing closed.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/decisions-memo", h.WorkerSaveDecisionsMemo)
 		r.With(h.refuseJobRuns).Get("/runs/{id}/decisions-memo", h.WorkerGetDecisionsMemo)
+
+		// Lead-config record (PRD #3244): the worker reports what its lead agent was configured
+		// to use and what the runtime reported, one claim-fenced row per report.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/lead-config", h.WorkerRecordLeadConfig)
 		r.With(interruptedCallsDeadline, h.refuseJobRuns).Get("/runs/{id}/interrupted-calls", h.WorkerInterruptedCalls)
 
 		// Forge read surface (PRD #158 M1): worker-authenticated, run-scoped, READ
@@ -1338,6 +1336,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// Claude run never has a Codex binding, so these fail closed for it (not codex-bound).
 		r.Post("/runs/{id}/codex/release", h.WorkerCodexRelease)
 		r.Post("/runs/{id}/codex/refresh", h.WorkerCodexRefresh)
+		r.Post("/runs/{id}/codex/admission-signal", h.WorkerCodexAdmissionSignal)
+		r.Post("/runs/{id}/codex/operation-admission", h.WorkerCodexOperationAdmission)
 
 		// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
 		// verdict. Both are judge-run-scoped (the worker must own the active judge

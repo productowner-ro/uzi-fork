@@ -139,8 +139,9 @@ func staticChoice(secretID *uuid.UUID, bound string) secretChoice {
 
 // openAnthropic resolves AND opens the Anthropic credential for one run — the one
 // secret the run lane, the judge lane and the chat lane all deliver, and the ONE
-// place credential resolution happens. The vault-dispatch logic (dek needs unlock,
-// legacy master opens regardless, nil vault → master box) lives in secretopen,
+// place credential resolution happens. The vault-dispatch logic (dek needs unlock;
+// master formats open without a cached DEK, with master_aad binding owner and kind;
+// unknown discriminators are refused) lives in secretopen,
 // shared with the rate-limit poller (PRD #53); this method maps its sentinels back
 // to workersvc's domain errors, preserving the exact prior behavior: a lock
 // surfaces as errVaultLocked (requeue, never fail), and a missing/undecryptable
@@ -419,6 +420,14 @@ func (s *Service) recordRunCredentialTx(ctx context.Context, run store.Run, cred
 	// A no-op after a successful Commit; on every early return it undoes the lock and any write.
 	defer func() { _ = tx.Rollback(ctx) }()
 	qtx := store.New(tx)
+	if len(run.CheckpointCoordinates) > 0 {
+		if _, err := qtx.GetWorkerForUpdate(ctx, uuid.UUID(run.WorkerID.Bytes)); err != nil {
+			return 0, err
+		}
+		if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+			return 0, err
+		}
+	}
 
 	// Step 1: lock the run row and re-read the fence columns (generation, released, last_seq).
 	locked, err := qtx.GetRunByIDForUpdate(ctx, run.ID)
@@ -611,6 +620,23 @@ func (s *Service) insertCredentialSwitchMessage(ctx context.Context, q *store.Qu
 //
 // Judge runs never reach here; they fork to assembleJudgeClaim earlier.
 func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store.Run) (secretChoice, error) {
+	choice, err := s.resolveClaimSecret(ctx, wkr, run)
+	if err != nil {
+		return choice, err
+	}
+	// PRD #3522 M3: the weekly usage reserve has the last word on the credential this claim would
+	// spend, whichever rung resolved it (a pinned binding, the default, a judge fallback). The auto
+	// ranker already filtered its own candidates; this is the check for the named ones. A nil gate
+	// (reserve off or not applicable to the run) returns today's choice untouched.
+	if herr := reserveGateFrom(ctx).checkChoice(choice); herr != nil {
+		return secretChoice{}, herr
+	}
+	return choice, nil
+}
+
+// resolveClaimSecret is claimSecretID's resolution ladder, unchanged by the weekly usage reserve,
+// which claimSecretID layers on top.
+func (s *Service) resolveClaimSecret(ctx context.Context, wkr store.Worker, run store.Run) (secretChoice, error) {
 	if run.Kind == runkind.SelfImprove {
 		// Full judge resolution, including the `auto` pool ranker and D4's empty-pool
 		// fallback (PRD #1140 M2): self_improve is uzi reviewing itself and follows the
@@ -867,6 +893,16 @@ func (s *Service) autoChoice(ctx context.Context, run store.Run) (secretChoice, 
 	for _, row := range rows {
 		cands = append(cands, autoselectrow.FromCandidateRow(row))
 	}
+	// PRD #3522 M3: with the weekly usage reserve enforced for this run, a pooled token the reserve
+	// blocks is never a candidate (the pool is not crossed to find another: only the owner's own
+	// pooled tokens below their threshold remain). allCands keeps the unfiltered pool so the
+	// failure path below can tell a pool the reserve emptied (hold) from a pool that was empty
+	// anyway (pool_wait, as today).
+	gate := reserveGateFrom(ctx)
+	allCands := cands
+	if gate != nil {
+		cands = gate.dropBlocked(cands)
+	}
 	out := autoselect.Select(cands, exclude, s.p.Autoselect, s.now())
 	if out.Picked {
 		id := out.SecretID
@@ -882,6 +918,14 @@ func (s *Service) autoChoice(ctx context.Context, run store.Run) (secretChoice, 
 	if floorID, ok := autoselect.Floor(cands, exclude, s.now()); ok {
 		id := floorID
 		return secretChoice{secretID: &id, reason: string(autoselect.ReasonPoolStale)}, nil
+	}
+	// PRD #3522 M3: something pooled WAS spendable and only the weekly reserve took it away: hold
+	// the run (queued, with the reserve reason) instead of waiting in pool_wait for a pool that is
+	// not empty.
+	if gate != nil {
+		if _, ok := autoselect.Floor(allCands, exclude, s.now()); ok {
+			return secretChoice{}, gate.autoHeldErr(exclude)
+		}
 	}
 	// Genuinely nothing pooled to spend (empty pool, or the only pooled token is the
 	// excluded dead credential). Do NOT spend the default and do NOT hard-fail — signal
@@ -917,7 +961,20 @@ func (s *Service) autoFloorRetry(ctx context.Context, run store.Run, failedID uu
 		}
 		cands = append(cands, c)
 	}
+	// PRD #3522 M3: never re-floor onto a token the weekly reserve blocks. When only blocked pooled
+	// tokens remain the claim is HELD (queued, with the reserve reason), not failed: no blocked
+	// token is spent and the run is not terminated for a condition that clears on its own.
+	gate := reserveGateFrom(ctx)
+	allCands := cands
+	if gate != nil {
+		cands = gate.dropBlocked(cands)
+	}
 	floorID, ok := autoselect.Floor(cands, exclude, s.now())
+	if !ok && gate != nil {
+		if _, spendable := autoselect.Floor(allCands, exclude, s.now()); spendable {
+			return secretChoice{}, gate.autoHeldErr(exclude)
+		}
+	}
 	if !ok {
 		// No OTHER pooled token to spend — terminal. Never fall to the non-pooled
 		// default (#754); finishRunClaim fails the run on errCredentialUnavailable.

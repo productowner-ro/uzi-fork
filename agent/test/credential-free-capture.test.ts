@@ -93,9 +93,13 @@ describe("credential-free capture foundation (#2852)", () => {
       r.git.withCredentialFreeCapture(context, async () => {
         t.mock.method(fs.promises, "lstat", async () => { reads++; throw new Error("unexpected filesystem read"); });
         t.mock.method(fs.promises, "mkdir", async () => { effects++; throw new Error("unexpected filesystem effect"); });
-        await assert.rejects(internal.withVerifiedMaintenancePack(
-          { clonePath: "/capture/source", identity: "1:2" }, "a".repeat(40), "/capture/output",
-          async () => { effects++; }, async () => { effects++; }), { message: "capture private verification refused" });
+        await assert.rejects(internal.importMaintenanceTip({
+          source: { clonePath: "/capture/source", identity: "1:2", runId: "capture", attemptId: "capture" },
+          original: { barePath: "/capture/base.git", cloneUrl: "https://example.test/repo.git" },
+          tip: "a".repeat(40), outDir: "/capture/output", defaultBranch: "main", branch: "capture",
+          key: "capture", family: [], prepare: async () => { effects++; },
+          beforeSemantic: async () => { effects++; }, validateFamily: async () => { effects++; },
+        }), { message: "capture private verification refused" });
         await assert.rejects(internal.spawnGit("/capture/source", ["status"], undefined, {
           trustedExecutable: true,
           // This decoration passes the overlay guard, so refusal must precede
@@ -262,7 +266,7 @@ describe("credential-free capture foundation (#2852)", () => {
       [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
     for (const pin of [["credential.helper", ""], ["core.askpass", ""],
       ["maintenance.auto", "false"], ["gc.auto", "0"]]) {
-      assert.equal(pairs.filter(pair => pair[0] === pin[0] && pair[1] === pin[1]).length, 1, pin[0]);
+      assert.equal(pairs.filter(pair => pair[0] === pin[0] && pair[1] === pin[1]).length, 1, pin[0]!);
     }
     assert.equal(env.GIT_OPTIONAL_LOCKS, "0");
     assert.equal(env.GIT_TERMINAL_PROMPT, "0");

@@ -63,6 +63,8 @@ import type { ExecutionRegistry } from "./registry.js";
 // so the test asserts the exact caps rather than hard-coding a copy of them.
 export const MAX_ID_BYTES = 512;
 export const MAX_TOOL_NAME_BYTES = 256;
+export const DEFAULT_COMMAND_WALL_MS = 3_600_000;
+export const LONG_COMMAND_WALL_MS = 7_200_000;
 
 // Output cap. A shell effect's stdout/stderr is bounded (as plain TEXT) before it
 // reaches the model so a large effect cannot balloon a callback result. HYGIENE bound,
@@ -164,9 +166,11 @@ const CHILD_FAILURE_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /** Closed helper/client failure vocabulary permitted into model-visible output.
- *  The Go helper owns every `E_*` code except the client's local timeout sentinel. */
+ *  Helper and client share codes; client-minted provenance separately identifies
+ *  correlated helper errors, including those eligible for Read fallback. */
 const FILEOP_FAILURE_CODES: ReadonlySet<string> = new Set([
   "E_OVERSIZE",
+  "E_NOT_TEXT",
   "E_MALFORMED",
   "E_UNKNOWN_OP",
   "E_DENIED",
@@ -241,6 +245,22 @@ export type CallbackResult =
   | { readonly ok: true; readonly output: unknown }
   | { readonly ok: false; readonly code: string; readonly message: string; readonly fileopCode?: string; readonly policyRefusal?: PolicyRefusalPayload; readonly memoryPressure?: WorkerMemoryPressureResult };
 
+// JS mirror of the Go helper's rangeScanBytes, shared by forward and tail validators.
+export const rangeScanBytes = 64 * 1024 * 1024;
+
+// Search ceilings. Reaching one returns an ok partial result (see dispatchFileSearch).
+const SEARCH_DEADLINE_MS = 10_000;
+const SEARCH_MAX_OPERATIONS = 2048;
+const SEARCH_MAX_DIRECTORIES = 1024;
+const SEARCH_MAX_ENTRIES = 16384;
+const SEARCH_MAX_FILE_BYTES = 1024 * 1024;
+const SEARCH_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
+const SEARCH_MAX_MATCHES = 20;
+const SEARCH_PARTIAL_NOTICE = "Partial search: coverage is incomplete; a missing match does not mean the text is absent.";
+/** Ceilings the search operation wrapper itself reports; deliberately not a FileopResponse. */
+type SearchCeiling = "operations" | "time";
+type SearchStopReason = SearchCeiling | "matches" | "directories" | "entries" | "bytes" | "listing" | "file_size";
+
 /** One fileop request, mapped to the NDJSON op protocol
  *  (agent/codex/supervisor/fileop). `path`/`newPath` are worktree-RELATIVE (the
  *  helper anchors them at the root dirfd and rejects an absolute/`..`/`.git`
@@ -250,8 +270,11 @@ export type CallbackResult =
  *  within the pinned parent directory.
  *  The `id` correlation is the production client's job, not the broker's. */
 export interface FileopRequest {
-  readonly op: "stat" | "read" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
+  readonly op: "stat" | "read" | "read_range" | "read_tail" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
   readonly path: string;
+  readonly offset?: number;
+  readonly limit?: number;
+  readonly tail?: number;
   readonly newPath?: string;
   readonly data?: string;
   readonly old?: string;
@@ -262,6 +285,18 @@ export interface FileopRequest {
  *  raw errno/path/content. */
 export interface FileopResponse {
   readonly ok: boolean;
+  /** Minted only by the client for a correlated, well-formed helper error. */
+  readonly origin?: "helper";
+  readonly offset?: number;
+  readonly tail?: number;
+  readonly fromEnd?: boolean;
+  readonly partialFirstLine?: boolean;
+  readonly linesReturned?: number;
+  readonly partialLastLine?: boolean;
+  readonly incomplete?: boolean;
+  /** Preserve presence and invalid wire types so excerpt validation can fail closed. */
+  readonly reason?: unknown;
+  readonly scannedBytes?: number;
   readonly code?: string;
   readonly size?: number;
   readonly data?: string;
@@ -269,6 +304,8 @@ export interface FileopResponse {
   readonly type?: string;
   readonly entries?: ReadonlyArray<{ readonly name: string; readonly type: string }>;
   readonly truncated?: boolean;
+  /** Client-derived invalid wire type; used only to reject ordinary tail bodies. */
+  readonly truncatedInvalid?: true;
 }
 
 /** The injected openat2 fileop client. Production talks to the fileop helper over a
@@ -324,6 +361,8 @@ export interface SpawnCommandResult {
  *  seam records the exact env command spawns use; the default seam falls back to its
  *  closed-over env when `env` is absent. */
 export interface SpawnCommandOptions {
+  /** Worker-owned original deadline after admission waited; never supplied by model args. */
+  readonly deadlineAt?: number;
   readonly modelCommand?: ModelCommandMetadata;
   readonly long_running?: boolean;
   readonly cwd?: string;
@@ -331,11 +370,11 @@ export interface SpawnCommandOptions {
   readonly signal?: AbortSignal;
 }
 
-/** Thrown by a {@link SpawnCommandSeam} when the command ran to its wall deadline. The
- *  seam throws it ONLY after the command's whole process tree was reaped cleanly, so the
+/** Thrown when a command reaches its original deadline. `launched:false` means no
+ *  command was started. Otherwise its whole process tree was reaped cleanly, so the
  *  broker can tell the agent the command was stopped rather than report a generic failure. */
 export class CommandDeadlineError extends Error {
-  constructor(readonly deadlineMs: number) {
+  constructor(readonly deadlineMs: number, readonly launched = true) {
     super(`command stopped at its deadline (${deadlineMs}ms)`);
     this.name = "CommandDeadlineError";
   }
@@ -411,6 +450,8 @@ export interface RunGrants {
 /** Everything the broker is constructed with: the registry, the injected seams, the
  *  immutable grants, and optional routing/screening config. */
 export interface CodexCallbackBrokerOptions {
+  readonly commandWallMs?: number;
+  readonly longCommandWallMs?: number;
   readonly capturedMemory?: CapturedMemoryContext;
   readonly scrubToolResult?: (result: WorkerMemoryPressureResult) => WorkerMemoryPressureResult;
   readonly codeCrossCheck?: CodeCrossCheckToolAccess;
@@ -611,6 +652,14 @@ export class CodexCallbackBroker {
     args: unknown,
     origin: CallbackOrigin,
   ): Promise<CallbackResult> {
+    if (!this.registry.workAdmissionOpen()) return deny("admission_closed", "executor lifetime closed");
+    return this.registry.admitWork(() => this.handleAdmittedToolCall(rt, name, args, origin));
+  }
+
+  private async handleAdmittedToolCall(
+    rt: CallbackRuntimeId, name: unknown, args: unknown, origin: CallbackOrigin,
+  ): Promise<CallbackResult> {
+    this.registry.assertWorkAdmission();
     // 1. Ingestion bounds. A malformed/oversize frame is a bounded deny; it must not
     // poison the epoch (that is reserved for a changed-payload reuse, decided by the
     // registry).
@@ -716,6 +765,7 @@ export class CodexCallbackBroker {
     args: unknown,
     origin: CallbackOrigin,
   ): Promise<CallbackResult> {
+    this.registry.assertWorkAdmission();
     const canonical = canonicalizeCodexToolName(name);
     const cap = capabilityOf(canonical);
 
@@ -757,34 +807,67 @@ export class CodexCallbackBroker {
     }
     const cwd = strField(args, "cwd");
     let spawnCwd = this.worktreePath;
-    if (cwd !== undefined) {
-      if (referencesDotGit(cwd)) return deny("path_denied", "cwd references the .git directory");
-      const jail = screenToolPath(cwd, this.worktreePath, this.worktreePath, this.extraSecretPaths);
-      if (jail.denied) return deny("path_denied", jail.reason ?? "cwd is outside the worktree");
-      spawnCwd = path.resolve(this.worktreePath, cwd);
-    }
-    // Screen the command through the shared guardrail — NEVER a second copy of it.
-    let screen: ReturnType<typeof screenBashCommand>;
-    try {
-      screen = screenBashCommand(command, this.extraSecretPaths, this.dockerWired);
-    } catch {
-      return deny("screen_error", "shell screening raised; denied fail-closed");
-    }
-    if (screen.denied) return deny("shell_denied", screen.reason ?? "denied by guardrail");
-
     const hasLongRunning = typeof args === "object" && args !== null && Object.hasOwn(args, "long_running");
     const longRunning = hasLongRunning ? (args as Record<string, unknown>)["long_running"] : undefined;
-    if (hasLongRunning && typeof longRunning !== "boolean") {
-      return deny("bad_args", "Bash 'long_running' must be a boolean");
-    }
-    if (longRunning === true && (origin !== "root" || !this.grants.isRoot)) {
-      return deny("denied_tool", "Bash long_running:true is available only to the root lead");
-    }
+    // Keep the original command arguments, but repeat all authority/path checks after a wait.
+    const validate = (): CallbackResult | undefined => {
+      if (!this.grants.allowedTools.has(toolName)) return deny("denied_tool", "shell tool grant is no longer available");
+      if (cwd !== undefined) {
+        if (referencesDotGit(cwd)) return deny("path_denied", "cwd references the .git directory");
+        const jail = screenToolPath(cwd, this.worktreePath, this.worktreePath, this.extraSecretPaths);
+        if (jail.denied) return deny("path_denied", jail.reason ?? "cwd is outside the worktree");
+        spawnCwd = path.resolve(this.worktreePath, cwd);
+      }
+      // Screen through the shared guardrail, including after admission waited.
+      let screen: ReturnType<typeof screenBashCommand>;
+      try {
+        screen = screenBashCommand(command, this.extraSecretPaths, this.dockerWired);
+      } catch {
+        return deny("screen_error", "shell screening raised; denied fail-closed");
+      }
+      if (screen.denied) return deny("shell_denied", screen.reason ?? "denied by guardrail");
+      if (hasLongRunning && typeof longRunning !== "boolean") {
+        return deny("bad_args", "Bash 'long_running' must be a boolean");
+      }
+      if (longRunning === true && (origin !== "root" || !this.grants.isRoot)) {
+        return deny("denied_tool", "Bash long_running:true is available only to the root lead");
+      }
+      return undefined;
+    };
+    const invalid = validate();
+    if (invalid) return invalid;
 
     const captured = this.opts.capturedMemory;
-    if (captured && (!captured.commands.isCurrent(captured.context, captured.flight, captured.lifecycleRevision)
-      || !captured.commands.admitsCommands(captured.context))) {
-      return deny("worker_memory_pressure", "Shell admission is held or its captured flight has retired.");
+    let deadlineAt: number | undefined;
+    if (captured) {
+      const { commands, context } = captured;
+      if (!commands.isCurrent(context, captured.flight, captured.lifecycleRevision)) {
+        return deny("worker_memory_pressure", commands.admissionMessage(context, "retired"));
+      }
+      const phaseRevision = commands.phaseRevision(context);
+      let reason = commands.admissionReason(context, phaseRevision);
+      if (reason === "pressure-held") {
+        const wallMs = longRunning === true
+          ? this.opts.longCommandWallMs ?? LONG_COMMAND_WALL_MS : this.opts.commandWallMs ?? DEFAULT_COMMAND_WALL_MS;
+        deadlineAt = Date.now() + wallMs;
+        const outcome = await commands.waitForPressure(context, { deadlineAt, phaseRevision, signal: this.signal });
+        if (outcome === "cancelled") return deny("command_cancelled", "Command cancelled while waiting for memory recovery; nothing was launched.");
+        if (outcome === "deadline" || Date.now() >= deadlineAt) {
+          return deny("command_deadline", `Command deadline expired before launch: ${commands.admissionMessage(context, "pressure-held")} Nothing was launched.`);
+        }
+        if (outcome !== "admitted") return deny("worker_memory_pressure", commands.admissionMessage(context, outcome));
+        if (this.signal?.aborted) return deny("command_cancelled", "Command cancelled before launch; nothing was launched.");
+        if (this.registry.state() !== "open" || this.registry.isPoisoned()) {
+          return deny("admission_closed", "The captured execution epoch closed while waiting; nothing was launched.");
+        }
+        const invalidAfterWait = validate();
+        if (invalidAfterWait) return invalidAfterWait;
+        if (!commands.isCurrent(context, captured.flight, captured.lifecycleRevision)) {
+          return deny("worker_memory_pressure", commands.admissionMessage(context, "retired"));
+        }
+        reason = commands.admissionReason(context, phaseRevision);
+      }
+      if (reason !== undefined) return deny("worker_memory_pressure", commands.admissionMessage(context, reason));
     }
     const metadata: ModelCommandMetadata = Object.freeze({
       threadId: rt.threadId, turnId: rt.turnId, callId: rt.callId, toolName,
@@ -793,9 +876,11 @@ export class CodexCallbackBroker {
     modelCommands.set(metadata, captured ? Object.freeze({ ...captured }) : undefined);
     let spawned: SpawnCommandResult;
     try {
-      spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal, modelCommand: metadata, ...(hasLongRunning ? { long_running: longRunning as boolean } : {}) });
+      spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal, modelCommand: metadata,
+        ...(deadlineAt === undefined ? {} : { deadlineAt }), ...(hasLongRunning ? { long_running: longRunning as boolean } : {}) });
     } catch (err) {
-      if (err instanceof CommandDeadlineError) return deny("command_deadline", commandDeadlineMessage(err.deadlineMs));
+      if (err instanceof CommandDeadlineError) return deny("command_deadline", err.launched
+        ? commandDeadlineMessage(err.deadlineMs) : "Command deadline expired before launch; nothing was launched.");
       throw err;
     }
     if (spawned.memoryPressure) {
@@ -922,6 +1007,11 @@ export class CodexCallbackBroker {
 
     const fields = asObject(args)!;
     const explicitRange = Object.hasOwn(fields, "offset") || Object.hasOwn(fields, "limit");
+    const hasTail = Object.hasOwn(fields, "tail");
+    const tail = fields.tail;
+    if (hasTail && (explicitRange || typeof tail !== "number" || !Number.isSafeInteger(tail) || tail < 1 || tail > 2000)) {
+      return deny("bad_args", "tail requires an integer from 1 to 2000 and excludes offset and limit");
+    }
     const offset = Object.hasOwn(fields, "offset") ? fields.offset : 1;
     const limit = Object.hasOwn(fields, "limit") ? fields.limit : 200;
     if (
@@ -935,7 +1025,26 @@ export class CodexCallbackBroker {
     if ("ok" in screened) return screened;
 
     const res = await this.fileop.op({ op: "read", path: screened.rel });
-    if (!res.ok) return this.mapFileopError(res);
+    if (!res.ok) {
+      if (hasTail && res.code === "E_NOT_TEXT") return deny("bad_args", "tail reads require a text file");
+      if (hasTail && res.origin === "helper" && res.code === "E_OVERSIZE") {
+        const result = await this.fileop.op({ op: "read_tail", path: screened.rel, tail: tail as number });
+        if (!result.ok) {
+          if (result.code === "E_NOT_TEXT") return deny("bad_args", "tail reads require a text file");
+          return this.mapFileopError(result);
+        }
+        return this.validateTailRead(result, tail as number);
+      }
+      if (explicitRange && res.origin === "helper" && res.code === "E_OVERSIZE") {
+        const range = await this.fileop.op({ op: "read_range", path: screened.rel, offset, limit });
+        if (!range.ok) {
+          if (range.code === "E_NOT_TEXT") return deny("bad_args", "line ranges require a text file");
+          return this.mapFileopError(range);
+        }
+        return this.validateRangeRead(range, offset, limit);
+      }
+      return this.mapFileopError(res);
+    }
     const maxReadBytes = 1024 * 1024;
     const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
     const oversized = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_OVERSIZE" });
@@ -961,17 +1070,40 @@ export class CodexCallbackBroker {
       // Invalid UTF-8 is binary, just like a NUL-containing valid UTF-8 body.
     }
     if (text === undefined || text.includes("\u0000")) {
-      if (explicitRange) return deny("bad_args", "line ranges require a text file");
+      if (explicitRange || hasTail) return deny("bad_args", "line ranges require a text file");
       return { ok: true, output: { size: res.size, contentBase64: res.data, truncated: res.truncated === true } };
     }
 
     // LF ends a logical line, including its delimiter. Scan at most the validated 1 MiB
-    // body; there is no phantom line after a final LF. A range never changes the helper read.
+    // body after a successful ordinary read; there is no phantom line after a final LF.
     const lineEnds: number[] = [];
     for (let i = 0; i < bytes.length; i++) {
       if (bytes[i] === 10) lineEnds.push(i + 1);
     }
     if (bytes.length > 0 && lineEnds.at(-1) !== bytes.length) lineEnds.push(bytes.length);
+    if (hasTail) {
+      // A prefix, even a valid text prefix, cannot prove the opening EOF suffix.
+      if (res.truncatedInvalid || (res.truncated !== undefined && res.truncated !== false)) return malformed();
+      const cap = 64 * 1024;
+      let first = Math.max(0, lineEnds.length - (tail as number));
+      let start = first === 0 ? 0 : lineEnds[first - 1]!;
+      let partialFirstLine = false;
+      if (bytes.length - start > cap) {
+        // Discard an older unfit line; retain as many recent whole lines as fit.
+        while (first < lineEnds.length - 1 && bytes.length - start > cap) {
+          start = lineEnds[first++]!;
+        }
+        if (bytes.length - start > cap) {
+          start = bytes.length - cap;
+          while ((bytes[start]! & 0xc0) === 0x80) start++;
+          partialFirstLine = true;
+        }
+      }
+      return { ok: true, output: {
+        size: res.size, content: decoder.decode(bytes.subarray(start)), tail, fromEnd: true,
+        linesReturned: lineEnds.length - first, partialFirstLine, truncated: start > 0,
+      } };
+    }
     const first = offset - 1;
     const start = first < lineEnds.length ? (first === 0 ? 0 : lineEnds[first - 1]!) : bytes.length;
     const selectedEnd = first < lineEnds.length ? lineEnds[Math.min(first + limit, lineEnds.length) - 1]! : start;
@@ -997,8 +1129,116 @@ export class CodexCallbackBroker {
     };
   }
 
-  /** Search only through fileop list/stat/read. Every traversal and returned byte has
-   * a fixed ceiling; one failed file blocks the search rather than hiding an incomplete result. */
+  /** Validate the independent EOF descriptor without inventing absolute coordinates. */
+  private validateTailRead(res: FileopResponse, tail: number): CallbackResult {
+    const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
+    const cap = 64 * 1024;
+    // Bound encoded input before regex or allocation, then require canonical encoding.
+    if (typeof res.data !== "string" || res.data.length > 4 * Math.ceil(cap / 3) ||
+      res.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(res.data)) return malformed();
+    const bytes = Buffer.from(res.data, "base64");
+    if (bytes.length > cap || bytes.toString("base64") !== res.data) return malformed();
+    if (
+      typeof res.size !== "number" || !Number.isSafeInteger(res.size) || res.size < bytes.length ||
+      res.tail !== tail || res.fromEnd !== true ||
+      typeof res.linesReturned !== "number" || !Number.isSafeInteger(res.linesReturned) ||
+      res.linesReturned < 0 || res.linesReturned > tail ||
+      typeof res.partialFirstLine !== "boolean" || typeof res.truncated !== "boolean" ||
+      typeof res.incomplete !== "boolean" ||
+      typeof res.scannedBytes !== "number" || !Number.isSafeInteger(res.scannedBytes) ||
+      res.scannedBytes < bytes.length || res.scannedBytes > res.size || res.scannedBytes > rangeScanBytes ||
+      res.truncated !== (res.size > bytes.length) ||
+      (res.incomplete
+        ? res.reason !== "scan_budget" || !res.truncated || res.partialFirstLine ||
+          res.linesReturned >= tail || bytes.length >= cap || res.scannedBytes !== rangeScanBytes || res.size <= rangeScanBytes
+        : Object.hasOwn(res, "reason")) ||
+      (bytes.length === 0 && (res.linesReturned !== 0 || res.partialFirstLine || (!res.incomplete && res.size !== 0))) ||
+      // A whole suffix needs its preceding LF as proof; a partial suffix needs the raw cap frontier.
+      (res.truncated && res.scannedBytes <= bytes.length) ||
+      (res.partialFirstLine && (res.incomplete || !res.truncated || res.linesReturned !== 1 ||
+        bytes.length < cap - 3 || res.scannedBytes < cap + 1 || res.size <= cap)) ||
+      // Below N lines, a completed truncated result must have encountered the output cap.
+      (!res.incomplete && res.truncated && res.linesReturned < tail && res.scannedBytes < cap + 1)
+    ) return malformed();
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch {
+      return deny("bad_args", "tail reads require a text file");
+    }
+    if (content.includes("\u0000")) return deny("bad_args", "tail reads require a text file");
+    let lines = bytes.length > 0 && bytes.at(-1) !== 10 ? 1 : 0;
+    for (const byte of bytes) if (byte === 10) lines++;
+    if (lines !== res.linesReturned) return malformed();
+    return { ok: true, output: {
+      size: res.size, content, tail, fromEnd: true, linesReturned: lines,
+      partialFirstLine: res.partialFirstLine, truncated: res.truncated,
+      ...(res.incomplete ? { incomplete: true, reason: "scan_budget", scannedBytes: res.scannedBytes } : {}),
+    } };
+  }
+
+  /** Validate the independent range descriptor's response before exposing any text. */
+  private validateRangeRead(res: FileopResponse, offset: number, limit: number): CallbackResult {
+    const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
+    const cap = 64 * 1024;
+    const scanCap = rangeScanBytes;
+    // Bound the encoded input before either regex or decoding.
+    if (typeof res.data !== "string") return malformed();
+    if (res.data.length > 4 * Math.ceil(cap / 3)) return malformed();
+    if (res.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(res.data)) return malformed();
+    const bytes = Buffer.from(res.data, "base64");
+    if (bytes.length > cap || bytes.toString("base64") !== res.data) return malformed();
+    if (
+      typeof res.size !== "number" || !Number.isSafeInteger(res.size) || res.size < 0 ||
+      res.offset !== offset ||
+      typeof res.scannedBytes !== "number" || !Number.isSafeInteger(res.scannedBytes) ||
+      res.scannedBytes < bytes.length || res.scannedBytes > scanCap || res.scannedBytes > res.size ||
+      typeof res.linesReturned !== "number" || !Number.isSafeInteger(res.linesReturned) ||
+      res.linesReturned < 0 || res.linesReturned > limit ||
+      typeof res.partialLastLine !== "boolean" || typeof res.truncated !== "boolean" ||
+      typeof res.incomplete !== "boolean" ||
+      (res.incomplete
+        ? res.reason !== "scan_budget" || !res.truncated || res.scannedBytes !== scanCap
+        : Object.hasOwn(res, "reason")) ||
+      (bytes.length === 0 && (res.linesReturned !== 0 || res.partialLastLine || (!res.incomplete && res.truncated))) ||
+      // Exhausting the budget below the opening extent cannot establish completed EOF.
+      (!res.incomplete && !res.truncated && res.scannedBytes === scanCap && res.size > scanCap) ||
+      // A completed excerpt must stop at the line limit, EOF, or the UTF-8 output ceiling.
+      // A four-byte codepoint may leave up to three unused output bytes.
+      (!res.incomplete && res.truncated && res.linesReturned < limit && bytes.length < cap - 3) ||
+      (res.partialLastLine && (!res.truncated || bytes.length === 0 || bytes.at(-1) === 10))
+    ) return malformed();
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch {
+      return deny("bad_args", "line ranges require a text file");
+    }
+    if (content.includes("\u0000")) return deny("bad_args", "line ranges require a text file");
+    let lines = bytes.length > 0 && bytes.at(-1) !== 10 ? 1 : 0;
+    for (const byte of bytes) if (byte === 10) lines++;
+    if (lines !== res.linesReturned ||
+      (bytes.length > 0 && bytes.at(-1) !== 10 && res.truncated && !res.partialLastLine)) return malformed();
+    return { ok: true, output: {
+      size: res.size, content, offset, linesReturned: res.linesReturned,
+      partialLastLine: res.partialLastLine, truncated: res.truncated,
+      ...(res.incomplete ? { incomplete: true, reason: "scan_budget", scannedBytes: res.scannedBytes } : {}),
+    } };
+  }
+
+  /** Search only through fileop list/stat/read. Every traversal and returned byte has a
+   * fixed ceiling, and reaching one returns the matches found so far as an ok partial
+   * result (`truncated: true`, a `reason`, `skippedFiles`, and a fixed `notice`) instead of
+   * denying the search. A partial result is never complete coverage, and an empty one never
+   * means the text is absent. Failures that are not ceilings (denied, escaping, symlink,
+   * I/O, or an unavailable listing, size, or body) still deny the whole search. The walk is
+   * breadth-first with each listing sorted by name, so results are deterministic. The first
+   * stop reason wins: a truncated listing records "listing" and the walk continues, so a later
+   * ceiling does not replace it. `path` may name one regular file, searched through the same
+   * stat, size, read, and scan routine as the walk.
+   *
+   * The deadline bounds broker waiting and admission of new operations, not settlement of an
+   * already-dispatched helper op: the client op is never cancelled and owns its own settlement. */
   private async dispatchFileSearch(args: unknown): Promise<CallbackResult> {
     const query = strField(args, "query");
     if (!query || Buffer.byteLength(query) > 256) return deny("bad_args", "Search requires a query of at most 256 bytes");
@@ -1011,30 +1251,95 @@ export class CodexCallbackBroker {
     let entries = 0;
     let bytes = 0;
     let operations = 0;
-    const deadline = Date.now() + 10_000;
-    const searchOp = async (request: FileopRequest): Promise<FileopResponse> => {
-      if (++operations > 64 || Date.now() >= deadline) return { ok: false, code: "E_TIMEOUT" };
+    let skippedFiles = 0;
+    let stopReason: SearchStopReason | undefined;
+    const deadline = Date.now() + SEARCH_DEADLINE_MS;
+    const expired = (): boolean => Date.now() >= deadline;
+    const partial = (reason: SearchStopReason): CallbackResult => ({
+      ok: true,
+      output: { matches, truncated: true, bytes, reason, skippedFiles, notice: SEARCH_PARTIAL_NOTICE },
+    });
+    const searchOp = async (request: FileopRequest): Promise<FileopResponse | SearchCeiling> => {
+      if (++operations > SEARCH_MAX_OPERATIONS) return "operations";
+      if (expired()) return "time";
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
+        // The race only stops this broker waiting; the client op is not cancelled.
         return await Promise.race([
           this.fileop.op(request),
-          new Promise<FileopResponse>((resolve) => {
-            timer = setTimeout(() => resolve({ ok: false, code: "E_TIMEOUT" }), Math.max(1, deadline - Date.now()));
+          new Promise<SearchCeiling>((resolve) => {
+            timer = setTimeout(() => resolve("time"), Math.max(1, deadline - Date.now()));
           }),
         ]);
       } finally {
         if (timer) clearTimeout(timer);
       }
     };
-    while (pending.length > 0) {
+    // Stat, size-check, read, and scan one file. Undefined means the file was searched or
+    // skipped; otherwise the walk stops with a ceiling or ends with a final result.
+    const searchFile = async (rel: string, direct: boolean): Promise<{ stop: SearchStopReason } | { result: CallbackResult } | undefined> => {
+      const stat = await searchOp({ op: "stat", path: rel });
+      if (typeof stat === "string") return { stop: stat };
+      if (!stat.ok) return { result: this.mapFileopError(stat) };
+      if (typeof stat.size !== "number" || !Number.isSafeInteger(stat.size) || stat.size < 0) return { result: deny("fileop_denied", "Search file size unavailable") };
+      if (direct && stat.type !== "file") return { result: deny("fileop_denied", "Search target is not a regular file") };
+      if (stat.size > SEARCH_MAX_FILE_BYTES) { skippedFiles++; return undefined; }
+      if (bytes + stat.size > SEARCH_MAX_TOTAL_BYTES) return { stop: "bytes" };
+      const read = await searchOp({ op: "read", path: rel });
+      if (typeof read === "string") return { stop: read };
+      if (!read.ok) {
+        if (read.code === "E_OVERSIZE" && read.origin === "helper") { skippedFiles++; return undefined; }
+        return { result: this.mapFileopError(read) };
+      }
+      if (read.truncated) { skippedFiles++; return undefined; }
+      if (typeof read.data !== "string") return { result: deny("fileop_denied", "Search file body unavailable") };
+      const body = Buffer.from(read.data, "base64");
+      if (body.length > SEARCH_MAX_FILE_BYTES) { skippedFiles++; return undefined; }
+      if (bytes + body.length > SEARCH_MAX_TOTAL_BYTES) return { stop: "bytes" };
+      if (expired()) return { stop: "time" };
+      bytes += body.length;
+      const text = body.toString("utf8");
+      let lineStart = 0;
+      for (let index = 1; lineStart <= text.length; index++) {
+        const newline = text.indexOf("\n", lineStart);
+        const lineEnd = newline < 0 ? text.length : newline;
+        const line = text.slice(lineStart, lineEnd);
+        const matchAt = line.indexOf(query);
+        if (matchAt >= 0) {
+          if (matches.length === SEARCH_MAX_MATCHES) return { result: partial(stopReason ?? "matches") };
+          const excerptStart = Math.max(0, matchAt - Math.floor((256 - query.length) / 2));
+          matches.push({ path: rel, line: index, text: line.slice(excerptStart, excerptStart + 256) });
+        }
+        if (newline < 0) break;
+        lineStart = newline + 1;
+      }
+      if (expired()) return { stop: "time" };
+      return undefined;
+    };
+    let first = true;
+    walk: while (pending.length > 0) {
       const dir = pending.shift()!;
-      if (++directories > 32) return deny("search_limit", "Search directory limit reached");
+      if (directories >= SEARCH_MAX_DIRECTORIES) { stopReason ??= "directories"; break; }
+      directories++;
       const listing = await searchOp({ op: "list", path: dir });
-      if (!listing.ok) return this.mapFileopError(listing);
-      if (listing.truncated || !listing.entries) return deny("search_limit", "Search listing incomplete");
-      entries += listing.entries.length;
-      if (entries > 256) return deny("search_limit", "Search entry limit reached");
-      for (const entry of listing.entries) {
+      if (typeof listing === "string") { stopReason ??= listing; break; }
+      if (!listing.ok) {
+        if (first && listing.code === "E_NOT_DIR" && listing.origin === "helper") {
+          const outcome = await searchFile(dir, true);
+          if (outcome && "result" in outcome) return outcome.result;
+          if (outcome) stopReason ??= outcome.stop;
+          break;
+        }
+        return this.mapFileopError(listing);
+      }
+      first = false;
+      if (!Array.isArray(listing.entries)) return deny("fileop_denied", "Search listing unavailable");
+      if (listing.truncated) stopReason ??= "listing";
+      const sorted = [...listing.entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      for (const entry of sorted) {
+        if (expired()) { stopReason ??= "time"; break walk; }
+        if (entries >= SEARCH_MAX_ENTRIES) { stopReason ??= "entries"; break walk; }
+        entries++;
         if (entry.name === ".git" || !entry.name || entry.name === "." || entry.name === ".." || entry.name.includes("/")) continue;
         const rel = dir === "." ? entry.name : path.posix.join(dir, entry.name);
         const screenedEntry = this.screenAndRelativize(rel);
@@ -1044,28 +1349,17 @@ export class CodexCallbackBroker {
           continue;
         }
         if (entry.type !== "file") continue;
-        const stat = await searchOp({ op: "stat", path: rel });
-        if (!stat.ok) return this.mapFileopError(stat);
-        if (typeof stat.size !== "number" || !Number.isSafeInteger(stat.size) || stat.size < 0) return deny("fileop_denied", "Search file size unavailable");
-        if (stat.size > 64 * 1024) return deny("search_limit", "Search file size limit reached");
-        if (bytes + stat.size > 256 * 1024) return deny("search_limit", "Search byte limit reached");
-        const read = await searchOp({ op: "read", path: rel });
-        if (!read.ok) return this.mapFileopError(read);
-        if (read.truncated) return deny("search_limit", "Search file read incomplete");
-        if (typeof read.data !== "string") return deny("fileop_denied", "Search file body unavailable");
-        const body = Buffer.from(read.data, "base64");
-        if (body.length > 64 * 1024) return deny("search_limit", "Search file size limit reached");
-        bytes += body.length;
-        if (bytes > 256 * 1024) return deny("search_limit", "Search byte limit reached");
-        for (const [index, line] of body.toString("utf8").split("\n").entries()) {
-          const matchAt = line.indexOf(query);
-          if (matchAt < 0) continue;
-          if (matches.length === 20) return { ok: true, output: { matches, truncated: true, bytes } };
-          const excerptStart = Math.max(0, matchAt - Math.floor((256 - query.length) / 2));
-          matches.push({ path: rel, line: index + 1, text: line.slice(excerptStart, excerptStart + 256) });
-        }
+        const outcome = await searchFile(rel, false);
+        if (!outcome) continue;
+        if ("result" in outcome) return outcome.result;
+        stopReason ??= outcome.stop;
+        break walk;
       }
     }
+    // An expiry after the final read must not be reported as complete coverage.
+    if (stopReason === undefined && expired()) stopReason = "time";
+    const reason = stopReason ?? (skippedFiles > 0 ? "file_size" : undefined);
+    if (reason !== undefined) return partial(reason);
     return { ok: true, output: { matches, truncated: false, bytes } };
   }
 
@@ -1184,6 +1478,7 @@ export class CodexCallbackBroker {
       return deny("denied_tool", `no handler is wired for "${safeId(name)}"`);
     }
     try {
+      this.registry.assertWorkAdmission();
       const output = await handler(args);
       return { ok: true, output };
     } catch {

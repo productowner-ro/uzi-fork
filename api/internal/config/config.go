@@ -394,10 +394,11 @@ type Config struct {
 	SeedReleaseCheckInterval      time.Duration
 	SeedReleaseCheckToken         string
 
-	// Agent-runtime (PRD #4) knobs. All have safe defaults; none is a boot guard
-	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
-	// and RunMaxIterations are enforced worker-side and shipped in the claim
-	// payload; the rest drive the server sweeper and claim affinity.
+	// Agent-runtime (PRD #4) knobs tune the run queue / worker liveness.
+	// Defaults and invalid-value handling vary per setting; some malformed values
+	// reject API startup. RunIdleTimeout and RunMaxIterations are enforced
+	// worker-side and shipped in the claim payload; the rest drive the server
+	// sweeper and claim affinity.
 	PlanCrossCheckMaxRevisions int32
 	CodeCrossCheckTimeout      time.Duration // independent code checker wall-clock budget
 	PlanCrossCheckTimeout      time.Duration // bounded checker wall-clock budget
@@ -496,9 +497,9 @@ type Config struct {
 
 	// Transient-recovery park (issue #1197). A run that reports a positively-empty SDK
 	// turn (after bounded in-process retries) parks in 'recovery_wait' and the sweeper
-	// auto-promotes it on a capped exponential backoff. UNLIKE the usage-limit park there
-	// is NO per-run park cap (no RUN_RECOVERY_MAX_WAITS): a park always becomes promotable
-	// again, so the run recovers repeatedly until it succeeds or the owner cancels.
+	// auto-promotes timed parks on a capped exponential backoff. Untyped recovery has
+	// no per-run park cap; typed causes such as Codex idle stalls apply their own
+	// retry bound and may instead wait for the owner.
 	//
 	// RunRecoveryParkBase is the FIRST park's wait (the backoff's base); each subsequent
 	// park doubles it, clamped at RunRecoveryMaxPark. Both shape only the retry cadence —
@@ -506,13 +507,20 @@ type Config struct {
 	RunRecoveryParkBase time.Duration // first recovery park's wait; doubles per prior park
 	RunRecoveryMaxPark  time.Duration // ceiling on one recovery park's backoff
 
+	// Idle parks above this count wait for owner Resume. Zero holds the first park.
+	RunCodexIdleStallMaxParks int
+
+	// RunRetainedRecoveryMaxParks bounds automatic budget-exhaustion renewals only.
+	// RUN_RETAINED_RECOVERY_MAX_PARKS defaults to 3; zero holds for the owner immediately.
+	RunRetainedRecoveryMaxParks int
+
 	// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2). A transient forge failure at
 	// clone parks the run in 'recovery_wait' with recovery_wait_cause='forge_unreachable';
 	// forge_park_count is its FORGE-ONLY lifetime counter (distinct from the backoff-shaping
-	// recovery_wait_count), and this is the cap the park-or-fail decision consults inside
-	// SetState. Past the cap the run fails with fail_origin='forge_unreachable'. UNLIKE the
-	// recovery-park cadence knobs above, this CAN fail a run — it is the forge park's lifetime
-	// bound. 0 = unlimited (never fail on the count), the deliberate off switch; the default
+	// recovery_wait_count). After this many timed parks, the next exhausted group holds
+	// in recovery_wait with a NULL retry stamp until owner Resume. Resume preserves the
+	// lifetime allowance, so another exhausted group holds again. Zero means unlimited
+	// automatic retry, the deliberate off switch; the default
 	// (6 parks ≈ an hour at the recovery-park defaults) lives in Load. Counted separately from
 	// recovery_wait_count so the empty-turn park keeps its no-lifetime-cap contract (fact 7).
 	RunForgeUnreachableMaxParks int
@@ -813,6 +821,8 @@ type Config struct {
 	// on a forge that left the list is settled 'disabled' (after a CAS delete of any
 	// unrecorded copy), so a rollback can still make forge calls for existing rows.
 	SalvageForges []string
+	// PrerequisiteClosureForges opts new captures into reviewed prerequisite pinning strategies.
+	PrerequisiteClosureForges []string
 
 	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) is the held-work publication switch.
 	// Unset or empty means on. Accepted values, case-insensitive and trimmed: true, on, 1, yes, t,
@@ -1242,13 +1252,16 @@ func Load() (Config, error) {
 	// value silently falls back to the default (like RUN_LIMIT_MAX_PARK): these shape the
 	// auto-promote cadence and have no off switch — there is no "never recover" mode.
 	cfg.RunRecoveryParkBase = parseDuration("RUN_RECOVERY_PARK_BASE", time.Minute)
+	cfg.RunCodexIdleStallMaxParks = 3
+	if n, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("RUN_CODEX_IDLE_STALL_MAX_PARKS")), 10, 32); err == nil && n >= 0 && n <= 2147483646 {
+		cfg.RunCodexIdleStallMaxParks = int(n)
+	}
+	cfg.RunRetainedRecoveryMaxParks = parseNonNegInt("RUN_RETAINED_RECOVERY_MAX_PARKS", 3)
 	cfg.RunRecoveryMaxPark = parseDuration("RUN_RECOVERY_MAX_PARK", 30*time.Minute)
 
-	// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2). parseNonNegInt, so
-	// RUN_FORGE_UNREACHABLE_MAX_PARKS=0 is legal and means "unlimited" (never fail on the
-	// count) — the deliberate off switch, matching how RUN_LIMIT_MAX_WAITS=0 means "never
-	// park". Default 6 (≈ an hour of parks at the recovery-park defaults; more once earlier
-	// parks raise the backoff).
+	// Forge-unreachable lifetime timed-park allowance. After the allowance is
+	// consumed, the next exhausted group waits for owner Resume with NULL retry.
+	// RUN_FORGE_UNREACHABLE_MAX_PARKS=0 deliberately permits unlimited timed parks.
 	cfg.RunForgeUnreachableMaxParks = parseNonNegInt("RUN_FORGE_UNREACHABLE_MAX_PARKS", 6)
 	// Plan-gate re-presentation refusal cap (PRD #1795 M1). parseNonNegInt, so
 	// RUN_GATE_REFUSAL_MAX=0 is legal and means "unlimited", the same off switch as
@@ -1449,6 +1462,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.SalvageForges = salvageForges
+	closureForges, err := parseForgeKinds("UZI_PREREQUISITE_CLOSURE_FORGES", getenv("UZI_PREREQUISITE_CLOSURE_FORGES", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PrerequisiteClosureForges = closureForges
 
 	heldPublication, err := parseOnOff("UZI_HELD_PUBLICATION", true)
 	if err != nil {
@@ -1471,6 +1489,10 @@ func Load() (Config, error) {
 // kind uzi supports (github, gitlab, forgejo); anything else is an error so a typo refuses
 // to start rather than silently leaving salvage off for that forge. Empty returns nil (off).
 func parseSalvageForges(raw string) ([]string, error) {
+	return parseForgeKinds("UZI_SALVAGE_FORGES", raw)
+}
+
+func parseForgeKinds(name, raw string) ([]string, error) {
 	var out []string
 	for _, part := range strings.Split(raw, ",") {
 		kind := strings.ToLower(strings.TrimSpace(part))
@@ -1480,7 +1502,7 @@ func parseSalvageForges(raw string) ([]string, error) {
 		switch kind {
 		case "github", "gitlab", "forgejo":
 		default:
-			return nil, fmt.Errorf("UZI_SALVAGE_FORGES: unknown forge %q (want a comma list of github, gitlab, forgejo)", kind)
+			return nil, fmt.Errorf("%s: unknown forge %q (want a comma list of github, gitlab, forgejo)", name, kind)
 		}
 		if !slices.Contains(out, kind) {
 			out = append(out, kind)

@@ -1293,3 +1293,78 @@ func TestLoadWorkerStaleRequeueGrace(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadRunRetainedRecoveryMaxParks(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	for _, tc := range []struct {
+		env  string
+		want int
+	}{
+		{"", 3},
+		{"5", 5},
+		{"0", 0},
+		{"-1", 3},
+		{"nonsense", 3},
+	} {
+		t.Setenv("RUN_RETAINED_RECOVERY_MAX_PARKS", tc.env)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with RUN_RETAINED_RECOVERY_MAX_PARKS=%q: %v", tc.env, err)
+		}
+		if cfg.RunRetainedRecoveryMaxParks != tc.want {
+			t.Errorf("RunRetainedRecoveryMaxParks for RUN_RETAINED_RECOVERY_MAX_PARKS=%q = %d, want %d", tc.env, cfg.RunRetainedRecoveryMaxParks, tc.want)
+		}
+	}
+}
+
+func TestLoadPrerequisiteClosureForges(t *testing.T) {
+	t.Setenv("UZI_PREREQUISITE_CLOSURE_FORGES", "")
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if len(cfg.PrerequisiteClosureForges) != 0 {
+		t.Fatalf("PrerequisiteClosureForges default = %v, want empty (off)", cfg.PrerequisiteClosureForges)
+	}
+
+	accept := map[string][]string{
+		"":                          nil,
+		" , ,":                      nil,
+		"github":                    {"github"},
+		" GitHub , gitlab,FORGEJO ": {"github", "gitlab", "forgejo"},
+		"gitlab,,gitlab, Gitlab":    {"gitlab"},
+		"forgejo,github":            {"forgejo", "github"},
+	}
+	for raw, want := range accept {
+		t.Setenv("UZI_PREREQUISITE_CLOSURE_FORGES", raw)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with UZI_PREREQUISITE_CLOSURE_FORGES=%q: %v", raw, err)
+		}
+		if !slices.Equal(cfg.PrerequisiteClosureForges, want) {
+			t.Errorf("UZI_PREREQUISITE_CLOSURE_FORGES=%q -> %v, want %v", raw, cfg.PrerequisiteClosureForges, want)
+		}
+	}
+
+	for _, raw := range []string{"gitea", "github,bitbucket", "git hub", "github;gitlab", "*"} {
+		t.Setenv("UZI_PREREQUISITE_CLOSURE_FORGES", raw)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_PREREQUISITE_CLOSURE_FORGES") {
+			t.Errorf("UZI_PREREQUISITE_CLOSURE_FORGES=%q: Load() err = %v, want a UZI_PREREQUISITE_CLOSURE_FORGES error", raw, err)
+		}
+	}
+}

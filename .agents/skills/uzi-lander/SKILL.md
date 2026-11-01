@@ -131,6 +131,10 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
   `.agents/skills/issue-triage/references/on-deck.md` (step 8).
 - **Skill or script PRs you open**: the buddy reviews the final draft, then add the
   `reviewed` label, so the user sees both agents agreed. Same with a local buddy.
+- **Superseded or CI-only PRs**: with the buddy's `APPROVE` of the close comment, close
+  the PR yourself (`gh pr close N --comment …`) and delete branches you created solely
+  for CI evidence, after preserving required CI results and confirming no unique work
+  is lost. Keep a branch whose commits are marked for reuse.
 - The buddy's `APPROVE` is required where this skill says so below. It never
   replaces a user approval.
 
@@ -181,6 +185,8 @@ changes it); trust it over a handover's claim.
 | `ready` | step 6 |
 | `merged` | step 7 |
 
+For `unknown`/exit 9 caused by `uzi run list` reporting "cannot reach", "no such host" or timeout, wait for network reachability in the background, then re-run the snapshot; never merge meanwhile.
+
 ## CI-fix branch ownership
 
 `takeover.sh` and `watch-pr.sh` print `CI_FIX_ACTIVE` and `CI_FIX_RECENT` for the exact
@@ -193,6 +199,7 @@ Before any local fix, push or rebase, refresh the snapshot. With an active ci_fi
 with the buddy: stay off the branch until it finishes, or `uzi run cancel ID -m 'REASON'`
 and wait for authoritative terminal state before fixing locally. Never both. Record
 `ci_fix waiting ID` or `ci_fix cancelled ID` with `S/trail.sh '#PR' 'STATE'`, then re-snapshot.
+For ci_fix triggered solely by a main-side breakage now fixed on main, agree with the buddy to cancel; confirm terminal state, unchanged branch head and no `preserved_patch`, then rebase. Preserve and review any delta instead.
 
 `CI_FIX_RECENT` triggers review of the pushed delta against the last reviewed SHA before
 merge, even with green CI. Require the same exact-head buddy review as a small local fix;
@@ -201,6 +208,8 @@ After recording that review, handle `RESULT=ci_fix_recent` as exit 1: fix the re
 locally in step 4. The advisory still prints until the window expires.
 
 ## The loop
+
+For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at filing with a pre-queue baseline, repo selector and verified completion route.
 
 1. **Run still active.** Poll blind to terminal with the watcher's poller, in the background:
    `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled,awaiting_approval,awaiting_input,paused 60 MAX SEQ`,
@@ -213,21 +222,29 @@ locally in step 4. The advisory still prints until the window expires.
    `ELAPSED` / `RESULT=elapsed` (exit 3) stopped counting, not the run: re-snapshot
    and re-launch under the existing grant, or record the coverage blocker. A stop-set
    state exits 0 with `RESULT=stop:STATE`, not a generic success verdict. Re-arm after every
-   `uzi run extend` or `uzi run resume`, which leave no poller running.
+   `uzi run extend`, `resume`, `answer` or `decide`, which leave no poller running; after an
+   answer or decide pass the answered question's seq as the 6th arg, or the lingering
+   `awaiting_input` stops the new poller at once and the run's next question goes unseen.
    `STOP=needs_attention` (exit 4) means a non-terminal run shows persistent non-ok health or
    a stale worker heartbeat: investigate (`uzi run get RUN --json`, `uzi worker list`, the
    trace tail); do not assume dead or lost, change nothing until you know, then launch its
    `REARM=` line in the background in the same turn (it acks that health episode).
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
    surface it, answer with `uzi run answer` if you can (never a wait-only answer: see `uzi-watcher`,
-   *Watching*; a completion question about a milestone
-   the plan made maintainer-owned: `uzi run decide RUN --partial <kept ids> --reason '...'`, since
-   a plain answer cannot exempt it, then open the PR); `awaiting_approval` past `SEQ` → the run re-planned
+   *Watching*; a completion question about a frozen
+   milestone on an older plan that made it maintainer-owned:
+   `uzi run decide RUN --partial KEPT_IDS --reason '...'`, since a plain answer cannot exempt it, then open the PR; new plans should list
+   owner acceptance outside the milestones and not ask); `awaiting_approval` past `SEQ` → the run re-planned
    (usually a lost worker resumed from the default branch): before steering the new gate with
    `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
-   keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause), except `recovery_wait` with cause
-   `worker_requeue_exhausted`: the poller stops on it (exit 0) because only the owner can
-   Resume or Cancel; back up first (`uzi-watcher` recovery). `paused` stops the poller because it never
+   keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
+   `worker_requeue_exhausted`, `retained_recovery_adoption_failed` (regardless of retry timing),
+   `worker_memory_pressure` (regardless of remaining interventions),
+   or `retained_recovery_exhausted` with its retry stamp explicitly null: the poller
+   stops on it (exit 0) because only the owner can Resume or Cancel; back up first (`uzi-watcher` recovery).
+   Adoption failure means an integrity check refused adoption, with local work and custody
+   preserved and no automatic retry. Resume requests a bounded attempt; success is not assured,
+   and repeated failure holds again. `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
    with `hold_reason: budget_exhausted` (PRD #1497), never `failed`: extend it (`uzi run
    extend RUN --by 2h`) and re-arm the poller; an owner pause waits for its owner.
@@ -344,6 +361,10 @@ locally in step 4. The advisory still prints until the window expires.
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
      `S/wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`, review its commit, trail `fix rework`.
      Exit 3 means the rework is still running: re-run the waiter with the same `$SINCE`.
+     GUIDANCE asks only for steps the agent can do in-run. It has no network git, so never
+     require fetching or merging live `main` (or any worker-, forge- or lander-only step):
+     an impossible precondition spins the run into its iteration budget. Integrate `main`
+     locally after the rework completes, then validate the integrated PR head before merging.
      On-demand rework ignores the per-run and per-user auto-rework settings, so a run
      created with `--mr-rework=false` can still be reworked and needs no toggle. A 409
      "disabled" is the admin kill-switch: report it, never downgrade a big fix to a local
@@ -456,6 +477,9 @@ locally in step 4. The advisory still prints until the window expires.
    S/merge.sh OWNER/REPO PR --expect-head <sha you watched> --expect-closes <N,...|none>   # squash + delete-branch + admin
    ```
 
+   For `vtmocanu/uzi` main, exit 12 means main changed changelog-policy files since the PR's merge-base: rebase or merge main, wait for fresh exact-head CI, re-run `merge.sh`; merges outside it bypass this guard.
+   That check uses the helper's own checkout and an exact GitHub origin URL allowlist for `vtmocanu/uzi`.
+   Exit 13 (`MIGRATION_COLLISION`) means an added, renamed or copied migration destination is at or below the live base head: run `land-prep.sh` to renumber, then require fresh exact-head CI and review. Unreadable PR files or base migrations refuse with exit 2. The final check shares takeover's parser; a base move outside the lander lock after the snapshot remains a race.
    It refuses on a moved head, an active rework, red, pending or no passing required checks, a
    git conflict, or (exit 5) any unresolved thread, open code-scanning alert or
    unacknowledged comment, or (exit 10) a `chore(release):` commit's CI still running on
@@ -467,12 +491,14 @@ locally in step 4. The advisory still prints until the window expires.
    writes the merge trail and releases the claim while preserving that trail through the
    post-merge CI watch — exit 9 if it is not merged yet). Do this
    BEFORE `reap`/`release`, or the trail is purged before it was ever written (#1510).
-7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --interval 60` in the background.
+7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --follow --interval 60` in the background.
    Pass the exact SHA from `merge.sh`; never hand-complete a prefix. The poller resolves it
    through GitHub and exits 3 before polling when it is invalid or unknown.
    Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
    per-job live-log commands it prints, then fix on a branch, never `main`; flake → rerun +
-   file), 3 no run appeared, 4 superseded → re-watch the current `main` head
+   file), 2 budget exhausted, 3 no run appeared or lookup failed. `--follow` prints each
+   `FOLLOW sha=OLD -> NEW` switch to the current branch head without resetting `--max-ticks`;
+   the final verdict covers the last watched SHA. Without it, 4 superseded → re-watch the current `main` head
    (references/merge-mechanics.md). Append the terminal result to the preserved trail
    (`main ci green`, `main ci red`, or `main ci superseded`) and print the whole line. Read
    the poller's own `EXIT=` line before reporting any of them (*Waiting, uniformly*).
@@ -483,6 +509,16 @@ locally in step 4. The advisory still prints until the window expires.
    trail with `S/claims.sh release '#PR' --purge`, then run
    `S/claims.sh reap --repo OWNER/REPO` (drops merged/closed claims and orphans of dead
    sessions), and hand any still-open item on.
+
+   - Run `uzi run recovery RUN` after merge. An open `decision_needed` hold on a completed
+     run counts toward owner custody admission and pins its worker, including ephemeral workers.
+     When its checkpoint tip equals the merged PR's final reviewed head, or its patch range
+     is identical (`git range-diff` shows only `=`), verify captures and retained source contain
+     no additional work. Export each capture with `uzi run export RUN --capture ID --output FILE`,
+     run `git bundle verify FILE`, and fetch, bundle and verify the checkpoint ref before
+     `uzi run discard RUN --hold ID --yes`. The last hold's discard can delete the forge
+     checkpoint ref. Keep verified backups; hand any unavailable export or unproven source/capture
+     gap to `uzi-watcher` recovery instead of discarding.
 
    **The run's follow-ups.** A run's off-task bugs are uzi incidental findings, not forge
    issues; review notes the lead deferred are the PR description's `deferred` scope notes,
@@ -577,6 +613,18 @@ and they precede every merge (step 6):
   title and commit messages reach `main` in the squash commit and close issues there) and
   pass the expected set to `merge.sh --expect-closes` (`none` for a Refs-only PR), which
   checks all three and refuses a mismatch.
+- **Owner acceptance survives the PR body.** Before merge, compare the approved plan's "Owner
+  acceptance" list with the rendered PR; summary scope notes can be replaced or dropped, so restore
+  omitted or truncated items in an owner-maintained area of the PR body or a durable linked
+  handoff. Missing prose never means acceptance is absent; the issue stays open
+  (`--expect-closes none`). After a non-closing delivery merges, apply issue-triage's "Acceptance
+  only" disposition (`.agents/skills/issue-triage/SKILL.md`: remove `uzi`, `bug`, `Planned`,
+  `on-deck`; add `acceptance`; comment citing the landing PR; label writes need the approval the
+  triage verdict requires) only after verifying implementation is complete and only maintainer
+  acceptance remains, so label-selected nightly sweeps cannot re-pick it (the scheduler has no
+  "already delivered" skip; an assigned-issue sweep ignores labels, so also unassign the uzi bot). Unfinished worker work, mixed scope and ordinary owner scope cuts keep their
+  actual remainder and the appropriate existing triage disposition; non-closing alone does not
+  establish acceptance-only status.
 - **A code-scanning alert on the PR ref may be an old one.** When the PR only touches
   lines near a known alert, compare rule and path with `main`'s alerts
   (`gh api repos/OWNER/REPO/code-scanning/alerts?ref=refs/heads/main`). Dismiss the

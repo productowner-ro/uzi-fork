@@ -17,6 +17,7 @@
 // kill on abort) with a full-replacement env.
 
 import path from "node:path";
+import { CODE_COVERAGE_LIMITS } from "./code-cross-check-coverage.js";
 import type { ActivitySettle, CheckActivityRecorder } from "./cross-check-activity.js";
 import type { EffortLevel, HookInput, HookJSONOutput, Options as SdkOptions, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 
@@ -154,6 +155,9 @@ export function buildClaudeCrossCheckOptions(input: {
     // Guardrail invariant #6 (semgrep/settings-sources-isolation.yml): nothing from disk, so a
     // cloned repo's .claude/ can grant the checker nothing. Keep this a LITERAL.
     settingSources: [],
+    // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
+    // mentions and dispatches a leading slash command before any PreToolUse hook runs.
+    verbatimPrompts: true,
     settings: { enabledPlugins: BUILTIN_PLUGINS_DISABLED },
     tools: [...CHECKER_SURFACE.tools],
     disallowedTools: isolatedDisallowedTools(CHECKER_SURFACE),
@@ -486,8 +490,8 @@ export class ClaudeCrossCheck {
       }
       if (isErrorResult(resultFrame)) throw new Error("cross-check model error");
       const text = resultFrame["result"];
-      if (typeof text !== "string" || Buffer.byteLength(text) > MAX_VERDICT_BYTES) {
-        throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict");
+      if (typeof text !== "string" || Buffer.byteLength(text) > (code ? CODE_COVERAGE_LIMITS.verdictBytes : MAX_VERDICT_BYTES)) {
+        throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict", "result_cap");
       }
       if (code) validateCodeFindings(text);
       else validateVerdict(text);

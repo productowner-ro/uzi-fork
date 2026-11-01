@@ -31,7 +31,7 @@ function breakdown(u: RunUsage): { fresh: number; cached: number; out: number; t
 // non-positive factory total to all zeros; forcing 100 is correct only because the
 // rows partition the factory total (AdminUsagePerUser and AdminUsageTotals sum the
 // same non-chat runs).
-function tokenShares(totals: number[], factoryTotal: number): number[] {
+function costShares(totals: number[], factoryTotal: number): number[] {
   if (factoryTotal <= 0) return totals.map(() => 0);
   const scaled = totals.map((t) => t * 100);
   const floors = scaled.map((s) => Math.floor(s / factoryTotal));
@@ -79,6 +79,19 @@ function summaryCost(usd: number): string {
     minimumFractionDigits: value >= 1000 ? 0 : 2,
     maximumFractionDigits: value >= 1000 ? 0 : 2,
   }).format(value);
+}
+
+// Issue #3686: "N PRs · $X per PR" for one window. null when the server did not
+// report the count (older API): never a fabricated 0. The per-PR cost divides the
+// column's displayed cost, so an incomplete cost reads "at least $X per PR" with the
+// cost disclosure's own title. Wording is "PRs" for every forge (no forgeNoun).
+function prSummary(count: number | undefined, cost: number, disclosure: ReturnType<typeof aggregateDisclosure>): ReactNode {
+  if (count == null) return null;
+  const head = `${count.toLocaleString("en-US")} ${count === 1 ? "PR" : "PRs"}`;
+  if (count === 0) return `${head} · — per PR`;
+  const per = summaryCost(cost / count);
+  if (disclosure.incomplete) return <>{head} · <span title={disclosure.title}>at least {per} per PR</span></>;
+  return `${head} · ${per} per PR`;
 }
 
 // PRD #1293: outcomes use the selected window and failed / finished denominator.
@@ -175,6 +188,8 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
   const subscriptionCount = window === "lifetime" ? usage.lifetime_subscription_run_count : usage.last7_subscription_run_count;
   const unreportedCount = window === "lifetime" ? usage.lifetime_unreported_run_count : usage.last7_unreported_run_count;
   const disclosure = aggregateDisclosure(subscriptionCount, unreportedCount);
+  const prText = prSummary(window === "lifetime" ? usage.lifetime_pr_count : usage.last7_pr_count, selected.cost, disclosure);
+  const showRuns = window === "lifetime";
   const delta = lifetime.finished > 0 && outcomes.finished > 0
     ? (outcomes.failed / outcomes.finished - lifetime.failed / lifetime.finished) * 100 : null;
   const deltaText = delta == null ? "" : `${delta < 0 ? "−" : delta > 0 ? "+" : ""}${Math.abs(delta).toFixed(1)} pp vs all-time ${failRate(lifetime)}`;
@@ -208,7 +223,7 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
       <div><FailedRunsBlock outcomes={outcomes} personal={personal} /></div>
       <div><TopCauses outcomes={outcomes} personal={personal} /></div>
       <div>{outcomes.needs_landing > 0 && <p className="text-[11px] text-muted">{outcomes.needs_landing.toLocaleString("en-US")} failed runs with recoverable work. May include work already landed.</p>}</div>
-      <div>{window === "lifetime" && <p className="text-[11px] text-muted">{runCountLine}</p>}</div>
+      <div>{(showRuns || prText != null) && <p className="text-[11px] text-muted">{showRuns && runCountLine}{showRuns && prText != null && " · "}{prText}</p>}</div>
       <div><SinceLastFailedRun outcomes={lifetime} owner={owner} /></div>
     </section>
   );
@@ -265,9 +280,10 @@ export function UsageCard({ self, admin, window, onWindowChange }: {
   );
 }
 
-function Th({ children, left }: { children: ReactNode; left?: boolean }) {
+function Th({ children, left, title }: { children: ReactNode; left?: boolean; title?: string }) {
   return (
     <th
+      title={title}
       className={
         "border-b border-edge px-2.5 py-1.5 text-[10.5px] font-semibold uppercase tracking-[0.06em] text-faint " +
         (left ? "text-left" : "text-right")
@@ -322,9 +338,16 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
     selectedOutcomes: recent ? u.last7_outcomes! : u.outcomes,
     subscription: recent ? u.last7_subscription_run_count! : u.subscription_run_count,
     unreported: recent ? u.last7_unreported_run_count! : u.unreported_run_count,
-  })).sort((a, b) => b.b.total - a.b.total || b.b.cost - a.b.cost || b.b.out - a.b.out ||
+    selectedPRs: recent ? u.last7_pr_count : u.pr_count,
+  })).sort((a, b) => b.b.cost - a.b.cost || b.b.total - a.b.total || b.b.out - a.b.out ||
     (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0));
-  const shares = tokenShares(rows.map((r) => r.b.total), factory.total);
+  // Issue #3686: render the PRs column only when every row reports the selected window's count.
+  const showPRs = rows.every((r) => r.selectedPRs != null);
+  const factoryPRs = rows.reduce((sum, r) => sum + (r.selectedPRs ?? 0), 0);
+  const factoryMicroUSD = Math.round(factory.cost * 1e6);
+  const shares = factoryMicroUSD > 0
+    ? costShares(rows.map((r) => Math.round(r.b.cost * 1e6)), factoryMicroUSD)
+    : undefined;
   const factoryRuns = recent ? rows.reduce((sum, u) => sum + u.selectedRuns, 0) : admin.factory.run_count;
   const factoryDisclosure = aggregateDisclosure(
     recent ? admin.factory.last7_subscription_run_count : admin.factory.lifetime_subscription_run_count,
@@ -336,25 +359,26 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
         <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
       ) : (
         <div className="mt-2 overflow-x-auto">
-          <table className="w-full min-w-[680px] border-collapse text-xs">
+          <table className="w-full min-w-[740px] border-collapse text-xs">
             <thead>
               <tr>
                 <Th left>User</Th>
                 <Th>Runs</Th>
+                {showPRs && <Th>PRs</Th>}
                 <Th>Failed</Th>
                 <Th>Fail rate</Th>
                 <Th>Since last failure</Th>
                 <Th>Tokens</Th>
                 <Th>Out</Th>
                 <Th>Cost</Th>
-                <Th>Share</Th>
+                <Th title="Share of recorded API-equivalent cost in the selected period">Cost share</Th>
               </tr>
             </thead>
             <tbody>
               {rows.map((u, i) => {
-                // Rank and Share both use total tokens, including subscription runs.
-                // Largest-remainder rounding (see tokenShares) so the column sums to 100%.
-                const pct = shares[i];
+                // Rank uses unrounded recorded cost; shares use integer microdollars.
+                // Largest-remainder rounding (see costShares) makes shares sum to 100%.
+                const pct = shares?.[i];
                 // This user's selected cost_usd includes recorded partial costs —
                 // disclose their own subscription/unreported counts beside it rather than
                 // let the dollar figure read as their complete total.
@@ -363,6 +387,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
                   <tr key={u.user_id}>
                     <Td left>{maskEmail(u.email, demo)}</Td>
                     <Td>{u.selectedRuns}</Td>
+                    {showPRs && <Td>{u.selectedPRs}</Td>}
                     <Td>{u.selectedOutcomes.failed}</Td>
                     <Td title={`${u.selectedOutcomes.failed} of ${u.selectedOutcomes.finished} finished runs`}>
                       {failRate(u.selectedOutcomes)}
@@ -377,16 +402,20 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
                       )}
                     </Td>
                     <Td>
-                      <span className="inline-flex items-center justify-end gap-2 whitespace-nowrap">
-                        {pct}%
-                        <span
-                          className="inline-block h-1 w-16 overflow-hidden rounded bg-edge align-middle"
-                          role="img"
-                          aria-label={`${pct} percent of factory tokens`}
-                        >
-                          <span className="block h-full bg-brand" style={{ width: `${pct}%` }} />
+                      {pct === undefined ? (
+                        <span title="Cost share unavailable: no recorded factory cost in the selected period">—</span>
+                      ) : (
+                        <span className="inline-flex items-center justify-end gap-2 whitespace-nowrap">
+                          {pct}%
+                          <span
+                            className="inline-block h-1 w-16 overflow-hidden rounded bg-edge align-middle"
+                            role="img"
+                            aria-label={`${pct} percent of recorded factory cost`}
+                          >
+                            <span className="block h-full bg-brand" style={{ width: `${pct}%` }} />
+                          </span>
                         </span>
-                      </span>
+                      )}
                     </Td>
                   </tr>
                 );
@@ -394,6 +423,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
               <tr>
                 <Td left total>uzi total</Td>
                 <Td total>{factoryRuns}</Td>
+                {showPRs && <Td total>{factoryPRs}</Td>}
                 <Td total>{factoryOutcomes.failed}</Td>
                 <Td
                   total

@@ -111,21 +111,53 @@ without progress, or an announcement of publication.
 
 ## Planning work and pending acceptance
 
-Put owner or deployment acceptance in a separate final milestone when it
-must happen outside the worker. Implementation, documentation, tests,
-mandatory gates, security checks and review remain worker work. Approval
-or auto-approval of that plan does not waive them. This separate-final-milestone
-convention is the structural-run rule; a dormant semantic run instead uses
-`maintainer` criteria (see [Maintainer outstanding proof on semantic
+A new, unfrozen plan keeps two kinds of item out of its milestones:
+
+- **Landing obligations**: checks that inherently need the PR/merge
+  environment (for example exact-head PR CI) or an already-authorized
+  issue-specific landing fallback. The plan lists them in a "Landing
+  obligations" section.
+- **Owner acceptance**: live, hosted or human-judgment acceptance the worker
+  cannot perform. The plan lists them in an "Owner acceptance" section naming
+  the remaining verification, why the worker cannot perform it, the
+  responsible actor and actionable steps.
+
+Neither is a milestone, so the run no longer parks at completion for them.
+When the plan has Owner acceptance items, the lead declares `non_closing`
+with a reason naming them as pending and not verified, and lists each as a
+`deferred` `pr_summary` scope note. The worker always renders that reason as
+"> **Issue remains open.** <reason>" in its completion block. Scope notes
+can be replaced by the generated summary or dropped by the 6 KiB region
+fallback; at most 8 of the lead's notes of 200 bytes each are published (5
+when the generated summary replaces them), so the reason is the dependable
+record.
+
+Implementation, documentation, tests, mandatory gates, security checks and
+review remain worker work and never move to either section, even if the
+lander repeats a check or the worker lacks time, permissions or tooling.
+Approval or auto-approval of the plan does not waive them. Unfinished worker
+work, such as a failed gate, still parks at completion.
+
+The lead resolves classification from the issue, the repository and prior
+owner instructions. If consequential doubt remains and `ask_user` reaches a
+human (the plan prompt carries no autopilot note), it asks before submitting
+the plan. On an auto-approved run `ask_user` reaches no human, even when the
+plan is force-gated, so a consequentially doubtful item stays a required
+milestone with the uncertainty recorded in the plan; auto-approval, a checker
+approval and the auto-answer supply no waiver. A dormant semantic run instead
+uses `maintainer` criteria (see [Maintainer outstanding proof on semantic
 runs](#maintainer-outstanding-proof-on-semantic-runs-dormant)).
 
-Formal owner partial is the scope-reduction authority: it records the exact
-kept and deferred milestone IDs and a reason. This applies to ordinary
-coding work too, not just acceptance milestones. An ordinary answer or a
-non-closing declaration grants no waiver.
+These sections apply to new, unfrozen plans. Plan approval, ordinary answers
+and `non_closing` never change frozen scope. For a frozen milestone that
+remains unmet (for example on a plan approved earlier), formal owner partial
+is the scope-reduction authority: it records the exact kept and deferred
+milestone IDs and a reason. This applies to ordinary coding work too, not
+just acceptance milestones. An ordinary answer or a non-closing declaration
+grants no waiver.
 
-On a partial delivery, the pending checklist keeps each deferred entry
-unchecked and includes its ID, frozen title and reason, explicitly marked
+On a partial delivery of frozen milestones, the pending checklist keeps each
+deferred entry unchecked and includes its ID, frozen title and reason, explicitly marked
 **not delivered** or **not verified** before owner closure. Checking a box
 grants no completion authority; a refresh restores it unchecked. Put
 actionable next steps in the ordinary summary outside the worker-owned
@@ -428,12 +460,29 @@ with authoritative scope restrictions and stores `runs.source_publication_intent
 atomically with successful issue completion. This also supports legacy
 (non-interlocked) issue runs; the stamp is independent of recovery inventory
 and completion-permit negotiation. There is no pre-push stamp writer.
-A rejected or rolled-back initial completion creates no stamp: absent
-other affirmative evidence, a later refresh is unknown, even if the push succeeded.
-A lost commit acknowledgement can leave completion and the stamp durable;
-exact terminal replay validates that paired outcome. Historical affirmative
-non-closing evidence can restrict a refresh without a stamp; missing evidence
-cannot establish closing authority. Historical publications are not backfilled.
+A rejected or rolled-back initial completion creates no stamp and leaves the
+source non-completed; absent affirmative restriction evidence its refresh is
+unknown and refuses, even if the push succeeded. A lost commit acknowledgement can leave completion and the stamp
+durable; exact terminal replay validates that paired outcome. Historical
+affirmative non-closing evidence can restrict a refresh without a stamp;
+missing evidence never establishes closing authority. Historical publications
+are not backfilled.
+
+A completed issue source with no stamp and no restriction, whose identity,
+ancestry and contract authority validate, refreshes as non-closing (#3420).
+This covers sources completed before the upgrade, by an old worker during a
+mixed rollout, or by any writer that completes without a stamp; age is never
+inferred from a null stamp. Unrestricted failed, running or cancelled sources,
+and invalid or unresolved authority without affirmative restriction evidence,
+still refuse. The non-closing commit scan
+below still applies, so an old PR whose branch commits close the issue is
+refused even on a no-change rework; the owner must remediate those commits.
+A refresh does not add or strip a `Closes #N` already in pull/merge request
+body text outside uzi's owned region, so merging can still close the issue.
+A refusal reads `refresh publication refused: source context could not be
+confirmed (<reason>) for candidate <sha>; publication stopped`; transport,
+malformed, unrecognized-reason and identity-change failures omit the
+parenthetical.
 
 The worker resolves again for the exact candidate before each push attempt,
 including retries, alignment and bridge candidates. Source identity must
@@ -466,14 +515,16 @@ Neither an earlier push nor a human edit is undone by this guard.
 
 This remains structural enforcement for every production run. #1230 D4 is
 implemented but dormant (see [Maintainer outstanding proof on semantic
-runs](#maintainer-outstanding-proof-on-semantic-runs-dormant)); #1231, which
-activates semantic enrollment and the completion audit, is still open.
+runs](#maintainer-outstanding-proof-on-semantic-runs-dormant)); semantic
+enrollment and the completion audit did not ship (#1231 was closed not
+planned), so no production run enforces them.
 Live deployment acceptance has not been performed; mocked tests or an
 existing PR do not establish it.
 
 ## Maintainer outstanding proof on semantic runs (dormant)
 
-**Dormant.** Production enrollment is off until #1231, no production code
+**Dormant.** Production enrollment is off and not planned (#1231 was closed not
+planned; any future activation needs a new approved design), no production code
 writes a semantic planning record, and only tests inject the path; a real run
 is structural or legacy and shows none of this. The rules below describe what
 the built code does once a run is enrolled, and nothing in this section is live

@@ -8,18 +8,19 @@ import (
 	"net/mail"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/theme"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // minPasswordLen is the server-side minimum; the client adds strength
@@ -162,24 +163,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create + unlock the user's vault with the registration password (PRD #32).
-	// Deliberately AFTER the transaction commits: registration holds a
-	// pg_advisory_xact_lock, and the vault's Argon2 KEK derivation inside that lock
-	// would serialize all registrations. The vault row is created in its own
-	// statement here; a crash between user-create and vault-create is self-healing
-	// (the next login's first-unlock creates it). A failure is non-fatal, same as
-	// login — the account exists and the SPA will show the unlock banner.
-	if h.vault != nil {
-		if err := h.vault.Unlock(r.Context(), user.ID, req.Password); err != nil {
-			slog.Error("vault unlock at register", "user", user.ID, "error", err)
-		} else if h.codexUsagePoker != nil {
-			// A successful unlock lets the Codex poller read this user's linked accounts;
-			// poke so their account meters refresh within seconds (PRD #1209). Best-effort.
-			h.codexUsagePoker.Poke(user.ID)
-		}
-	}
-
-	if !h.issueSession(w, user) {
+	if !h.passwordSession(w, r, user, vault.Snapshot(user), req.Password) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, h.sessionPayload(r.Context(), user))
@@ -189,13 +173,26 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 // check-and-insert in a single transaction.
 func (h *Handler) createUserFirstAdmin(r *http.Request, email, hash string, displayName pgtype.Text) (store.User, error) {
 	ctx := r.Context()
-	tx, err := h.pool.Begin(ctx)
+	tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return store.User{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
 
 	qtx := h.q.WithTx(tx)
+	// Admission precedes the registration guard and stays held through commit.
+	if err := qtx.LockSettingsAdmission(ctx); err != nil {
+		return store.User{}, err
+	}
+	// Read the authoritative policy in its own statement after admission.
+	policy, err := qtx.GetVaultPolicy(ctx)
+	if err != nil {
+		return store.User{}, err
+	}
+	mode := store.VaultModeProtected
+	if policy == "optional" {
+		mode = store.VaultModeUnprotected
+	}
 
 	// Serialize registrations: the lock is held until the transaction ends,
 	// so the count-then-insert below is atomic across concurrent callers.
@@ -208,7 +205,8 @@ func (h *Handler) createUserFirstAdmin(r *http.Request, email, hash string, disp
 		return store.User{}, err
 	}
 
-	user, err := qtx.CreateUser(ctx, store.CreateUserParams{
+	user, err := qtx.EnrollUser(ctx, store.EnrollUserParams{
+		VaultMode:    mode,
 		Email:        email,
 		PasswordHash: pgtype.Text{String: hash, Valid: true},
 		DisplayName:  displayName,
@@ -279,6 +277,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	snapshot := vault.Snapshot(user)
 	ok, err := auth.VerifyPassword(req.Password, user.PasswordHash.String)
 	if err != nil {
 		slog.Error("verify password", "error", err)
@@ -298,23 +297,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("set last login", "error", err)
 	}
 
-	// Unlock the vault with the just-verified password so the user's agents can
-	// work this session — including overnight, since the DEK lives in the API, not
-	// the browser (PRD #32). First-ever unlock creates the vault. A failure here
-	// must NOT block login (the session is valid); it can only be a corrupted row,
-	// so log loudly and return the session with the vault left locked (the SPA then
-	// shows the unlock banner). The error never carries the password or a secret.
-	if h.vault != nil {
-		if err := h.vault.Unlock(r.Context(), user.ID, req.Password); err != nil {
-			slog.Error("vault unlock at login", "user", user.ID, "error", err)
-		} else if h.codexUsagePoker != nil {
-			// A successful unlock lets the Codex poller read this user's linked accounts;
-			// poke so their account meters refresh within seconds (PRD #1209). Best-effort.
-			h.codexUsagePoker.Poke(user.ID)
-		}
-	}
-
-	if !h.issueSession(w, user) {
+	if !h.passwordSession(w, r, user, snapshot, req.Password) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, h.sessionPayload(r.Context(), user))
@@ -328,10 +311,19 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	if _, err := h.q.BumpTokenVersion(r.Context(), user.ID); err != nil {
-		slog.Error("bump token version", "error", err)
+	var err error
+	if h.vault != nil {
+		_, err = h.vault.Logout(r.Context(), user.ID)
+	} else {
+		_, err = h.q.BumpTokenVersion(r.Context(), user.ID)
 	}
 	auth.ClearAuthCookies(w, h.cfg.CookieSecure)
+	clearVaultSlot(w)
+	if err != nil {
+		slog.Warn("logout failed", "phase", "revoke", "owner", user.ID)
+		httpx.Error(w, http.StatusServiceUnavailable, "logout could not be confirmed; retry")
+		return
+	}
 	httpx.JSON(w, http.StatusOK, map[string]string{"status": "logged out"})
 }
 
@@ -343,6 +335,45 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, h.sessionPayload(r.Context(), user))
+}
+
+// sessionResponse is the shared Login, Register and Me bootstrap contract.
+// It carries user metadata only; password hashes and vault key material stay out.
+type sessionResponse struct {
+	User                 apitypes.UserDTO          `json:"user"`
+	AutopilotLabel       string                    `json:"autopilot_label"`
+	UziLabel             string                    `json:"uzi_label"`
+	Appearance           sessionAppearanceResponse `json:"appearance"`
+	Theme                string                    `json:"theme"`
+	ThemeOverride        *string                   `json:"theme_override"`
+	DefaultTheme         string                    `json:"default_theme"`
+	Vault                vault.Status              `json:"vault"`
+	HasPassword          bool                      `json:"has_password"`
+	JudgeEnforcedByAdmin bool                      `json:"judge_enforced_by_admin"`
+	EffectiveJudgeModel  string                    `json:"effective_judge_model"`
+}
+
+type sessionAppearanceValues struct {
+	Mode       string `json:"mode"`
+	LightTheme string `json:"light_theme"`
+	DarkTheme  string `json:"dark_theme"`
+	Typeface   string `json:"typeface"`
+}
+
+type sessionAppearanceOverrides struct {
+	Mode       *string `json:"mode"`
+	LightTheme *string `json:"light_theme"`
+	DarkTheme  *string `json:"dark_theme"`
+	Typeface   *string `json:"typeface"`
+}
+
+type sessionAppearanceResponse struct {
+	Mode       string                     `json:"mode"`
+	LightTheme string                     `json:"light_theme"`
+	DarkTheme  string                     `json:"dark_theme"`
+	Typeface   string                     `json:"typeface"`
+	Overrides  sessionAppearanceOverrides `json:"overrides"`
+	Defaults   sessionAppearanceValues    `json:"defaults"`
 }
 
 // sessionPayload builds the auth/session bootstrap body the SPA reads on
@@ -357,7 +388,7 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 // eligibility predicate and has no board payload — it reads it from useAuth(). It
 // also feeds the card's Start/Promote eligibility affordance, which has no board
 // payload of its own to carry it.
-func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[string]any {
+func (h *Handler) sessionPayload(ctx context.Context, user store.User) sessionResponse {
 	autopilotLabel, _ := h.settings.AutopilotLabel(ctx)
 	// PRD #764: the single run-eligibility label the SPA reads to render the "add
 	// the uzi label" runnable affordance. Best-effort like the other labels — a cold
@@ -403,60 +434,29 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 	// names the real model, not a guess.
 	instanceJudgeModel, _ := h.settings.InstanceModel(ctx, settings.KeyJudgeModel)
 	effectiveJudgeModel := agenttmpl.ResolveJudgeModel("claude", user.JudgeModel.String, instanceJudgeModel).Model
-	return map[string]any{
-		"user":            toDTO(user),
-		"autopilot_label": autopilotLabel,
-		// PRD #764: the single run-eligibility label.
-		"uzi_label": uziLabel,
-		// Appearance (PRD #1167): the resolved appearance, the user's raw per-field
-		// overrides (each nullable), and the instance defaults — everything the SPA
-		// needs to paint and to render the Appearance picker's "Use default (<name>)"
-		// affordances without the admin-only settings endpoint.
-		"appearance": map[string]any{
-			"mode":        appr.Mode,
-			"light_theme": appr.Light,
-			"dark_theme":  appr.Dark,
-			"typeface":    appr.Typeface,
-			"overrides": map[string]any{
-				"mode":        textPtrValue(user.AppearanceMode.Valid, user.AppearanceMode.String),
-				"light_theme": textPtrValue(user.LightTheme.Valid, user.LightTheme.String),
-				"dark_theme":  textPtrValue(user.DarkTheme.Valid, user.DarkTheme.String),
-				"typeface":    textPtrValue(user.Typeface.Valid, user.Typeface.String),
+	return sessionResponse{
+		User:           toDTO(user),
+		AutopilotLabel: autopilotLabel,
+		UziLabel:       uziLabel,
+		Appearance: sessionAppearanceResponse{
+			Mode: appr.Mode, LightTheme: appr.Light, DarkTheme: appr.Dark, Typeface: appr.Typeface,
+			Overrides: sessionAppearanceOverrides{
+				Mode:       textPtrValue(user.AppearanceMode.Valid, user.AppearanceMode.String),
+				LightTheme: textPtrValue(user.LightTheme.Valid, user.LightTheme.String),
+				DarkTheme:  textPtrValue(user.DarkTheme.Valid, user.DarkTheme.String),
+				Typeface:   textPtrValue(user.Typeface.Valid, user.Typeface.String),
 			},
-			"defaults": map[string]any{
-				"mode":        iMode,
-				"light_theme": iLight,
-				"dark_theme":  iDark,
-				"typeface":    iTypeface,
-			},
+			Defaults: sessionAppearanceValues{Mode: iMode, LightTheme: iLight, DarkTheme: iDark, Typeface: iTypeface},
 		},
-		// DEPRECATED theme trio (PRD #1167), kept one release for the pre-appearance
-		// SPA. "theme" is the painted-polarity slot of the resolved appearance;
-		// "theme_override" is the raw legacy override (unchanged); "default_theme" is
-		// the resolved instance DARK default (iDark = the legacy-chained value).
-		"theme":          paintedTheme(appr),
-		"theme_override": textPtrValue(override != "", override),
-		"default_theme":  iDark,
-		// Vault status (PRD #32): the SPA shows a 🔒 badge + unlock banner and marks
-		// own queued runs "waiting for vault unlock" when locked. Delivered on the
-		// session payload so the shell needs no extra round-trip; the SPA refreshes
-		// it via AuthContext (window focus, after unlock/lock, on any 409 vault_locked).
-		// `exists` (PRD #45, review N1) lets a passwordless user's SPA pick the
-		// create-passphrase dialog (exists=false) vs the unlock banner (exists=true)
-		// deterministically, without probing for a 409.
-		"vault": map[string]any{
-			"unlocked": h.vaultUnlocked(user.ID),
-			"exists":   h.vaultExists(ctx, user.ID),
-		},
-		// has_password is false for OIDC-only users (NULL password_hash); the SPA uses
-		// it with vault.exists to choose passphrase-create vs unlock wording (PRD #45).
-		"has_password": user.PasswordHash.Valid,
-		// Judge consent (PRD #69 M4). judge_enforced_by_admin drives the RunDefaults
-		// ENFORCED banner; effective_judge_model names the model the user's own token
-		// will run on. The user's RAW per-user judge_model override is read/written
-		// through PUT /me/settings (userSettingsDTO), so it is not duplicated here.
-		"judge_enforced_by_admin": judgeEnforced,
-		"effective_judge_model":   effectiveJudgeModel,
+		// Deprecated trio preserves the painted slot, raw legacy override and
+		// legacy-chained instance dark default.
+		Theme:                paintedTheme(appr),
+		ThemeOverride:        textPtrValue(override != "", override),
+		DefaultTheme:         iDark,
+		Vault:                h.vaultStatus(ctx, user),
+		HasPassword:          user.PasswordHash.Valid,
+		JudgeEnforcedByAdmin: judgeEnforced,
+		EffectiveJudgeModel:  effectiveJudgeModel,
 	}
 }
 
@@ -479,31 +479,6 @@ func paintedTheme(a theme.Appearance) string {
 		return a.Light
 	}
 	return a.Dark
-}
-
-// vaultUnlocked reports whether the user's vault DEK is cached. A nil vault (only
-// in tests; main always wires one) means "no gate", reported as unlocked so the
-// SPA shows no banner and legacy behavior is preserved.
-func (h *Handler) vaultUnlocked(userID uuid.UUID) bool {
-	return h.vault == nil || h.vault.Unlocked(userID)
-}
-
-// vaultExists reports whether the user has a vault row, for the session payload's
-// `exists` bit (PRD #45). A nil vault (tests) reports true ("no gate", consistent
-// with vaultUnlocked) so the SPA offers no create dialog. A DB error is treated as
-// "exists" (conservative: never invite a passphrase-create over a vault we could
-// not confirm is absent — the user can retry, and /api/vault/passphrase is itself
-// create-only as the real backstop).
-func (h *Handler) vaultExists(ctx context.Context, userID uuid.UUID) bool {
-	if h.vault == nil {
-		return true
-	}
-	exists, err := h.vault.Exists(ctx, userID)
-	if err != nil {
-		slog.Error("vault exists for session payload", "user", userID, "error", err)
-		return true
-	}
-	return exists
 }
 
 // AuthConfig returns the operator-set registration policy the register page
@@ -532,30 +507,13 @@ func (h *Handler) AuthConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// issueSessionCookies mints the JWT and sets the auth + CSRF cookies. It logs and
-// returns an error WITHOUT writing a response body, so callers choose how to
-// surface failure: a JSON 500 for the password endpoints (issueSession), a
-// redirect for the OIDC callback (review NB3).
+// issueSessionCookies prepares and emits a browser identity and session cookie
+// pair without unlocking the vault. The OIDC callback owns its error response.
 func (h *Handler) issueSessionCookies(w http.ResponseWriter, user store.User) error {
-	token, err := auth.IssueToken(h.cfg.JWTSecret, user.ID.String(), user.TokenVersion, h.cfg.AuthTokenTTL)
+	session, err := h.freshSession(user)
 	if err != nil {
-		slog.Error("issue token", "error", err)
 		return err
 	}
-	if err := auth.SetAuthCookies(w, token, auth.CookieOptions{Secure: h.cfg.CookieSecure, TTL: h.cfg.AuthTokenTTL}); err != nil {
-		slog.Error("set auth cookies", "error", err)
-		return err
-	}
+	session.emit(w)
 	return nil
-}
-
-// issueSession mints a JWT at the user's current token_version and sets the
-// auth + CSRF cookies. It writes an error response and returns false on
-// failure.
-func (h *Handler) issueSession(w http.ResponseWriter, user store.User) bool {
-	if err := h.issueSessionCookies(w, user); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return false
-	}
-	return true
 }

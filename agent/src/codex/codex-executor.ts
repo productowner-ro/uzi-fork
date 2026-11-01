@@ -1,4 +1,7 @@
+import { acquireCodexOperationScope } from "../codex-operation-scope.js";
+import type { CodexAdmissionReporter } from "./admission-signal.js";
 import { checkCheckpointStop, cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../checkpoint-stop.js";
+import { ExecutorLifetime, type ExecutorSealResult, type ExecutorTerminalSeal } from "./executor-lifetime.js";
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production `CodexExecutor` and the
 // claim-aware DARK selection seam's Codex branch.
 //
@@ -65,6 +68,7 @@ import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-s
 import path from "node:path";
 import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
+import { goConcurrencyEnv } from "../go-concurrency.js";
 import { randomUUID } from "node:crypto";
 import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
@@ -73,12 +77,14 @@ import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
+import { resolveLeadRequest, type LeadRequest } from "../lead-config-report.js";
+import { toLeadObservation } from "../runtime-observation.js";
 import { CodexRequestFailure, RequestError, codexDeferralReason, codexRefreshFailure, isTransientStatus, type PlanCrossCheckFindings, type WorkerClient } from "../client.js";
 import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
-import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
+import { type CodexErrorClassification, CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
-import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
 import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
@@ -108,15 +114,16 @@ import { rmTeardownTree, rmRunnerTeardownTree } from "../rmtree.js";
 import { asText } from "../tool-evidence.js";
 import { installJsDeps, prepareSupervisedInstall, DEFAULT_INSTALL_TIMEOUT_MS, MAX_PROJECT_DIRS, type InstallExec, type JsDepsInstall } from "../js-deps.js";
 import { startDepsInstall, reportDepsInstall } from "../js-deps-provision.js";
+import { readRepoInstructions } from "../repo-instructions.js";
 import {
   evidencesModelProcessing,
   EpochCleanupUnprovenError,
   type BoundaryRequest,
+  type ToolDisposal,
   type BoundaryProcessRequest,
   type CodexExecutionSafety,
   type HarnessAgent,
   type HarnessContextHook,
-  type HarnessEffort,
   type HarnessError,
   type CredentialFreeCaptureContext,
   type CompletedCredentialFreeCapture,
@@ -125,7 +132,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
+import { buildRepoInstructionsContext, interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -154,6 +161,7 @@ import { bindCaptureLaunch, isCaptureRequest } from "../git.js";
 import {
   CodexHarness,
   CodexResumeError,
+  type CodexCatalogEntry,
   type CodexChildSink,
   type CodexLaunchRootResult,
   type CodexLaunchRootSpec,
@@ -163,6 +171,8 @@ import {
 import {
   CodexCallbackBroker,
   CommandDeadlineError,
+  DEFAULT_COMMAND_WALL_MS,
+  LONG_COMMAND_WALL_MS,
   type FileopClient,
   type ScreenPolicy,
   type CapturedMemoryContext,
@@ -178,7 +188,7 @@ import {
 } from "./delegation.js";
 import { CODE_DISPOSITIONS_TOOL, reportCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { buildCodexRunPlan } from "./run-builder.js";
-import { codexSubagentWriteCapabilities } from "./render.js";
+import { codexSubagentWriteCapabilities, sanitizeName } from "./render.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
 import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
@@ -196,9 +206,12 @@ import {
   watchStartupCleanup,
   type StartupCleanupAuthorization,
   DEFAULT_REMOVE_CACHE_TIMEOUT_MS,
+  CommandCacheStartError,
+  measureCommandCache,
   removeCommandCache,
   startCommandCacheHolder,
   type CacheCleanupResult,
+  type CacheMeasureResult,
   type CodexEffectLaunchSpec,
   type CodexRootHandle,
   type CommandCacheHolder,
@@ -213,7 +226,7 @@ import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "./config.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
 import { isSeededOwnerPlan, SEEDED_PLAN_RULES } from "../seeded-plan.js";
-import { CodexAdviceHarness, type LaunchAdviceRootSeam } from "./codex-advice-harness.js";
+import { CodexAdviceHarness, type CodexAdviceHarnessOptions, type LaunchAdviceRootSeam } from "./codex-advice-harness.js";
 import { makePrDescriptionEvalLaunch, type PrDescriptionEvalLaunchTestSeams } from "./pr-description-eval-launch.js";
 import type { AdviceRequest, AdviceResultPolicy } from "../harness.js";
 import {
@@ -315,8 +328,6 @@ function isCommandCacheEnvKey(key: string): boolean {
 
 const DEFAULT_IDLE_MS = 5 * 60 * 1000;
 const DEFAULT_WALL_MS = 60 * 60 * 1000;
-const DEFAULT_COMMAND_WALL_MS = 3_600_000;
-const LONG_COMMAND_WALL_MS = 7_200_000;
 // Issue #1600: the precision/race allowance a refused-park re-drive is armed with when the server's
 // remaining budget has (nearly) run out. The budget fields are whole seconds and the refusal raced
 // the deadline, so a zero-or-negative remainder would otherwise re-trip and re-capture at once. Kept
@@ -379,7 +390,7 @@ interface PauseNowToken {
  * caller that matches on it) plus the pause-now snapshot taken when the trip fired.
  */
 class CodexTurnTripError extends Error {
-  constructor(reason: string, readonly pauseToken: PauseNowToken) {
+  constructor(reason: string, readonly pauseToken: PauseNowToken, readonly processedEvents?: number, readonly retryClassification?: Readonly<CodexErrorClassification>) {
     super(reason);
   }
 }
@@ -1173,6 +1184,8 @@ export async function makeCodexAdviceHarness(
   signal?: AbortSignal,
   refresh?: "deny",
   ownership?: SummaryOwnership,
+  admissionReporter?: CodexAdmissionReporter,
+  operationScope?: CodexAdviceHarnessOptions["operationScope"],
 ): Promise<CodexAdviceHarness> {
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
@@ -1188,7 +1201,7 @@ export async function makeCodexAdviceHarness(
   ownership?.guard();
   registerToken(initial);
   const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny"));
-  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log });
+  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log, admissionReporter, operationScope });
 }
 
 /** One evaluator pass on a caller-provided key. Register CLI signal cleanup before run;
@@ -1410,6 +1423,7 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
  *  ({@link import("./select.js").selectCodexBinding}'s output). */
 export interface CodexAdviceHarnessBuildParams {
   readonly runId: string;
+  readonly claimGeneration?: number;
   readonly binding: CodexBinding;
   readonly signal?: AbortSignal;
   /** PRD #2603: "deny" makes the call's app-server refresh bridge fail instead of calling
@@ -1436,14 +1450,26 @@ export function makeProductionCodexAdviceHarnessFactory(
   client: WorkerClient,
   log: Logger,
   homeRoot: string,
+  deps: { launchRoot?: LaunchAdviceRootSeam } = {},
 ): CodexAdviceHarnessFactory {
   return async (params: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
     const { runId, binding, signal, refresh } = params;
     const ownership = summaryOwnership.get(params);
     ownership?.guard();
-    const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
-    const launchRoot = makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership);
-    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership);
+    // Retain the owner's scope before credential release can yield. A delayed advice
+    // launch must still observe root closure, rather than create a fresh unbound scope.
+    const scope = binding.authMode === "subscription"
+      ? acquireCodexOperationScope(client, runId, params.claimGeneration ?? 0, {}, undefined, undefined, log) : undefined;
+    const close = (): void => { signal?.removeEventListener("abort", close); scope?.close(); };
+    signal?.addEventListener("abort", close, { once: true });
+    if (signal?.aborted) close();
+    try {
+      const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
+      const launchRoot = deps.launchRoot ?? makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership);
+      return await makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
+        binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined,
+        scope ? () => ({ prepare: (signal, check) => scope.prepare("advice", signal, () => { ownership?.guard(); check(); }), close }) : undefined);
+    } catch (error) { close(); throw error; }
   };
 }
 
@@ -1886,6 +1912,9 @@ export interface CodexExecutorDeps {
   /** Issue #1866 M2: the run-start environment probe's bound; defaults to
    *  CODEX_ENV_PROBE_TIMEOUT_MS. Tests lower it to drive the timeout path fast. */
   readonly envProbeTimeoutMs?: number;
+  /** PRD #3247 M2: the Codex `model/list` catalog probe's bound; defaults to
+   *  CODEX_CATALOG_PROBE_TIMEOUT_MS. Tests lower it to drive the timeout path fast. */
+  readonly catalogProbeTimeoutMs?: number;
   /** Issue #1600: the refused-park race allowance; defaults to REDRIVE_RACE_ALLOWANCE_MS. */
   readonly redriveAllowanceMs?: number;
   /** Issue #2099: in-process same-thread retries of a transient provider failure before the
@@ -1912,7 +1941,7 @@ export interface CodexExecutorDeps {
    *  {@link startCommandCacheHolder} when the uid split is active and holds no cache
    *  otherwise; a test injects a fake (which applies regardless of the split). A rejection
    *  means the run proceeds WITHOUT cache variables. */
-  readonly startCacheHolder?: (token: string) => Promise<CommandCacheHolder>;
+  readonly startCacheHolder?: (token: string, opts?: { onSpawned?(settlement: Promise<CacheCleanupResult>): void }) => Promise<CommandCacheHolder>;
   /** Issue #1598: remove a cache whose holder died mid-run (production:
    *  {@link removeCommandCache}), waiting at most `timeoutMs`. Called only when every root
    *  that used it drained. */
@@ -1921,6 +1950,14 @@ export interface CodexExecutorDeps {
   readonly cacheReleaseTimeoutMs?: number;
   /** Issue #1598: the bound on a `--remove-cache` answer (default 2 minutes). */
   readonly cacheRemoveTimeoutMs?: number;
+  /** Issue #3675: rotate the run's command cache once a measurement reaches this many bytes
+   *  (production: UZI_CODEX_COMMAND_CACHE_RUN_BYTES). Absent or 0 disables measurement and
+   *  rotation; no command is ever refused for cache size. */
+  readonly commandCacheRunBytes?: number;
+  /** Issue #3675: measure one run's cache (production: {@link measureCommandCache}). */
+  readonly measureCommandCache?: (token: string, signal: AbortSignal) => Promise<CacheMeasureResult>;
+  /** Issue #3675: the minimum spacing between two measurements of one cache (default 30 s). */
+  readonly cacheMeasureMinIntervalMs?: number;
 }
 
 export interface CodexExecutorOptions {
@@ -1985,6 +2022,7 @@ export interface CodexExecutorOptions {
  * an owned HOME are minted anew per epoch.
  */
 interface EpochSharedContext {
+  readonly repoInstructions?: string;
   readonly provider: CodexProviderConfig;
   readonly binding: CodexBinding;
   readonly worktreePath: string;
@@ -2115,6 +2153,86 @@ function childInterruptDeadlineMs(boundaryDeadlineMs: number): number {
 }
 
 export class CodexExecutor implements Executor {
+  private readonly lifetime = new ExecutorLifetime();
+
+  /** The lifetime's incarnation; a source-use admission binds it (see Executor.executorIncarnation). */
+  get executorIncarnation(): string { return this.lifetime.executorIncarnation; }
+
+  /**
+   * Irreversibly close this executor's admission and, only when every owned producer, observer and
+   * cleanup tail has actually settled with its original successful disposal facts, issue an opaque
+   * seal bound to `sourceUse`. Call it after the last executor-dependent sink/source tail and safety
+   * disposal, never while holding a safety, journal or bare lock. It never joins run()/execute() or
+   * the runner's execution-tail release (those own this call's caller), and never fails or retries
+   * a completed run: any uncertainty yields `{ kind: "unproven" }` and the executor stays closed.
+   * The runner's publishFlightSource awaits it with no bound (see HeldRunCommandCache.observeCleanup).
+   *
+   * Under deferRegistryTeardown the final epoch's registry stays in the outstanding set until the
+   * runner's terminal safety.dispose; the seal then accepts it only through deferredFinalProven,
+   * evaluated both before and after the joins (so a poison during the joins leaves it unproven).
+   * That predicate is one guard; ExecutorLifetime's own inventory check (proven()) also rejects a
+   * revoked disposal. The set is never edited to earn the seal: only after the lifetime has
+   * resolved "sealed" (past its post-join eligibility re-check) is that one registry retired from
+   * the bookkeeping, and only while the predicate still holds. The result object is returned
+   * unchanged so a repeat call still yields the identical cached result.
+   */
+  sealLifetime(sourceUse: object): Promise<ExecutorSealResult> {
+    const wasRunning = this.runActive;
+    return this.lifetime.seal(sourceUse, async () => {
+      // Admission is already closed. Abort only what cannot be waiting on a live run.
+      if (!wasRunning) {
+        this.summaryLifecycleClosed = true;
+        this.provisionAbort?.abort();
+        this.depsInstall?.abort.abort();
+      }
+      await this.closeAndSettlePlanSummary();
+      // Join the actual setup operations (not the capture queue they must never queue behind).
+      await Promise.allSettled(this.epochSetups.keys());
+      await Promise.allSettled([
+        ...this.planFlights, ...this.retiredIntentFlights,
+        ...(this.intentFlight ? [this.intentFlight] : []),
+      ].map(flight => flight.done));
+    }, () => !this.runActive && this.captureOwners === 0 &&
+      (this.unverifiedEpochRegistries.size === 0 || this.deferredFinalProven()))
+      .then(result => {
+        const final = this.deferredFinal;
+        if (result.kind === "sealed" && final && this.deferredFinalProven()) {
+          this.unverifiedEpochRegistries.delete(final.registry);
+        }
+        return result;
+      });
+  }
+
+  /**
+   * The progress observers discard `reportProgress` (fire and forget). The executor owns that tail:
+   * the derived context refuses after closure and the actual push promise is joined by a seal. Only
+   * reportProgress is overridden; every other property reads through to the runner's context.
+   */
+  private ownedProgressContext(ctx: RunContext): RunContext {
+    const push = ctx.reportProgress;
+    if (!push) return ctx;
+    return Object.create(ctx, {
+      reportProgress: {
+        enumerable: true,
+        value: (progress: MilestoneProgress, frozen?: readonly Milestone[]): Promise<void> =>
+          this.lifetime.admit(async () => { await push.call(ctx, progress, frozen); }),
+      },
+    }) as RunContext;
+  }
+
+  /**
+   * Raw auth refresh is a lifetime producer. The pinned auth owner retains and re-invokes its bridge
+   * after cancellation, so the bridge itself refuses once the lifetime is closed, before any
+   * credential work, and the actual refresh is joined by a seal when it was admitted earlier.
+   */
+  private lifetimeBoundRefreshBridge(bridge: CodexSubscriptionRefreshBridge): CodexSubscriptionRefreshBridge {
+    return { refresh: request => this.lifetime.admit(() => bridge.refresh(request)) };
+  }
+
+  acceptsLifetimeSeal(seal: unknown, sourceUse: object): seal is ExecutorTerminalSeal {
+    return this.lifetime.accepts(seal, sourceUse);
+  }
+
   /** M3/M4 (PRD #1171): the Codex outer safety facade, POPULATED at the top of `run()` (before
    *  any model work) with the per-sink auth-mode reconcile closure. The runner's durability
    *  sinks route through it (m4). Absent means Claude/stub — this executor always sets it, so
@@ -2139,6 +2257,7 @@ export class CodexExecutor implements Executor {
    * `incomplete` rather than trusting an unobserved drain.
    */
   async settleForCredentialFreeCapture(deadlineMs: number, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeCaptureSettlement> {
+    this.lifetime.assertOpen();
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
     const budget = MaintenanceBudget.current();
     const remaining = budget?.cap(deadlineMs) ?? (() => Math.max(0, deadlineAt - Date.now()));
@@ -2248,12 +2367,29 @@ export class CodexExecutor implements Executor {
   private unstartedLegClosed = false;
   private executionStarted = false;
   private captureRevision = 0;
+  private readonly rootAdmissionWaits = new Set<AbortController>();
   private captureCleanupRemaining?: () => number;
   private captureTail: Promise<void> = Promise.resolve();
   private provisionAbort?: AbortController;
   private provisionDeadline?: (deadlineAt: number) => void;
   private readonly epochSetups = new Map<Promise<unknown>, Set<ExecutionRegistry> | undefined>();
   private runActive = false;
+  /** Under deferRegistryTeardown: the final epoch's registry and safety, set only when run()'s
+   *  deferred teardown succeeded. Cleared at the start of every run leg. */
+  private deferredFinal?: { readonly registry: ExecutionRegistry; readonly safety: CodexExecutionSafetyImpl };
+
+  /**
+   * True only when the sole outstanding registry is the deferred final epoch and its safety's own
+   * settled terminal disposal is still accepted by the registry (exact witness, unchanged poison
+   * revision and cursors, every root reaped and disposed). Cleared tables or state() never count.
+   */
+  private deferredFinalProven(): boolean {
+    const final = this.deferredFinal;
+    if (!final || this.unverifiedEpochRegistries.size !== 1 || !this.unverifiedEpochRegistries.has(final.registry)) return false;
+    if (this.epochSafeties.get(final.registry) !== final.safety || final.safety !== this.safety) return false;
+    const outcome = final.safety.terminalDisposalOutcome();
+    return outcome !== undefined && outcome.kind === "disposed" && final.safety.acceptsTerminalDisposal(outcome);
+  }
 
   /** Reserve synchronously: a later capture must queue behind the entire operation. */
   private async withCaptureOwnership<T>(action: () => Promise<T>): Promise<T> {
@@ -2270,11 +2406,13 @@ export class CodexExecutor implements Executor {
   private beforeCaptureDrain?: () => Promise<void>;
   private captureMayHaveDrained?: () => boolean;
   private epochAdmission?: () => void;
+  private epochSourceAdmission?: () => Promise<void>;
   private captureLifecycleSignal?: AbortSignal;
   private reaperAttempt?: RunContext["runAttempt"];
   private captureReaperAttempt?: Readonly<SdkAttemptEnv>;
 
   private assertCaptureAdmission(revision = this.captureRevision): void {
+    this.lifetime.assertOpen();
     if (this.unstartedLegClosed || this.captureOwners || revision !== this.captureRevision) {
       throw new TrustedExecutionRefusal("codex epoch admission closed for capture");
     }
@@ -2288,6 +2426,7 @@ export class CodexExecutor implements Executor {
       this.assertCaptureAdmission(revision);
       return action();
     });
+    this.lifetime.join(pending);
     this.epochSetups.set(pending, registries);
     try { return await pending; }
     finally { this.epochSetups.delete(pending); }
@@ -2300,6 +2439,8 @@ export class CodexExecutor implements Executor {
     signal?: AbortSignal,
     attempt?: Readonly<SdkAttemptEnv>,
   ): Promise<{ kind: "observed_empty"; value: T } | { kind: "incomplete"; errors: readonly HarnessError[] }> {
+    // Refuse before any state change: a closed lifetime admits no capture.
+    this.lifetime.assertOpen();
     // Each queued caller owns a value snapshot, never a mutable caller reference.
     const captureAttempt = attempt === undefined ? undefined : Object.freeze({
       marker: attempt.marker, cloneKey: attempt.cloneKey, clonePath: attempt.clonePath,
@@ -2313,6 +2454,8 @@ export class CodexExecutor implements Executor {
     }
     this.captureOwners++;
     this.captureRevision++;
+    for (const waiting of this.rootAdmissionWaits)
+      waiting.abort(new TrustedExecutionRefusal("codex root dispatch invalidated by capture"));
     this.summaryLifecycleClosed = true;
     this.depsInstall?.abort.abort();
     const signals = [signal, purpose === "capture" ? this.captureLifecycleSignal : undefined].filter((value): value is AbortSignal => value !== undefined);
@@ -2428,12 +2571,13 @@ export class CodexExecutor implements Executor {
       if (safety === undefined) {
         if (remaining() <= 0) return incomplete("codex capture deadline expired");
         // Use precisely the production boundary adapter, with no reconcile/provider/cache lane.
-        const registry = new ExecutionRegistry(newLocalExecutionEpoch(0));
+        const registry = new ExecutionRegistry(newLocalExecutionEpoch(0), this.lifetime);
         safety = createCodexExecutionSafety(registry,
           async () => { throw new TrustedExecutionRefusal("capture-only root lane"); },
           async () => { throw new TrustedExecutionRefusal("capture-only reconcile lane"); },
           undefined,
-          makeBoundaryProcessSpawner(this.deps.launchEffectRoot ?? productionEffectLaunch,
+          makeBoundaryProcessSpawner(
+            ((...args) => this.lifetime.admit(() => (this.deps.launchEffectRoot ?? productionEffectLaunch)(...args))) as EffectLaunch,
             this.opts.commandSandbox ?? "required", this.log), undefined, undefined,
           { reaperAttempt: () => this.captureReaperAttempt ?? this.reaperAttempt });
         this.unverifiedEpochRegistries.add(registry);
@@ -2670,19 +2814,25 @@ export class CodexExecutor implements Executor {
         ? this.ownSummaryFactory(opts.codexAdviceHarnessFactory) : undefined,
     });
     this.deps = deps;
-    this.sessionStore = deps.sessionStore ?? CodexSessionStore;
+    const sessions = deps.sessionStore ?? CodexSessionStore;
+    this.sessionStore = {
+      adopt: (...args) => this.lifetime.admit(() => sessions.adopt(...args)),
+      inspect: (...args) => this.lifetime.admit(() => sessions.inspect(...args)),
+      remove: (...args) => this.lifetime.admit(() => sessions.remove(...args)),
+      persist: (...args) => this.lifetime.admit(() => sessions.persist(...args)),
+    };
   }
 
   /** Bind only the default intent/plan runner; other advice callers retain their policy. */
   private ownSummaryFactory(build: CodexAdviceHarnessFactory): CodexAdviceHarnessFactory {
-    const factory: CodexAdviceHarnessFactory = async params => {
+    const factory: CodexAdviceHarnessFactory = params => this.lifetime.admit(async () => {
       this.assertCaptureAdmission();
       const revision = this.captureRevision;
       const deadlineAt = summaryCallDeadlines.get(params);
       if (deadlineAt === undefined) throw new TrustedExecutionRefusal("summary call deadline missing");
       const remaining = () => Math.max(0, Math.min(deadlineAt - Date.now(),
         this.captureCleanupRemaining?.() ?? Infinity));
-      const registry = new ExecutionRegistry(newLocalExecutionEpoch(0));
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(0), this.lifetime);
       const reservation = registry.reserveLaunch("provider");
       if (reservation.kind !== "reserved") throw new TrustedExecutionRefusal("summary launch admission closed");
       let launchAttempted = false;
@@ -2752,7 +2902,7 @@ export class CodexExecutor implements Executor {
         } catch { /* Disposal still joins every known root below. */ }
         try {
           const disposed = await registry.disposeTools(remaining());
-          if (drained && disposed.kind === "disposed" && !registry.isPoisoned()) {
+          if (drained && registry.acceptsTerminalDisposal(disposed) && !registry.isPoisoned()) {
             this.unverifiedEpochRegistries.delete(registry);
             this.epochSafeties.delete(registry);
           }
@@ -2763,16 +2913,16 @@ export class CodexExecutor implements Executor {
         const harness = await build(params);
         ownedSummaryHarnesses.set(harness, () => registry.markLaunchCleanupUnconfirmed());
         const run = harness.run.bind(harness);
-        harness.run = async (request, policy) => {
+        harness.run = (request, policy) => this.lifetime.admit(async () => {
           try { return await run(request, policy); }
           finally { await finish(); }
-        };
+        });
         return harness;
       } catch (error) {
         await finish();
         throw error;
       }
-    };
+    });
     ownedSummaryFactories.add(factory);
     return factory;
   }
@@ -2816,8 +2966,16 @@ export class CodexExecutor implements Executor {
     this.assertCaptureAdmission();
     if (this.runActive) throw new TrustedExecutionRefusal("codex run already active");
     this.runActive = true;
+    const operation = this.opts.binding.authMode === "subscription" && !ctx.prepareCodexRootDispatch
+      ? acquireCodexOperationScope(this.opts.client, ctx.runId, ctx.claimGeneration ?? 0, {}, undefined, undefined, this.log) : undefined;
+    operation?.own();
+    if (operation) ctx = { ...ctx,
+      codexRootAdmissionActive: () => operation.controller.active(),
+      prepareCodexRootDispatch: (signal, check, kind = "root") => operation.prepare(kind,
+        AbortSignal.any([signal, ...[ctx.terminalLifecycleSignal].filter((s): s is AbortSignal => !!s)]), check),
+    };
     try { return await this.runLeg(ctx); }
-    finally { this.runActive = false; }
+    finally { operation?.close(); this.runActive = false; }
   }
 
   private async runLeg(ctx: RunContext): Promise<ExecutorResult> {
@@ -2836,6 +2994,7 @@ export class CodexExecutor implements Executor {
     let summaryResult: ExecutorResult | undefined;
     this.depsInstall = undefined;
     this.safety = undefined;
+    this.deferredFinal = undefined;
     // Everything that needs the worktree is built at the TOP of run() (the executor is
     // constructed before the claim's worktree exists).
     const binding = this.opts.binding;
@@ -2851,6 +3010,30 @@ export class CodexExecutor implements Executor {
           baseUrl: this.deps.appServerAuthOpenAIBaseUrlForTest,
         };
     const worktreePath = ctx.worktreePath;
+    // Snapshot and frame once per execution, before provisioning, dependency installation,
+    // or agent writes. Every root request and replacement epoch shares these bytes and nonce.
+    let repoInstructions: string | undefined;
+    if (ctx.repoClaudemdEnabled) {
+      const result = await readRepoInstructions(worktreePath);
+      if ("text" in result) {
+        repoInstructions = buildRepoInstructionsContext(result.text);
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: repoInstructions
+              ? `repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(result.text, "utf8")} bytes)`
+              : "repo instructions: not injected (empty)",
+          },
+        });
+      } else {
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: `repo instructions: not injected (${result.dropped})` },
+        });
+      }
+    }
     this.reaperAttempt = ctx.runAttempt ? Object.freeze({ ...ctx.runAttempt }) : undefined;
     const storeDir = path.join(this.homeRoot, "codex-session-store");
     const boundaryDeadlineMs = this.deps.boundaryDeadlineMs ?? DEFAULT_BOUNDARY_DEADLINE_MS;
@@ -2981,7 +3164,7 @@ export class CodexExecutor implements Executor {
     lifecycleSignal.addEventListener("abort", intentAbort, { once: true });
     const summaryResultAllowed = (): boolean => !lifecycleSignal.aborted
       && !ctx.cancelRequested?.() && !ctx.claimFenced?.();
-    const summaryAllowed = (): boolean => !this.captureOwners && !summaryState.closed && !this.summaryLifecycleClosed
+    const summaryAllowed = (): boolean => this.lifetime.isOpen() && !this.captureOwners && !summaryState.closed && !this.summaryLifecycleClosed
       && summaryResultAllowed();
     const summaryBinding = {
       auth_mode: binding.authMode, access_token: binding.accessToken, capability: binding.capability,
@@ -2994,7 +3177,7 @@ export class CodexExecutor implements Executor {
     const prdInputP = summariesOn
       ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
     const summaryInputs = async () => ({
-      claim: { run_id: ctx.runId, secrets: {
+      claim: { run_id: ctx.runId, claim_generation: ctx.claimGeneration, secrets: {
         codex: this.opts.summaryClaimCodex !== undefined ? this.opts.summaryClaimCodex : summaryBinding,
       } },
       token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
@@ -3133,7 +3316,7 @@ export class CodexExecutor implements Executor {
       const provisionAbort = new AbortController();
       this.provisionAbort = provisionAbort;
       const provisionSignal = AbortSignal.any([provisionAbort.signal, lifecycleSignal]);
-      const provisionRegistry = new ExecutionRegistry(newLocalExecutionEpoch(0));
+      const provisionRegistry = new ExecutionRegistry(newLocalExecutionEpoch(0), this.lifetime);
       const provisionRegistries = new Set([provisionRegistry]);
       let provisionClean = false;
       let provisionDeadlineAt = Date.now() + 10 * 60_000;
@@ -3247,7 +3430,7 @@ export class CodexExecutor implements Executor {
           } catch { /* Disposal still owns every returned root. */ }
           try {
             const disposed = await provisionRegistry.disposeTools(provisionRemaining());
-            provisionClean = drained && disposed.kind === "disposed" && !provisionRegistry.isPoisoned();
+            provisionClean = drained && provisionRegistry.acceptsTerminalDisposal(disposed) && !provisionRegistry.isPoisoned();
           } catch { provisionClean = false; }
           if (provisionClean) {
             this.unverifiedEpochRegistries.delete(provisionRegistry);
@@ -3270,7 +3453,7 @@ export class CodexExecutor implements Executor {
       let installDeps = this.deps.installDeps;
       if (!installDeps) {
         installerCleanupClean = false;
-        const registry = new ExecutionRegistry(newLocalExecutionEpoch(0));
+        const registry = new ExecutionRegistry(newLocalExecutionEpoch(0), this.lifetime);
         let admissionOpen = true;
         // Discovery and the sequential manager count are bounded by installJsDeps.
         // Every root also spends its original command deadline, never a renewed wait.
@@ -3380,7 +3563,7 @@ export class CodexExecutor implements Executor {
             } catch { /* Attempt disposal even after an unsuccessful observation. */ }
             try {
               const disposed = await registry.disposeTools(remaining());
-              installerCleanupClean = drained && disposed.kind === "disposed" && !registry.isPoisoned();
+              installerCleanupClean = drained && registry.acceptsTerminalDisposal(disposed) && !registry.isPoisoned();
             } catch { installerCleanupClean = false; }
             if (installerCleanupClean) {
               this.unverifiedEpochRegistries.delete(registry);
@@ -3418,12 +3601,28 @@ export class CodexExecutor implements Executor {
       // failure: commands then get no cache variables (Go/npm fall back to a cold cache
       // inside the per-command private tmp, which the supervisor still cleans).
       const startCacheHolder = this.deps.startCacheHolder
-        ?? (uidSplitActive() ? (token: string) => startCommandCacheHolder(token) : undefined);
+        ?? (uidSplitActive() ? (token: string, opts?: { onSpawned?(settlement: Promise<CacheCleanupResult>): void }) =>
+          startCommandCacheHolder(token, opts ?? {}) : undefined);
       if (startCacheHolder !== undefined) {
         try {
           this.assertCaptureAdmission(setupRevision);
+          // Issue #3675: measurement and rotation exist only with a positive budget.
+          const budgetBytes = this.deps.commandCacheRunBytes ?? 0;
+          const rotation: CacheRotationOptions | undefined = budgetBytes > 0 ? {
+            budgetBytes,
+            measure: this.deps.measureCommandCache ?? ((token, signal) => measureCommandCache(token, { signal })),
+            startHolder: (token, opts) => startCacheHolder(token, opts),
+            admitCapture: () => this.assertCaptureAdmission(),
+            remove: this.deps.removeCommandCache ?? ((token, timeoutMs) => removeCommandCache(token, { timeoutMs })),
+            log: this.log,
+            waits: {
+              releaseMs: this.deps.cacheReleaseTimeoutMs ?? DEFAULT_CACHE_RELEASE_TIMEOUT_MS,
+              removeMs: this.deps.cacheRemoveTimeoutMs ?? DEFAULT_REMOVE_CACHE_TIMEOUT_MS,
+            },
+            ...(this.deps.cacheMeasureMinIntervalMs === undefined ? {} : { minIntervalMs: this.deps.cacheMeasureMinIntervalMs }),
+          } : undefined;
           runCache = new HeldRunCommandCache(await this.trackEpochSetup(() => startCacheHolder(randomUUID())),
-            registry => this.completedCaptures.get(registry));
+            registry => this.completedCaptures.get(registry), this.lifetime, rotation);
         } catch (error) {
           this.log.warn("codex command cache unavailable; commands run without a shared cache", {
             error: errMessage(error),
@@ -3453,13 +3652,15 @@ export class CodexExecutor implements Executor {
       // drives `spawnBoundaryProcess`); it stays a fail-closed reject stub. The reconcile + eviction
       // closures write the SHARED released-token set and committed-generation cell, so credential
       // state is continuous across a recreation.
-      const launchEffectRoot = this.deps.launchEffectRoot ?? productionEffectLaunch;
+      const rawEffectLaunch = this.deps.launchEffectRoot ?? productionEffectLaunch;
+      const launchEffectRoot: EffectLaunch = (...args) => this.lifetime.admit(() => rawEffectLaunch(...args));
       const spawnBoundaryRoot: SpawnRootSeam =
         this.deps.spawnBoundaryRoot ??
         ((): Promise<RegisteredRoot> =>
           Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
       const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox, this.log, runCache);
       const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
+        this.lifetime.assertOpen();
         const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
         await this.settleOwnedSummariesBeforeCredentials(request.deadlineMs);
         return installState.reconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) }, signal);
@@ -3499,6 +3700,7 @@ export class CodexExecutor implements Executor {
       // its own fresh credential + owned HOME on top of it.
       const claimRedact = ctx.redactText ?? ((s: string): string => s);
       const shared: EpochSharedContext = {
+        repoInstructions,
         provider,
         binding,
         vaultLock: pauseNow.vaultLock,
@@ -3555,20 +3757,49 @@ export class CodexExecutor implements Executor {
       let lastSessionId = ctx.sessionId ?? undefined;
       const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
       const wall: RunWall = { remainingMs: wallMs, maxServedMs: wallMs, claimMs: wallMs };
+      let silentRevision: { cause: TransientRecoveryError; needsRebuild: boolean; checkedAt: number; ownerWaiting?: boolean } | undefined;
+      const chargeSilentRecovery = (): void => {
+        if (!silentRevision?.needsRebuild || silentRevision.ownerWaiting) return;
+        const now = Date.now();
+        wall.remainingMs -= Math.max(0, now - silentRevision.checkedAt);
+        silentRevision.checkedAt = now;
+      };
+      const remainingSilentWall = (): number => {
+        chargeSilentRecovery();
+        return Math.max(0, wall.remainingMs);
+      };
+      const observeOwnerWait: PlanRevisionOwnerWaitObserver = waiting => {
+        if (!silentRevision?.needsRebuild) return;
+        if (waiting) chargeSilentRecovery();
+        else silentRevision.checkedAt = Date.now();
+        silentRevision.ownerWaiting = waiting;
+      };
       let completionAttempted = false;
       const completion = { history: new CompletionHistory(), attempted: () => completionAttempted };
       this.epochAdmission = () => {
         this.assertCaptureAdmission();
         // Capture continuation adds this fence. Ordinary epoch startup retains its
         // established approval/installer interruption routing.
-        if (this.captureRevision === 0) return;
+        if (this.captureRevision === 0 && !silentRevision) return;
+        chargeSilentRecovery();
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         if (ctx.claimFenced?.() || lifecycleSignal.aborted) throw new CodexRequestFailure("parent_abort");
-        if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
         const pending = this.pendingInterruption(ctx, pauseNow, wall);
         if (pending === REASON_CANCEL) throw new Error(REASON_CANCEL);
-        if (pauseNow.pending || ((epochIndex > 0 || this.captureRevision > 0)
+        if (silentRevision && pending === REASON_WALL) throw this.tripError(REASON_WALL, pauseNow.capture(), 0);
+        if (silentRevision && pending === REASON_PAUSE) throw new PauseNowSignal();
+        if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
+        if (pauseNow.pending || ((epochIndex > 0 || this.captureRevision > 0 || silentRevision !== undefined)
           && (pending === REASON_PAUSE || pending === REASON_WALL))) throw new PauseNowSignal();
+      };
+      this.epochSourceAdmission = async () => {
+        if (!silentRevision) return;
+        const outcome = await ctx.beforePlanRevisionTurn?.(
+          silentRevision?.needsRebuild ? observeOwnerWait : undefined,
+          silentRevision?.needsRebuild ? remainingSilentWall : undefined);
+        if (outcome === "wall") throw this.tripError(REASON_WALL, pauseNow.capture(), 0);
+        // Ownership probes await network I/O; check controls afterwards.
+        this.epochAdmission?.();
       };
       this.assertCaptureAdmission(setupRevision);
       epoch = await this.withCaptureOwnership(async () => {
@@ -3601,6 +3832,9 @@ export class CodexExecutor implements Executor {
         if (this.unverifiedEpochRegistries.has(old.registry)) {
           throw new EpochCleanupUnprovenError(old.safety);
         }
+        // Last disposal must precede the exact-source/claim/control proof.
+        await this.epochSourceAdmission?.();
+        this.epochAdmission?.();
         epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex, { persistAfterLaunchOnly: true });
         this.safety = epoch.safety;
         reapedSinceLastPersist = false;
@@ -3707,17 +3941,95 @@ export class CodexExecutor implements Executor {
         // turn and every revision turn each get one nudge and one owner park.
         let nudged = false;
         let fallbackUsed = false;
+        const routeSilentInterruption = async (): Promise<{ kind: "walled" } | { kind: "held"; reason: string } | undefined> => {
+          if (!silentRevision?.needsRebuild) return;
+          chargeSilentRecovery();
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          const pending = this.pendingInterruption(ctx, pauseNow, wall);
+          if (pending === REASON_CANCEL) throw new Error(REASON_CANCEL);
+          if (pending === REASON_PAUSE) throw new PauseNowSignal();
+          if (pending !== REASON_WALL) return;
+          if (ctx.completionInterlock && (completion.attempted() || completion.history.priorAttempt)) {
+            if (await routeHold(REASON_WALL, true, { allowDegradedCapture: true })) return { kind: "held", reason: REASON_WALL };
+            return { kind: "walled" };
+          }
+          const outcome = await this.parkAtWall(ctx, { completedCount: 0 }, beforeReapingSink, pauseNow, pauseNow.capture(), wall, completion);
+          silentRevision.checkedAt = Date.now();
+          if (outcome === "held") return { kind: "held", reason: REASON_WALL };
+          if (outcome === "parked") return { kind: "walled" };
+          if (outcome === "unwired") throw this.tripError(REASON_WALL, pauseNow.capture(), 0);
+          return;
+        };
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
           let turn: Awaited<ReturnType<CodexExecutor["driveTurnWithWallPark"]>>;
           try {
-            if (humanRevision) await ctx.beforePlanRevisionTurn?.();
-            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion);
+            const stopped = await routeSilentInterruption();
+            if (stopped) return stopped;
+            // Recovery carries measured-silence readiness into an owner replacement.
+            // Debit its allowance before every reconstruction, including credential failures.
+            if (humanRevision) {
+              const outcome = await ctx.beforePlanRevisionTurn?.(
+                silentRevision?.needsRebuild ? observeOwnerWait : undefined,
+                silentRevision?.needsRebuild ? remainingSilentWall : undefined);
+              if (outcome === "wall") {
+                const stopped = await routeSilentInterruption();
+                if (stopped) return stopped;
+                continue;
+              }
+            }
+            if (humanRevision && silentRevision?.needsRebuild) {
+              await recreateEpochAfterReap();
+              chargeSilentRecovery();
+              silentRevision.needsRebuild = false;
+            }
+            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, shared.repoInstructions, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, undefined, undefined, undefined, undefined, false, !humanRevision, humanRevision);
           } catch (error) {
-            if (!humanRevision || !(error instanceof TransientRecoveryError) || !error.providerOrigin || !ctx.retryPlanRevisionTurn) throw error;
-            // The runner hook owns backoff and control checks. Redrive without a new cap,
-            // wall-budget reset, or epoch; clarification/prose recovery state stays local.
-            await ctx.retryPlanRevisionTurn(error);
+            if (silentRevision?.needsRebuild && error instanceof CodexTurnTripError && error.message === REASON_WALL) {
+              const stopped = await routeSilentInterruption();
+              if (stopped) return stopped;
+              continue;
+            }
+            let cause = error;
+            if (humanRevision && error instanceof TransientRecoveryError && error.idleStallKind === "zero_evidence") {
+              silentRevision = { cause: error, needsRebuild: true, checkedAt: Date.now() };
+              // Persist already happened in the measured-idle branch. Dispose before
+              // the hook, even when it will restore the exhausted owner gate.
+              await this.withCaptureOwnership(async () => {
+                await epoch!.dispose();
+                if (this.unverifiedEpochRegistries.size)
+                  throw new EpochCleanupUnprovenError(epoch!.safety);
+              });
+              chargeSilentRecovery();
+              const stopped = await routeSilentInterruption();
+              if (stopped) return stopped;
+            } else if (humanRevision && silentRevision?.needsRebuild &&
+                (error instanceof CodexCredentialDeferredError || error instanceof CodexInitialCredentialUnavailableError)) {
+              // Includes half-built replacement registries, not just the predecessor.
+              if (this.unverifiedEpochRegistries.size) throw new EpochCleanupUnprovenError(epoch!.safety);
+              // Failed construction cleanup can itself spend the wall. Route it
+              // before another backoff or an exhausted owner wait.
+              const stopped = await routeSilentInterruption();
+              if (stopped) return stopped;
+              cause = silentRevision.cause;
+            }
+            if (!humanRevision || !(cause instanceof TransientRecoveryError) ||
+                (!cause.providerOrigin && cause.idleStallKind !== "zero_evidence")) throw error;
+            if (!ctx.retryPlanRevisionTurn) throw cause.idleStallKind === "zero_evidence" ? cause.originalIdle ?? cause : cause;
+            try {
+              const outcome = await ctx.retryPlanRevisionTurn(cause,
+                silentRevision?.needsRebuild ? observeOwnerWait : undefined,
+                silentRevision?.needsRebuild ? remainingSilentWall : undefined);
+              if (outcome === "wall") {
+                const stopped = await routeSilentInterruption();
+                if (stopped) return stopped;
+              }
+            } catch (rejected) {
+              // Only identity rejection denotes unsupported recovery. Controls and
+              // replacement-revise exceptions must retain their own routing.
+              if (rejected === cause && cause.idleStallKind === "zero_evidence") throw cause.originalIdle ?? cause;
+              throw rejected;
+            } finally { chargeSilentRecovery(); }
             continue;
           }
           // Issue #1764: an owner `now` pause dropped the plan turn. The runner's plan-phase catch
@@ -3824,7 +4136,7 @@ export class CodexExecutor implements Executor {
           // The revise turn resumes the plan thread, which holds the plan being revised.
           let reviseTurn: Awaited<ReturnType<typeof drivePlan>>;
           try {
-            if (reapedSinceLastPersist) await recreateEpochAfterReap();
+            if (reapedSinceLastPersist && !silentRevision?.needsRebuild) await recreateEpochAfterReap();
             reviseTurn = await drivePlan(verdict.automatic === true
               ? buildAutomaticRevisionPrompt("plan", { summary: feedback, items: verdict.items ?? [] }, undefined)
               : buildRevisePlanPrompt(feedback), !automatic);
@@ -3842,6 +4154,7 @@ export class CodexExecutor implements Executor {
             throw new TrustedExecutionRefusal("codex plan turn produced no plan on revision");
           }
           verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), settles, planResult.semanticSubmission);
+          silentRevision = undefined;
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
@@ -3975,6 +4288,8 @@ export class CodexExecutor implements Executor {
       // turn's milestones_completed reaches the ExecutorResult after the loop breaks.
       let declaredMilestonesCompleted: string[] | undefined;
       let declaredReportOnly = false;
+      let declaredSummary: string | undefined;
+      let declaredProposal: ReducedTurnResult["proposal"];
       // PRD #1798 M2 (D4, D13 parity with sdk-executor): the latched signal_done pr_summary,
       // stamped with the worktree HEAD on the done turn that declared it.
       let declaredPrSummary: PrSummaryClaim | undefined;
@@ -4012,6 +4327,8 @@ export class CodexExecutor implements Executor {
         ...(pausedAt ? { pausedAt } : {}),
         ...(isIssueRun && scopeCapped ? { scopeCapped } : {}),
         ...(isIssueRun && declaredReportOnly ? { reportOnly: true } : {}),
+        ...((isIssueRun || resolveRunKind(ctx.kind) === "prompt") && declaredSummary !== undefined ? { summary: declaredSummary } : {}),
+        ...(declaredProposal !== undefined ? { proposal: declaredProposal } : {}),
         // Issue #1674 (PRD #265 M1 parity): forward the declared finished-milestone ids on issue
         // runs only, OMITTED when nothing was declared, as sdk-executor does; runner.ts reads it.
         ...(isIssueRun && declaredMilestonesCompleted !== undefined ? { milestonesCompleted: declaredMilestonesCompleted } : {}),
@@ -4215,17 +4532,17 @@ export class CodexExecutor implements Executor {
         for (let round = 0; ; round++) {
           // Issue #1674 (PRD #1064 parity): each report_progress observation pushes at once and emits
           // its started / reported-complete frames exactly once, diffed from the last known progress.
-          const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
+          const onProgress = makeProgressObserver(this.ownedProgressContext(ctx), latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, onProgress, round === 0 ? firstEventHandler : undefined, undefined,
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, shared.repoInstructions, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, onProgress, round === 0 ? firstEventHandler : undefined, undefined,
             systemFollowUp === undefined && round === 0 ? (prompt) => {
               if (interruptedOwnerDispatched) return prompt;
               const calls = interruptedCallsNote(ctx.getInterruptedCalls?.());
               const snapshot = interruptedSnapshotNote(ctx.interruptedSnapshot);
               interruptedOwnerDispatched = true;
               return [prompt, snapshot, calls].filter(Boolean).join("\n\n");
-            } : undefined, ownerCompletionRecheck);
+            } : undefined, ownerCompletionRecheck, true);
           if (implTurn.kind === "walled") return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, agentSelection, completionHeld: { reason: implTurn.reason } };
           // Issue #1764: an owner `now` pause dropped the turn and ctx.parkForPause parked the run.
@@ -4251,6 +4568,13 @@ export class CodexExecutor implements Executor {
             declaredMilestonesCompleted = result.milestonesCompleted;
             for (const id of result.milestonesCompleted) seenCompletedIds.add(id);
           }
+          // Keep the latest declaration across later turns that omit it.
+          if (!hasQuestions && result.summary !== undefined) {
+            declaredSummary = result.summary;
+          }
+          if (!hasQuestions && result.proposal !== undefined) {
+            declaredProposal = result.proposal;
+          }
           // PRD #1798 M2: last-wins, and stamped with the worktree HEAD only on the turn that
           // carried the claims, so a later bare signal_done keeps the earlier claims with the sha
           // they were made at. A turn carrying claims is always a done turn: scanSignals (via the
@@ -4267,7 +4591,7 @@ export class CodexExecutor implements Executor {
             let disposition: Awaited<ReturnType<NonNullable<RunContext["requestParkRun"]>>> | undefined;
             const outcome = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer,
               "implement", nextPrompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker,
-              shared.selection.current, at, shared.scrubProjected, beforeReapingSink, pauseNow,
+              shared.selection.current, shared.repoInstructions, at, shared.scrubProjected, beforeReapingSink, pauseNow,
               recreateEpochAfterReap, completion, onProgress, undefined, async () => {
                 await beforeReapingSink();
                 disposition = await ctx.requestParkRun!(at);
@@ -4604,6 +4928,7 @@ export class CodexExecutor implements Executor {
         this.beforeCaptureDrain = undefined;
         this.captureMayHaveDrained = undefined;
         this.epochAdmission = undefined;
+        this.epochSourceAdmission = undefined;
         summaryState.closed = true;
         await this.closeAndSettlePlanSummary();
         if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.() || lifecycleSignal.aborted)) {
@@ -4631,7 +4956,13 @@ export class CodexExecutor implements Executor {
           // reap, so re-persisting would only overwrite that generation with an empty one.
           if (beforeReapPersist) await beforeReapPersist;
           if (!reapedSinceLastPersist) await epoch.persistSession();
-          await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown);
+          const finalClean = await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown, undefined,
+            epoch.safety instanceof CodexExecutionSafetyImpl ? epoch.safety : undefined);
+          // The deferred final registry stays outstanding until the runner's terminal safety.dispose
+          // proves it (see deferredFinalProven); remember the exact pair that proof must name.
+          if (this.deps.deferRegistryTeardown && finalClean && epoch.safety instanceof CodexExecutionSafetyImpl) {
+            this.deferredFinal = { registry: epoch.registry, safety: epoch.safety };
+          }
         }
         // (C) Evict the DURING-run released tokens (every epoch's provider-root launches + refreshes)
         // from the logger's secret set — AFTER the harness/transport is closed above, so no late log
@@ -4698,6 +5029,7 @@ export class CodexExecutor implements Executor {
     const registries = new Set<ExecutionRegistry>();
     return this.trackEpochSetup(async () => {
       await this.settleOwnedSummariesBeforeCredentials();
+      await this.epochSourceAdmission?.();
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
       const epoch = await this.buildProviderEpoch(ctx, shared, resumeSessionId, epochNamespace, epochIndex, opts, revision, registries);
@@ -4714,6 +5046,21 @@ export class CodexExecutor implements Executor {
     }, registries);
   }
 
+  /** PRD #3247 M2 policy: when the catalog lists the model but not the claim's level, emit one
+   *  `effort_not_in_catalog` status. Never changes, retries or downgrades the level. */
+  private catalogProbeFor(ctx: RunContext, level: string) {
+    return {
+      timeoutMs: this.deps.catalogProbeTimeoutMs ?? CODEX_CATALOG_PROBE_TIMEOUT_MS,
+      onEntry: (entry: CodexCatalogEntry | undefined, model: string): void => {
+        if (entry === undefined || entry.supportedEfforts.includes(level)) return;
+        ctx.emit({ kind: "status", agent: "worker", payload: {
+          event: "effort_not_in_catalog",
+          text: `Codex does not list reasoning effort ${level} for ${sanitizeName(model)}. uzi sends it unchanged; the provider may reject it. Choose a listed level or Runtime default.`,
+        } });
+      },
+    };
+  }
+
   private async buildProviderEpoch(
     ctx: RunContext,
     shared: EpochSharedContext,
@@ -4724,6 +5071,8 @@ export class CodexExecutor implements Executor {
     revision: number,
     setupRegistries: Set<ExecutionRegistry>,
   ): Promise<ProviderEpoch> {
+    // The claim's effort, as resolveLeadRequest reads it for the turn (PRD #3244); absent for Runtime default.
+    const level = ctx.config?.default_effort;
     // Snapshot the runner contract once for all effect surfaces in this epoch.
     // Legacy direct callers may still bind through the static executor option.
     const captureMemory = ctx.capturedMemory;
@@ -4740,7 +5089,7 @@ export class CodexExecutor implements Executor {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, onTerminalDispose, accountant, scrubProjected,
-      commandCache, lifecycleSignal, selection, vaultLock, settleDepsInstall,
+      commandCache, lifecycleSignal, selection, vaultLock, settleDepsInstall, repoInstructions,
     } = shared;
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
@@ -4761,7 +5110,7 @@ export class CodexExecutor implements Executor {
     const codexHome = path.join(ownedDataRoot, "codex");
     this.assertCaptureAdmission(revision);
     this.epochAdmission?.();
-    const registry = new ExecutionRegistry(newLocalExecutionEpoch(epochIndex));
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(epochIndex), this.lifetime);
     setupRegistries.add(registry);
     this.unverifiedEpochRegistries.add(registry);
     // Issue #1782: the session subset is adopted into codexHome only when the provider root
@@ -4806,15 +5155,15 @@ export class CodexExecutor implements Executor {
             mode: "subscription",
             initial: { accessToken: initialToken, accountId: binding.chatgptAccountId },
             assertRefreshAdmission: () => this.assertCaptureAdmission(revision),
-            bridge: buildAppServerRefreshBridge(ctx.runId, {
+            bridge: this.lifetimeBoundRefreshBridge(buildAppServerRefreshBridge(ctx.runId, {
               refreshCodex: async (...args) => {
                 await this.settleOwnedSummariesBeforeCredentials();
                 this.assertCaptureAdmission(revision);
-                const result = await this.opts.client.refreshCodex(...args);
+                const result = await this.lifetime.admit(() => this.opts.client.refreshCodex(...args));
                 this.assertCaptureAdmission(revision);
                 return result;
               },
-            }, binding, committedGeneration, registerToken, () => vaultLock.onVaultLocked()),
+            }, binding, committedGeneration, registerToken, () => vaultLock.onVaultLocked())),
           }
         : { mode: "api_key", apiKey: initialToken };
       const appServerAuth = createCodexAppServerAuth(authConfig);
@@ -4834,12 +5183,15 @@ export class CodexExecutor implements Executor {
         LONG_COMMAND_WALL_MS,
         capturedMemory,
       );
-      const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
+      const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => this.lifetime.admit(() => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv }));
       // Issue #1598: least privilege: the fileop helper never runs Go or npm, so it gets no
       // `--cache` (and commandEffectSpec strips the cache variables from its env).
       const fileopRoot = await launchRegisteredEffectRoot(
         registry,
         async (spec, deadlineMs) => {
+          await this.epochSourceAdmission?.();
+          this.assertCaptureAdmission(revision);
+          this.epochAdmission?.();
           const handle = await launchEffectRoot(spec, deadlineMs);
           return {
             get started() { return handle.started; },
@@ -4865,6 +5217,7 @@ export class CodexExecutor implements Executor {
         this.log,
       );
       try {
+        this.assertCaptureAdmission(revision);
         fileopHandle = (this.deps.wireFileop ?? wireFileopHelper)({
           stdin: fileopRoot.handle.transport.stdin,
           stdout: fileopRoot.handle.transport.stdout,
@@ -4876,7 +5229,8 @@ export class CodexExecutor implements Executor {
       }
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
-      const fileop: FileopClient = fileopHandle.client;
+      const rawFileop = fileopHandle.client;
+      const fileop: FileopClient = { op: request => this.lifetime.admit(() => rawFileop.op(request)) };
 
       // (5) The composition cycle (harness → broker → delegation → harness) is resolved by
       // late-binding `harness`: the delegation seam captures it by reference and is only invoked
@@ -4886,7 +5240,7 @@ export class CodexExecutor implements Executor {
       // and the SHARED per-run tool-handler map. The broker enforces the plan-phase file-write ban
       // through `grants.phase`, so it MUST be phase-correct for the turn it serves; the harness
       // re-points it via useBroker before each turn.
-      const providerLaunchRoot = this.deps.launchProviderRoot
+      const rawProviderLaunchRoot = this.deps.launchProviderRoot
         ?? ((spec, authMode) => defaultLaunchProviderRoot(
           spec,
           authMode,
@@ -4896,9 +5250,14 @@ export class CodexExecutor implements Executor {
           scrubProjected,
           this.deps.launchCodexRootForTest,
         ));
+      // Own the factory call itself: a seal that closes admission while it is in flight joins it,
+      // and a call arriving after the seal is refused before the factory is invoked.
+      const providerLaunchRoot: typeof rawProviderLaunchRoot = (spec, authMode) =>
+        this.lifetime.admit(async () => rawProviderLaunchRoot(spec, authMode));
       const buildPhaseBroker = (phase: "plan" | "implement", signal?: AbortSignal): CodexCallbackBroker => {
+        this.assertCaptureAdmission(revision);
         const runPlan = buildCodexRunPlan(
-          this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal, selection.current),
+          this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal, selection.current, repoInstructions),
         );
         const scrubToolResult = (result: NonNullable<SpawnCommandResult["memoryPressure"]>) => ({
           ...result, command: scrubProjected(result.command),
@@ -4910,7 +5269,7 @@ export class CodexExecutor implements Executor {
           registry,
           roles: runPlan.roles,
           startChildTurn: (spec: StartChildTurnSpec) =>
-            this.startChildTurn(harness!, provider, worktreePath, spec, childInterruptDeadlineMs(boundaryDeadlineMs)),
+            this.startChildTurn(harness!, provider, worktreePath, spec, childInterruptDeadlineMs(boundaryDeadlineMs), ctx),
           spawnCommand,
           fileop,
           worktreePath,
@@ -4949,11 +5308,13 @@ export class CodexExecutor implements Executor {
       // command identity out of the dedicated session-reader path. The staging tree is gone before
       // the harness can send initialize or any model-bearing request.
       const providerLaunchSeam: LaunchRootSeam = async (spec) => {
+        this.assertCaptureAdmission(revision);
         if (this.providerLaunchInjected()) {
           // Unit seams own a synthetic filesystem and retain the direct adopt call so
           // their established control-flow timing and session-operation evidence stay
           // independent of the production launcher staging protocol.
           await this.sessionStore.adopt(storeDir, codexHome).catch(() => undefined);
+          await this.epochSourceAdmission?.();
           this.assertCaptureAdmission(revision);
           this.epochAdmission?.();
           return providerLaunchRoot(spec, binding.authMode);
@@ -4980,6 +5341,7 @@ export class CodexExecutor implements Executor {
           { destination: "runner-seed" },
         ).catch(() => undefined);
         try {
+          await this.epochSourceAdmission?.();
           this.assertCaptureAdmission(revision);
           this.epochAdmission?.();
           return await providerLaunchRoot(
@@ -4994,6 +5356,7 @@ export class CodexExecutor implements Executor {
       };
 
       harness = new CodexHarness({
+        admissionReporter: this.opts.client.codexAdmissionReporter?.(ctx.runId, ctx.claimGeneration),
         registry,
         launchRoot: async (spec) => {
           this.assertCaptureAdmission(revision);
@@ -5025,6 +5388,10 @@ export class CodexExecutor implements Executor {
         emitClaimInit: epochIndex === 0,
         // Issue #1583: projected tool frames are scrubbed of runtime-released Codex tokens.
         scrubProjected,
+        // PRD #3247 M2: advisory catalog probe, only on the claim's first root epoch and only for an
+        // explicit level (Runtime default carries none). The note is emitted from onEntry, which the
+        // harness calls before the first turn/start; the level itself is always sent unchanged.
+        ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) } : {}),
       });
 
       const epochHarness = harness;
@@ -5056,9 +5423,17 @@ export class CodexExecutor implements Executor {
         // disposeTools the registry (WITHOUT the onDispose token-eviction hook — a live token must
         // survive into the next epoch), then close the harness/transport and dispose the fileop.
         dispose: async (): Promise<void> => {
-          await settleDepsInstall();
-          const clean = await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true, "replacement");
-          if (clean) this.unverifiedEpochRegistries.delete(registry);
+          let clean = false;
+          try {
+            await settleDepsInstall();
+            clean = await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true, "replacement", safety);
+          } finally {
+            if (clean) this.unverifiedEpochRegistries.delete(registry);
+            else {
+              this.unverifiedEpochRegistries.add(registry);
+              this.verifiedDisposedCaptureFacades.delete(safety);
+            }
+          }
         },
       };
     } catch (error) {
@@ -5067,7 +5442,7 @@ export class CodexExecutor implements Executor {
       // Issue #1766: only a VERIFIED clean teardown clears the registry from the outstanding set,
       // so a failed or rejected one leaves a later capture settle answering `incomplete`.
       await settleDepsInstall();
-      const clean = await this.tearDownEpoch(registry, harness, fileopHandle, boundaryDeadlineMs, true).catch(() => false);
+      const clean = await this.tearDownEpoch(registry, harness, fileopHandle, boundaryDeadlineMs, true, undefined, safety).catch(() => false);
       if (clean) this.unverifiedEpochRegistries.delete(registry);
       throw error;
     }
@@ -5089,73 +5464,95 @@ export class CodexExecutor implements Executor {
     deadlineMs: number,
     disposeRegistry: boolean,
     purpose?: "replacement",
+    cleanupSafety?: CodexExecutionSafetyImpl,
   ): Promise<boolean> {
-    const deadlineAt = Date.now() + Math.max(0, deadlineMs);
-    const cap = MaintenanceBudget.current()?.cap(deadlineMs);
-    const remaining = () => Math.min(Math.max(0, deadlineAt - Date.now()),
-      cap?.() ?? Infinity, this.captureCleanupRemaining?.() ?? Infinity);
-    const captureProof = this.completedCaptures.get(registry);
-    // Only intentional capture poison with unchanged exact-epoch evidence permits
-    // outstanding-set removal. Pre-existing faults remain unproven.
-    const captureClean = () => captureProof !== undefined && registry.acceptsCompletedCapture(captureProof);
-    let ordinaryDrained = false;
-    let ordinaryObservationUnchanged: (() => boolean) | undefined;
-    let registryClean = !disposeRegistry || (registry.state() === "disposed" &&
-      (captureClean() || (!registry.isPoisoned() && !this.unverifiedEpochRegistries.has(registry))));
-    if (disposeRegistry && registry.state() !== "disposed") {
-      // A completed capture already observed every root empty; ordinary quiesce/reap
-      // refuses its poisoned epoch. Every other epoch still needs both observations.
-      let drained = captureClean();
-      if (!drained) {
-        try {
-          const q = await registry.quiesceChildren(remaining());
-          if (q.kind === "quiescent") {
-            const epoch = registry.epoch();
-            const roots = registry.rootCount();
-            const launches = registry.launchAdmissionCursor();
-            const callbacks = registry.callbackAdmissionCursor();
-            const initiallyEmpty = registry.pendingLaunchCount() === 0 && registry.inFlightCallbackCount() === 0;
-            // disposeTools clears pending tables; their later empty counts cannot rule out
-            // closed-state admissions during reap or handler/transport cleanup.
-            ordinaryObservationUnchanged = () => initiallyEmpty && registry.epoch() === epoch &&
-              registry.rootCount() === roots && registry.launchAdmissionCursor() === launches &&
-              registry.callbackAdmissionCursor() === callbacks;
-            const reaped = await registry.reapProcesses(remaining(), q.epoch);
-            drained = q.epoch === epoch && reaped.kind === "observed_empty" && reaped.epoch === epoch &&
-              ordinaryObservationUnchanged();
-            ordinaryDrained = drained;
-          }
-        } catch { /* Disposal is still attempted after a failed drain. */ }
-      }
-      try {
-        const disposal = await registry.disposeTools(remaining());
-        registryClean = drained && disposal.kind === "disposed";
-      } catch { registryClean = false; }
-    }
-    try { await harness?.close(); } catch { registryClean = false; }
-    try { await fileopHandle?.dispose(); } catch { registryClean = false; }
-    // Closing transports can add poison too. Disposal alone never launders it.
-    registryClean &&= !disposeRegistry || (registry.state() === "disposed" && (!registry.isPoisoned() || captureClean()));
-    registryClean &&= ordinaryObservationUnchanged?.() ?? true;
-    if (disposeRegistry && registryClean) {
-      // Preserve the public Codex refusal marker: absence would select legacy sinks.
-      // Only a later owned capture can use this exact completed teardown to select a
-      // fresh capture-only facade; it still needs its own settlement and deadline.
-      const retiredFacade = this.epochSafeties.get(registry);
-      if (retiredFacade && retiredFacade === this.safety) {
-        if (captureClean()) this.verifiedDisposedCaptureFacades.set(retiredFacade, captureClean);
-        else if (purpose === "replacement" && ordinaryDrained && !registry.isPoisoned()) {
-          // Terminal cleanup cannot manufacture ordinary capture eligibility from cleared tables.
-          // This replacement observed quiescence, every root reaped, disposal and transport cleanup.
-          // Later rejected root registration poisons even a disposed registry, invalidating this fact.
-          this.verifiedDisposedCaptureFacades.set(retiredFacade,
-            () => registry.state() === "disposed" && !registry.isPoisoned() && ordinaryObservationUnchanged?.() === true);
+    const exactSafety = cleanupSafety ?? this.epochSafeties.get(registry);
+    let provedClean = false;
+    try {
+      const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+      const cap = MaintenanceBudget.current()?.cap(deadlineMs);
+      const remaining = () => Math.min(Math.max(0, deadlineAt - Date.now()),
+        cap?.() ?? Infinity, this.captureCleanupRemaining?.() ?? Infinity);
+      const captureProof = this.completedCaptures.get(registry);
+      // Only intentional capture poison with unchanged exact-epoch evidence permits
+      // outstanding-set removal. Pre-existing faults remain unproven.
+      const captureClean = () => captureProof !== undefined && registry.acceptsCompletedCapture(captureProof);
+      let terminalDisposal: ToolDisposal | undefined;
+      let ordinaryDrained = false;
+      let ordinaryObservationUnchanged: (() => boolean) | undefined;
+      let registryClean = !disposeRegistry || (registry.state() === "disposed" &&
+        (captureClean() || (!registry.isPoisoned() && !this.unverifiedEpochRegistries.has(registry))));
+      if (disposeRegistry && registry.state() !== "disposed") {
+        // A completed capture already observed every root empty; ordinary quiesce/reap
+        // refuses its poisoned epoch. Every other epoch still needs both observations.
+        let drained = captureClean();
+        if (!drained) {
+          try {
+            const q = await registry.quiesceChildren(remaining());
+            if (q.kind === "quiescent") {
+              const epoch = registry.epoch();
+              const roots = registry.rootCount();
+              const launches = registry.launchAdmissionCursor();
+              const callbacks = registry.callbackAdmissionCursor();
+              const initiallyEmpty = registry.pendingLaunchCount() === 0 && registry.inFlightCallbackCount() === 0;
+              // disposeTools clears pending tables; their later empty counts cannot rule out
+              // closed-state admissions during reap or handler/transport cleanup.
+              ordinaryObservationUnchanged = () => initiallyEmpty && registry.epoch() === epoch &&
+                registry.rootCount() === roots && registry.launchAdmissionCursor() === launches &&
+                registry.callbackAdmissionCursor() === callbacks;
+              const reaped = await registry.reapProcesses(remaining(), q.epoch);
+              drained = q.epoch === epoch && reaped.kind === "observed_empty" && reaped.epoch === epoch &&
+                ordinaryObservationUnchanged();
+              ordinaryDrained = drained;
+            }
+          } catch { /* Disposal is still attempted after a failed drain. */ }
         }
+        try {
+          const disposal = await registry.disposeTools(remaining());
+          terminalDisposal = disposal;
+          registryClean = drained && registry.acceptsTerminalDisposal(disposal);
+        } catch { registryClean = false; }
       }
-      this.unverifiedEpochRegistries.delete(registry);
-      this.epochSafeties.delete(registry);
+      if (disposeRegistry && !terminalDisposal) {
+        try {
+          terminalDisposal = await registry.disposeTools(remaining());
+          registryClean &&= registry.acceptsTerminalDisposal(terminalDisposal);
+        } catch { registryClean = false; }
+      }
+      try { await harness?.close(); } catch { registryClean = false; this.lifetime.distrust(); }
+      try { if (fileopHandle) await this.lifetime.retain(fileopHandle.dispose()); } catch { registryClean = false; }
+      // Closing transports can add poison too. Disposal alone never launders it.
+      registryClean &&= !disposeRegistry || (registry.state() === "disposed" && (!registry.isPoisoned() || captureClean()));
+      registryClean &&= !disposeRegistry || (terminalDisposal !== undefined && registry.acceptsTerminalDisposal(terminalDisposal));
+      registryClean &&= ordinaryObservationUnchanged?.() ?? true;
+      if (disposeRegistry && registryClean) {
+        // Preserve the public Codex refusal marker: absence would select legacy sinks.
+        // Only a later owned capture can use this exact completed teardown to select a
+        // fresh capture-only facade; it still needs its own settlement and deadline.
+        const retiredFacade = this.epochSafeties.get(registry);
+        if (retiredFacade && retiredFacade === this.safety) {
+          if (captureClean()) this.verifiedDisposedCaptureFacades.set(retiredFacade, captureClean);
+          else if (purpose === "replacement" && ordinaryDrained && !registry.isPoisoned()) {
+            // Terminal cleanup cannot manufacture ordinary capture eligibility from cleared tables.
+            // This replacement observed quiescence, every root reaped, disposal and transport cleanup.
+            // Later rejected root registration poisons even a disposed registry, invalidating this fact.
+            this.verifiedDisposedCaptureFacades.set(retiredFacade,
+              () => registry.state() === "disposed" && !registry.isPoisoned() && ordinaryObservationUnchanged?.() === true);
+          }
+        }
+        this.unverifiedEpochRegistries.delete(registry);
+        this.epochSafeties.delete(registry);
+      }
+      provedClean = registryClean;
+      return registryClean;
+    } finally {
+      // Terminal and partial-build cleanup also revisit retired epochs. Failure
+      // revokes their prior proof even when registry disposal was deferred.
+      if (!provedClean) {
+        this.unverifiedEpochRegistries.add(registry);
+        if (exactSafety) this.verifiedDisposedCaptureFacades.delete(exactSafety);
+      }
     }
-    return registryClean;
   }
 
   // ─── the per-turn drive (run-lane precedence, Codex-specific) ─────────────────
@@ -5184,6 +5581,7 @@ export class CodexExecutor implements Executor {
     wall: RunWall,
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     selection: AgentSelection | undefined,
+    repoInstructions: string | undefined,
     scrubLeadText: (s: string) => string,
     onProgress: (progress: MilestoneProgress) => void,
     pauseNow: CodexPauseNowState,
@@ -5201,10 +5599,12 @@ export class CodexExecutor implements Executor {
     // was outstanding at THAT moment: an owner `now` that lands between the trip and the handler
     // (its own trip is a first-wins no-op) stays pending and drops the re-driven turn.
     let tripToken: PauseNowToken | undefined;
+    let tripRetryClassification: Readonly<CodexErrorClassification> | undefined;
     const trip = (reason: string): void => {
       if (tripReason === undefined) {
         tripReason = reason;
         tripToken = pauseNow.capture();
+        if (reason === REASON_IDLE) tripRetryClassification = harness.retryClassification;
         turnAbort.abort();
       }
     };
@@ -5233,15 +5633,18 @@ export class CodexExecutor implements Executor {
     // Issue #1789: a mid-turn vault-locked refresh deferral trips THIS turn the same way.
     vaultLock.activeTurnTrip = trip;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const accountAdmissionActive = (): boolean => ctx.codexRootAdmissionActive?.() ?? !!ctx.prepareCodexRootDispatch;
+    let startupResumed = !accountAdmissionActive();
     let currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = undefined;
       currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
-      if (currentTurnCallbacks > 0) return;
+      if (!startupResumed || currentTurnCallbacks > 0) return;
       idleTimer = setTimeout(() => trip(REASON_IDLE), idleMs);
       idleTimer.unref?.();
     };
+    armIdle();
     const unsubscribeCallbacks = registry.subscribeCallbacks(() => {
       if (registry.inFlightCallbackCountSince(callbackCursor) !== currentTurnCallbacks) armIdle();
     });
@@ -5275,10 +5678,67 @@ export class CodexExecutor implements Executor {
     const effectsAbort = new AbortController();
     try {
       harness.useBroker(buildPhaseBroker(phase, AbortSignal.any([turnAbort.signal, effectsAbort.signal])));
-      if (tripReason) throw this.tripError(tripReason, tripToken!);
-      armIdle();
+      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
       if (beforeDispatch) prompt = beforeDispatch(prompt);
-      const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, ownerCompletionRecheck);
+      const captureRevision = this.captureRevision;
+      let sourceGuard: (() => boolean | void) | undefined;
+      const checkDispatch = (): void => {
+        if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
+        turnAbort.signal.throwIfAborted();
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+        if (accountAdmissionActive() && (ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted))
+          throw new CodexRequestFailure("parent_abort");
+        this.assertCaptureAdmission(captureRevision);
+        if (registry.state() !== "open") throw new CodexRequestFailure("parent_abort");
+        assertResidueQuarantineOpen("provider_turn");
+      };
+      const dispatch = {
+        prepare: async (): Promise<void> => {
+          startupResumed = !accountAdmissionActive();
+          armIdle();
+          sourceGuard = undefined;
+          checkDispatch();
+          const waiting = new AbortController();
+          this.rootAdmissionWaits.add(waiting);
+          try {
+            sourceGuard = await ctx.prepareCodexRootDispatch?.(
+              AbortSignal.any([turnAbort.signal, waiting.signal]), checkDispatch);
+          } finally { this.rootAdmissionWaits.delete(waiting); }
+          sourceGuard?.();
+          checkDispatch();
+        },
+        check: (): boolean => {
+          const valid = sourceGuard?.();
+          checkDispatch();
+          if (valid === false) return false;
+          startupResumed = true;
+          armIdle();
+          return true;
+        },
+      };
+      // PRD #3244: record the lead's requested config for this phase before the turn starts. A new
+      // entry only on a phase change (a re-driven turn, replacement turn or recreated epoch of the
+      // same phase is a no-op); bounded to 3 s inside the reporter, which never throws.
+      // PRD #3244 M2: every root thread/start and thread/resume reports the thread's resolved config,
+      // once its first turn/start is accepted (D30), against the entry bound here; the reporter
+      // dedupes an unchanged reading per entry.
+      // An inactive or disabled reporter gets no entry and hands the harness no runtime-config callback.
+      let onRuntimeConfig: RunTurnRequest["onRuntimeConfig"];
+      if (ctx.leadConfig?.enabled) {
+        const reporter = ctx.leadConfig;
+        const entry = await reporter.enterPhase(phase, this.leadRequestFor(ctx, phase));
+        onRuntimeConfig = (obs) => {
+          try {
+            reporter.observe(entry, toLeadObservation(obs));
+          } catch {
+            /* an observation is best-effort and never reaches the turn */
+          }
+        };
+        if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
+      }
+      const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
+      request.rootDispatch = dispatch;
+      if (onRuntimeConfig) request.onRuntimeConfig = onRuntimeConfig;
       let turn = harness.startTurn(request);
       let events = turn.events[Symbol.asyncIterator]();
       let first = await (async () => {
@@ -5293,7 +5753,10 @@ export class CodexExecutor implements Executor {
             text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
             event: "resume_lineage_break",
           } });
-          turn = harness.startTurn(this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection, ownerCompletionRecheck));
+          const fallback = this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
+          fallback.rootDispatch = dispatch;
+          if (onRuntimeConfig) fallback.onRuntimeConfig = onRuntimeConfig;
+          turn = harness.startTurn(fallback);
           events = turn.events[Symbol.asyncIterator]();
           return events.next();
         }
@@ -5345,7 +5808,7 @@ export class CodexExecutor implements Executor {
         if (pending !== undefined) trip(pending);
       }
       // (a) FIRST-WINS trip.
-      if (tripReason) throw this.tripError(tripReason, tripToken!);
+      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
       // (c) a failed terminal is classified ONCE and materialized+thrown here.
       if (sawTerminal && terminal && terminal.outcome === "failed") {
         const thrown = terminal.failure
@@ -5353,6 +5816,10 @@ export class CodexExecutor implements Executor {
           : { original: new Error("codex run failed: unknown") };
         throw thrown.original;
       }
+      // A child/advice admission failure cannot carry owner feedback to this
+      // stack. Recheck the lead-owned source before accepting its candidate.
+      // Ignore permit expiry here: it gates the next send, not completed work.
+      sourceGuard?.();
       // (d) clean terminal / exhausted.
       const end: TurnStreamEnd = sawTerminal && terminal ? { kind: "terminal", terminal } : { kind: "exhausted" };
       result = reducer.finish(end).result;
@@ -5363,7 +5830,7 @@ export class CodexExecutor implements Executor {
       if (rootText) result.finalText = scrubLeadText(rootText);
     } catch (err) {
       // (a) again: a trip beats the raw aborted/protocol error the iterator threw.
-      if (tripReason) throw this.tripError(tripReason, tripToken!);
+      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
       effectsAbort.abort();
@@ -5377,7 +5844,7 @@ export class CodexExecutor implements Executor {
     }
     // No await separates cleanup from this live-state check and notification entry.
     // The async notification owner must recheck its ownership before journaling.
-    if (tripReason) throw this.tripError(tripReason, tripToken!);
+    if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
     if (sawTerminal && terminal?.outcome === "success" && processedEvents > 0 &&
         !ctx.cancelRequested?.() && !ctx.terminalLifecycleSignal?.aborted && !vaultLock.latched &&
         this.pendingInterruption(ctx, pauseNow, wall) === undefined &&
@@ -5446,8 +5913,8 @@ export class CodexExecutor implements Executor {
     }
   }
 
-  private tripError(reason: string, pauseToken: PauseNowToken): Error {
-    return new CodexTurnTripError(reason, pauseToken);
+  private tripError(reason: string, pauseToken: PauseNowToken, processedEvents: number, retryClassification?: Readonly<CodexErrorClassification>): Error {
+    return new CodexTurnTripError(reason, pauseToken, processedEvents, retryClassification);
   }
 
   /**
@@ -5459,7 +5926,7 @@ export class CodexExecutor implements Executor {
    * phasePublish skips finalize, or `paused`. With proven cleanup, a REFUSED wall park (owner
    * extended) re-drives the turn on a recreated provider epoch (issue #1782: capture may have
    * reaped the root). Unproven cleanup throws before recreation. Idle trips hold after an attempt
-   * and otherwise rethrow; other errors propagate unchanged.
+   * and otherwise park eligible zero-evidence turns; other errors propagate unchanged.
    *
    * Issue #1764: an owner now/milestone pause that dropped the turn (REASON_PAUSE, mode not `wall`)
    * is honoured, never cancelled. In the implement phase it parks through ctx.parkForPause
@@ -5482,17 +5949,20 @@ export class CodexExecutor implements Executor {
     wall: RunWall,
     buildPhaseBrokerIn: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     selection: AgentSelection | undefined,
+    repoInstructions: string | undefined,
     at: { completedCount: number; total?: number },
     scrubLeadText: (s: string) => string,
     beforeReapingSink: () => Promise<void>,
     pauseNow: CodexPauseNowState,
     recreateEpoch: () => Promise<ProviderEpoch>,
     completion?: { history: CompletionHistory; attempted: () => boolean },
-    onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
+    onProgress: (progress: MilestoneProgress) => void = forwardProgress(this.ownedProgressContext(ctx)),
     onFirstEvent?: () => void,
     idleOperation?: () => Promise<ReducedTurnResult>,
     beforeDispatch?: (prompt: string) => string,
     ownerCompletionRecheck = false,
+    idleRecoveryEligible = false,
+    humanRevision = false,
   ): Promise<
     | { kind: "turn"; result: ReducedTurnResult }
     | { kind: "walled" }
@@ -5513,7 +5983,7 @@ export class CodexExecutor implements Executor {
       resumeId = fresh.resumeSessionId;
       buildPhaseBroker = fresh.buildPhaseBroker;
     };
-    for (;;) {
+    turnLoop: for (;;) {
       try {
         // Use consumable lifecycle state, not the sticky pause mode, before releasing again.
         const pending = this.pendingInterruption(ctx, pauseNow, wall);
@@ -5526,7 +5996,7 @@ export class CodexExecutor implements Executor {
         }
         this.assertCaptureAdmission();
         const result = idleOperation ? await idleOperation() : await this.driveCodexTurn(
-          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, scrubLeadText, onProgress, pauseNow, onFirstEvent, beforeDispatch, ownerCompletionRecheck,
+          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, repoInstructions, scrubLeadText, onProgress, pauseNow, onFirstEvent, beforeDispatch, ownerCompletionRecheck,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared
@@ -5587,72 +6057,120 @@ export class CodexExecutor implements Executor {
             );
           }
         }
-        const msg = err instanceof Error ? err.message : "";
-        // Issue #1764: the interrupt generation this path handles, captured before any await; a
-        // newer `now`/`wall` that lands during an await below stays pending for the re-drive.
-        // A REASON_PAUSE trip is snapshotted here, not at the trip: steering aborts the shared
-        // signal BEFORE it fires the same pause's interrupt, so a trip-time snapshot would miss
-        // that pause's own generation. Any other trip (the own wall timer) uses the snapshot taken
-        // when it fired, so an owner `now` that landed after it is never consumed by its park.
-        const pauseToken = msg !== REASON_PAUSE && err instanceof CodexTurnTripError
-          ? err.pauseToken
-          : pauseNow.capture();
-        const mode = ctx.pauseModeRequested?.();
-        // A pending cancel wins over a pause of either kind.
-        if (msg === REASON_PAUSE && ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-        if (msg === REASON_PAUSE && mode == null) {
-          // Issue #1764: the pause was withdrawn (pause_cancel) before it was handled: never park,
-          // never cancel. Preserve the interrupted thread and replace its epoch before reuse.
-          await beforeReapingSink();
-          pauseNow.consume(pauseToken);
-          continue;
-        }
-        if (msg === REASON_PAUSE && mode !== "wall") {
-          // Issue #1764: an owner now/milestone pause dropped the live turn. The plan phase has no
-          // in-executor park: the plan loop hands it to the runner as a PauseNowSignal.
-          if (phase === "plan") {
+        // Human revision silence stays inside its negotiated driver. Synthetic
+        // trips and unknown evidence retain the terminal idle contract.
+        const measuredIdle = !idleOperation && err instanceof CodexTurnTripError &&
+          err.message === REASON_IDLE && err.processedEvents !== undefined;
+        const idleStallKind = measuredIdle && (idleRecoveryEligible || humanRevision) && err instanceof CodexTurnTripError
+          ? err.processedEvents === 0 ? "zero_evidence"
+            : idleRecoveryEligible && !humanRevision && ctx.codexIdleStallRecovery && err.processedEvents! > 0
+              ? "productive" : undefined
+          : undefined;
+        let recoveryCheckedAt = Date.now();
+        const recoveryInterruption = (): CodexTurnTripError | undefined => {
+          // The turn disarmed its wall timer. Charge only this candidate's post-idle
+          // capture/hold waits so a budget spent there still takes the wall route.
+          const now = Date.now();
+          wall.remainingMs -= Math.max(0, now - recoveryCheckedAt);
+          recoveryCheckedAt = now;
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          const reason = this.pendingInterruption(ctx, pauseNow, wall);
+          return reason === undefined ? undefined : new CodexTurnTripError(reason, pauseNow.capture());
+        };
+        if (idleStallKind) err = recoveryInterruption() ?? err;
+        // At most one idle capture and one declined hold; each new interruption leaves
+        // the idle arm and follows the existing pause/wall route with its own snapshot.
+        routeTrip: for (;;) {
+          const msg = err instanceof Error ? err.message : "";
+          // Issue #1764: the interrupt generation this path handles, captured before any await; a
+          // newer `now`/`wall` that lands during an await below stays pending for the re-drive.
+          // A REASON_PAUSE trip is snapshotted here, not at the trip: steering aborts the shared
+          // signal BEFORE it fires the same pause's interrupt, so a trip-time snapshot would miss
+          // that pause's own generation. Any other trip (the own wall timer) uses the snapshot taken
+          // when it fired, so an owner `now` that landed after it is never consumed by its park.
+          const pauseToken = msg !== REASON_PAUSE && err instanceof CodexTurnTripError
+            ? err.pauseToken
+            : pauseNow.capture();
+          const mode = ctx.pauseModeRequested?.();
+          // A pending cancel wins over a pause of either kind.
+          if (msg === REASON_PAUSE && ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          if (msg === REASON_PAUSE && mode == null) {
+            // Issue #1764: the pause was withdrawn (pause_cancel) before it was handled: never park,
+            // never cancel. Preserve the interrupted thread and replace its epoch before reuse.
             await beforeReapingSink();
-            return { kind: "paused", at };
+            pauseNow.consume(pauseToken);
+            continue turnLoop;
           }
-          // The runner can capture before deciding the pause; requestPause persists first.
-          if (await this.requestPause(ctx, at, beforeReapingSink)) return { kind: "paused", at };
-          // A declined pause re-enters the loop; captured-epoch recreation requires proven cleanup.
-          pauseNow.consume(pauseToken);
-          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-          continue;
+          if (msg === REASON_PAUSE && mode !== "wall") {
+            // Issue #1764: an owner now/milestone pause dropped the live turn. The plan phase has no
+            // in-executor park: the plan loop hands it to the runner as a PauseNowSignal.
+            if (phase === "plan") {
+              await beforeReapingSink();
+              return { kind: "paused", at };
+            }
+            // The runner can capture before deciding the pause; requestPause persists first.
+            if (await this.requestPause(ctx, at, beforeReapingSink)) return { kind: "paused", at };
+            // A declined pause re-enters the loop; captured-epoch recreation requires proven cleanup.
+            pauseNow.consume(pauseToken);
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+            continue turnLoop;
+          }
+          const wallTrip = msg === REASON_WALL || msg === REASON_PAUSE;
+          if (ctx.completionInterlock && (wallTrip ? completion?.attempted() || completion?.history.priorAttempt : completion?.attempted()) && (wallTrip || msg === REASON_IDLE)) {
+            const reason = wallTrip ? REASON_WALL : REASON_IDLE;
+            // Issue #1764: the hold's capture reaps the live provider root; persist first.
+            if (ctx.enterCompletionHold) await beforeReapingSink();
+            const held = await routeCompletionHold(ctx, reason, true, wallTrip ? { allowDegradedCapture: true } : undefined);
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+            if (held) return { kind: "held", reason };
+            if (wallTrip) return { kind: "walled" };
+          }
+          if (idleStallKind && msg === REASON_IDLE) {
+            const interrupted = recoveryInterruption();
+            if (interrupted) { err = interrupted; continue routeTrip; }
+            if (!pauseNow.vaultLock.latched) {
+              await beforeReapingSink();
+              const afterCapture = recoveryInterruption();
+              if (afterCapture) { err = afterCapture; continue routeTrip; }
+              if (!pauseNow.vaultLock.latched) {
+                if (idleStallKind === "zero_evidence" && caught instanceof CodexTurnTripError &&
+                    isCodexTransientClassification(caught.retryClassification, isTransientStatus)) {
+                  throw new TransientRecoveryError("silence after a provider-reported rate limit or transport retry", {
+                    providerOrigin: true, idleStallKind: "zero_evidence", originalIdle: caught,
+                  });
+                }
+                throw new TransientRecoveryError(idleStallKind === "productive"
+                  ? "model output stalled within the idle timeout"
+                  : "provider sent no model output within the idle timeout", {
+                  ...(humanRevision || ctx.codexIdleStallRecovery ? { idleStallKind } : {}),
+                  originalIdle: caught instanceof Error ? caught : undefined,
+                });
+              }
+            }
+          }
+          // Not a wall trip: legacy propagation.
+          if (!wallTrip) throw err;
+          const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken, wall, completion);
+          if (outcome === "held") return { kind: "held", reason: REASON_WALL };
+          if (outcome === "parked") return { kind: "walled" };
+          if (outcome === "refused") {
+            // The owner extended: re-drive the turn. It skips reportIteration, so re-arm the run-wide
+            // wall from the refusal's own budget first, or the re-drive would trip at once.
+            // Issue #1789: a vault lock latched before or during the refused park defers now
+            // (cancel first): recreating the epoch would release a new credential for a turn the
+            // latch drops at its start anyway.
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+            if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
+            // A newer pause is handled before releasing credentials for the replacement epoch.
+            if (this.pendingInterruption(ctx, pauseNow, wall) === REASON_PAUSE) continue turnLoop;
+            // Issue #1782: the refused capture may have reaped the provider root (closing the
+            // registry for good); the re-drive requires recreation after proven cleanup.
+            if (!idleOperation) await adoptFresh();
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+            continue turnLoop;
+          }
+          throw err; // "unwired": no seam wired (stub/test) — legacy propagation of the wall trip
         }
-        const wallTrip = msg === REASON_WALL || msg === REASON_PAUSE;
-        if (ctx.completionInterlock && (wallTrip ? completion?.attempted() || completion?.history.priorAttempt : completion?.attempted()) && (wallTrip || msg === REASON_IDLE)) {
-          const reason = wallTrip ? REASON_WALL : REASON_IDLE;
-          // Issue #1764: the hold's capture reaps the live provider root; persist first.
-          if (ctx.enterCompletionHold) await beforeReapingSink();
-          const held = await routeCompletionHold(ctx, reason, true, wallTrip ? { allowDegradedCapture: true } : undefined);
-          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-          if (held) return { kind: "held", reason };
-          if (wallTrip) return { kind: "walled" };
-        }
-        // Not a wall trip: legacy propagation.
-        if (!wallTrip) throw err;
-        const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken, wall, completion);
-        if (outcome === "held") return { kind: "held", reason: REASON_WALL };
-        if (outcome === "parked") return { kind: "walled" };
-        if (outcome === "refused") {
-          // The owner extended: re-drive the turn. It skips reportIteration, so re-arm the run-wide
-          // wall from the refusal's own budget first, or the re-drive would trip at once.
-          // Issue #1789: a vault lock latched before or during the refused park defers now
-          // (cancel first): recreating the epoch would release a new credential for a turn the
-          // latch drops at its start anyway.
-          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-          if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
-          // A newer pause is handled before releasing credentials for the replacement epoch.
-          if (this.pendingInterruption(ctx, pauseNow, wall) === REASON_PAUSE) continue;
-          // Issue #1782: the refused capture may have reaped the provider root (closing the
-          // registry for good); the re-drive requires recreation after proven cleanup.
-          if (!idleOperation) await adoptFresh();
-          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-          continue;
-        }
-        throw err; // "unwired": no seam wired (stub/test) — legacy propagation of the wall trip
       }
     }
   }
@@ -5777,6 +6295,7 @@ export class CodexExecutor implements Executor {
     };
     // One epoch owns this bounded sequence; a refusal stops it immediately.
     for (let attempt = 1; attempt <= attempts; attempt++) {
+      await this.epochSourceAdmission?.();
       checkAbort();
       assertResidueQuarantineOpen("provider_turn");
       try {
@@ -5823,6 +6342,7 @@ export class CodexExecutor implements Executor {
     workspace: string,
     spec: StartChildTurnSpec,
     interruptDeadlineMs: number,
+    ctx: RunContext,
   ): Promise<ChildThreadController> {
     return (async (): Promise<ChildThreadController> => {
       // Start a CHILD thread on the SAME app-server transport as the root (same untrusted
@@ -5855,6 +6375,7 @@ export class CodexExecutor implements Executor {
       const sink = new ChildFrameQueue();
       harness.registerChildSink(childThreadId, sink);
       let childTurnId: string;
+      let admissionAttempt: ReturnType<CodexHarness["beginAdmissionAttempt"]>;
       try {
         const turnParams: Record<string, unknown> = {
           threadId: childThreadId,
@@ -5862,10 +6383,29 @@ export class CodexExecutor implements Executor {
         };
         if (spec.model !== undefined) turnParams.model = spec.model;
         if (spec.effort !== undefined) turnParams.effort = spec.effort;
+        const revision = this.captureRevision;
+        const check = (): void => {
+          spec.signal?.throwIfAborted();
+          if (ctx.cancelRequested?.() || ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted)
+            throw new CodexRequestFailure("parent_abort");
+          this.assertCaptureAdmission(revision);
+          assertResidueQuarantineOpen("provider_turn");
+        };
+        let permit: (() => boolean | void) | undefined;
+        const waiting = new AbortController();
+        this.rootAdmissionWaits.add(waiting);
+        try {
+          do {
+            permit = await ctx.prepareCodexRootDispatch?.(AbortSignal.any([waiting.signal, ...(spec.signal ? [spec.signal] : [])]), check, "child");
+            check();
+          } while (permit?.() === false);
+        } finally { this.rootAdmissionWaits.delete(waiting); }
+        admissionAttempt = harness.beginAdmissionAttempt(childThreadId);
         const turnRes = await harness.requestOnTransport<{ turn?: { id?: string } }>("turn/start", turnParams, { signal: spec.signal });
         const id = turnRes?.turn?.id;
         if (typeof id !== "string" || id.length === 0) throw new Error("codex child turn/start returned no turn id");
         childTurnId = id;
+        admissionAttempt?.bind(id);
       } catch (err) {
         harness.unregisterChildSink(childThreadId);
         sink.end();
@@ -5878,7 +6418,12 @@ export class CodexExecutor implements Executor {
       return {
         threadId: childThreadId,
         turnId: childTurnId,
-        notifications: () => sink.iterator(),
+        notifications: async function* () {
+          for await (const note of sink.iterator()) {
+            admissionAttempt?.observe(note);
+            yield note;
+          }
+        },
         project: (items) => harness.emitChildFrame(childThreadId, items),
         respond: (requestId, reply) => harness.respondOnTransport(requestId, reply),
         // Issue #1864: the delegation interrupts only AFTER spec.signal aborted, and the transport
@@ -5886,8 +6431,7 @@ export class CodexExecutor implements Executor {
         // is bounded by the transport's own short deadline instead (childInterruptDeadlineMs).
         interrupt: async (): Promise<void> => {
           await harness
-            .requestOnTransport(
-              "turn/interrupt",
+            .interruptOnTransport(
               { threadId: childThreadId, turnId: childTurnId },
               { deadlineMs: interruptDeadlineMs },
             )
@@ -5902,6 +6446,18 @@ export class CodexExecutor implements Executor {
   }
 
   // ─── request + prompt construction ────────────────────────────────────────────
+  /** PRD #3244: the lead's requested model/effort for a phase, from the one worker resolver. Pure in
+   *  (ctx.config, provider model), so the request built per turn and the row reported at the phase
+   *  entry cannot differ. */
+  private leadRequestFor(ctx: RunContext, phase: "plan" | "implement"): LeadRequest {
+    return resolveLeadRequest({
+      harness: "codex",
+      phase,
+      config: ctx.config,
+      providerDefaultModel: this.opts.provider.model,
+    });
+  }
+
   private buildRunRequest(
     ctx: RunContext,
     phase: "plan" | "implement",
@@ -5909,6 +6465,7 @@ export class CodexExecutor implements Executor {
     resumeId: string | undefined,
     signal: AbortSignal,
     selection: AgentSelection | undefined,
+    repoInstructions?: string,
     ownerCompletionRecheck = false,
   ): RunTurnRequest {
     let leadBody: string | undefined;
@@ -5964,12 +6521,15 @@ export class CodexExecutor implements Executor {
     const systemPrompt = buildLeadSystemPrompt(leadBody, {
       kind: ctx.kind,
       harness: "codex",
+      repoInstructions,
       repoSourced,
       // Issue #3272: only an implement-phase request of an owner-supplied plan gets the seeded variant.
       seeded: phase === "implement" && isSeededOwnerPlan(ctx),
     }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
-    const effort = codexEffort(ctx);
+    // PRD #3244: the model and effort sent below are the same LeadRequest the lead-config row reports.
+    const leadRequest = this.leadRequestFor(ctx, phase);
+    const effort = leadRequest.effort;
     if (parkRunEnabled(ctx, phase)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
     // Lead wiring must carry this worker-owned access into root-thread registration and the broker.
     // Presence is consent: runner only supplies the gate/hooks for strictly opted-in publishing runs.
@@ -5993,7 +6553,7 @@ export class CodexExecutor implements Executor {
       // the claim; fall back to the fixed provider default when the claim carries none. render.ts's
       // resolveModel re-validates request.model downstream and codex-harness.ts's
       // `rendered.lead.model ?? this.provider.model` supplies the same default for an out-of-set value.
-      model: ctx.config?.default_model ?? this.opts.provider.model,
+      model: leadRequest.model!,
       // PRD #1551 (D4/D5): mark the ROOT model's provenance ONLY when it came from the
       // server worker default (a present, non-empty `default_model`). This is the sole
       // source render.ts's resolveModel lets carry a validated CUSTOM (non-curated) ID
@@ -6064,8 +6624,8 @@ export class CodexExecutor implements Executor {
           "",
           "Your plan was cross-checked and the server contract above was approved. Implement THAT contract now",
           "on the current branch, delegating to your subagents and iterating until the review passes. It is",
-          "your authoritative instruction for this run: it supersedes the issue text and the plan you drafted",
-          "in this thread; do not re-plan or resubmit it.",
+          "your authoritative instruction for this run: it supersedes the plan you drafted in this thread and,",
+          "except for in-scope additions the approval advice above permits, the issue text; do not re-plan or resubmit it.",
         ].join("\n")
       : gatedPlan !== undefined
       ? [
@@ -6172,6 +6732,7 @@ const COMMAND_ROOT_UNREAPED = "command supervisor root did not reap cleanly";
 /** Issue #1866 M2: the Codex probe's bound. Longer than runEnvProbe's 2s default because the
  *  probe starts a registered, sandboxed command supervisor root, not a bare process. */
 const CODEX_ENV_PROBE_TIMEOUT_MS = 10_000;
+const CODEX_CATALOG_PROBE_TIMEOUT_MS = 2_000;
 
 async function assertCommandWorktreePosture(worktreePath: string): Promise<void> {
   const stat = await fs.stat(worktreePath);
@@ -6229,125 +6790,542 @@ export function registeredRoot(
 
 type EffectLaunch = (spec: CodexEffectLaunchSpec, deadlineMs?: number, startupCleanup?: StartupCleanupAuthorization) => Promise<CodexRootHandle>;
 
+/**
+ * One command-identity launch's claim on the run's cache, taken BEFORE its spec is built.
+ * It pins the generation that was admitting at that moment: that generation cannot be
+ * retired or removed while the reservation is outstanding.
+ */
+export interface CacheReservation {
+  /** The cache directory the launch's spec must carry. */
+  readonly dir: string;
+  /** Wrap the INNERMOST real launch. The result is usable ONCE (a second `launch` call, or a
+   *  second invocation of the returned launch, throws). Invoking it converts the reservation
+   *  into an open root whose disposal outcome counts toward the drained attestation. */
+  launch(inner: EffectLaunch): EffectLaunch;
+  /** Release a reservation whose launch was never invoked (a pre-spawn abort, a refused
+   *  registry reservation, a spec that failed to build). Idempotent; a no-op once the launch
+   *  was invoked. */
+  cancel(): void;
+}
+
 /** Issue #1598: the run's command cache as a command-identity launch site sees it. */
 export interface RunCommandCache {
-  /** The cache a NEW command launch may use, or undefined: none is held, the holder
+  /** Reserve the cache a NEW command launch may use, or undefined: none is held, the holder
    *  exited or misbehaved, or the run's cache was already settled. Once undefined it stays
    *  undefined, so a command launched after holder loss never gets `--cache` (a later
-   *  `--remove-cache` could otherwise race it). */
-  current(): { readonly dir: string } | undefined;
-  /** Wrap a launch whose spec carries this cache, so its root's disposal outcome counts
-   *  toward the drained attestation. */
-  track(launch: EffectLaunch): EffectLaunch;
+   *  `--remove-cache` could otherwise race it). Never undefined for a size reason. */
+  reserve(): CacheReservation | undefined;
   /** Record a registry whose poison requires exact completed capture evidence at disposal. */
   watchRegistry(registry: ExecutionRegistry): void;
 }
 
-/** Resolve the cache for ONE command-identity launch: its directory plus the tracked
- *  launch, or no directory and the launch unchanged. */
-function cacheForLaunch(cache: RunCommandCache | undefined, launch: EffectLaunch): { readonly dir?: string; readonly launch: EffectLaunch } {
-  const current = cache?.current();
-  return current !== undefined && cache !== undefined ? { dir: current.dir, launch: cache.track(launch) } : { launch };
+/** Resolve the cache for ONE command-identity launch: its directory, the (reservation-wrapped)
+ *  launch, and the `cancel` the caller MUST run in a `finally` (a no-op once the launch ran).
+ *  Without a cache the launch is returned unchanged. */
+function cacheForLaunch(
+  cache: RunCommandCache | undefined,
+  launch: EffectLaunch,
+): { readonly dir?: string; readonly launch: EffectLaunch; readonly cancel: () => void } {
+  const reservation = cache?.reserve();
+  return reservation === undefined
+    ? { launch, cancel: () => undefined }
+    : { dir: reservation.dir, launch: reservation.launch(launch), cancel: () => reservation.cancel() };
+}
+
+/** Issue #3675: how a run's command cache is measured and rotated. Absent, or a
+ *  non-positive budget, means no measurement and no rotation. */
+export interface CacheRotationOptions {
+  /** Rotate once a complete measurement reaches this many bytes (or any measurement is unknown). */
+  readonly budgetBytes: number;
+  readonly measure: (token: string, signal: AbortSignal) => Promise<CacheMeasureResult>;
+  /** Start a replacement holder. `onSpawned` receives the helper's ACTUAL settlement. */
+  readonly startHolder: (token: string, opts: { onSpawned(settlement: Promise<CacheCleanupResult>): void }) => Promise<CommandCacheHolder>;
+  /** Throws when capture admission (or the executor lifetime) is closed. */
+  readonly admitCapture: () => void;
+  readonly remove: (token: string, timeoutMs: number) => Promise<CacheCleanupResult>;
+  readonly log: Pick<Logger, "info" | "warn">;
+  readonly waits: { readonly releaseMs: number; readonly removeMs: number };
+  /** Minimum spacing between two measurement starts of one generation (default 30 s). */
+  readonly minIntervalMs?: number;
+  readonly now?: () => number;
+}
+
+const DEFAULT_CACHE_MEASURE_MIN_INTERVAL_MS = 30 * 1000;
+
+/** One cache directory with its holder and the accounting of what still uses it. */
+interface CacheGeneration {
+  readonly holder: CommandCacheHolder;
+  /** Reservations taken and neither launched nor cancelled. */
+  reservations: number;
+  openRoots: number;
+  unclean: boolean;
+  /** No longer admitting: replaced, or the run is settling. */
+  closed: boolean;
+  rotationPending: boolean;
+  registries: ExecutionRegistry[];
+  /** The measurement's ACTUAL extent: through the helper's close, not its delivery. */
+  inFlight?: Promise<void>;
+  /** Aborts a measurement still queued (not yet spawned). */
+  queuedAbort?: AbortController;
+  again: boolean;
+  lastStartedAt?: number;
+  /** Retirement (release/remove) was started: terminal settle must not repeat it. */
+  retireStarted: boolean;
+  deferredLogged: boolean;
+  /** Removed/absent: nothing of this generation remains. */
+  finished: boolean;
+}
+
+/** The single replacement start in flight (or its latched failure). */
+interface StartupRecord {
+  readonly token: string;
+  /** The replacement helper's ACTUAL settlement, from `onSpawned`. */
+  settlement?: Promise<CacheCleanupResult>;
+}
+
+const cleanedUp = (outcome: CacheCleanupResult): boolean => outcome.state === "removed" || outcome.state === "absent";
+
+/** Resolve true if `p` settles within `ms`, false otherwise (timer unref'd and cleared). */
+async function settlesWithinMs(p: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      p.then(() => true, () => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), Math.max(0, ms));
+        if (typeof timer.unref === "function") timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
  * Issue #1598: the run's held command cache plus the evidence for its release.
  *
- * DRAINED ATTESTATION: true iff every command-identity root launched WITH this cache
- * reported a clean disposal (its registeredRoot reap/dispose, which both go through
- * the handle's dispose) AND every poisoned provider-epoch registry is disposed with
- * its existing exact completed capture proof still accepted. A launch that threw after the spec named the
- * cache makes it false unless that invocation receives the launcher's fresh, exact-attempt
- * certificate for fully closed rejected-startup cleanup. An unclean or rejected disposal,
- * or a root never disposed by the terminal settle, also makes it false. False is the safe
- * direction: the directory is retained for the startup
- * reaper.
+ * DRAINED ATTESTATION (per generation): true iff every command-identity root launched WITH
+ * that generation's cache reported a clean disposal (its registeredRoot reap/dispose, which both
+ * go through the handle's dispose), no reservation or measurement of it is outstanding AND every
+ * poisoned provider-epoch registry is disposed with its existing exact completed capture proof
+ * still accepted. A launch that threw after the spec named the cache makes it false unless that
+ * invocation receives the launcher's fresh, exact-attempt certificate for fully closed
+ * rejected-startup cleanup. An unclean or rejected disposal, or a root never disposed by the
+ * terminal settle, also makes it false. False is the safe direction: the directory is retained for
+ * the startup reaper.
+ *
+ * ROTATION (issue #3675, opt-in through `rotation`): the current generation is measured after
+ * its roots are disposed; an over-budget or unknown measurement marks it rotation-pending and a
+ * replacement holder is started. The pending generation keeps admitting until the replacement
+ * is READY and adopted, so a failed replacement never changes what commands see. The replaced
+ * generation then retires (release or remove) once its last reservation, root and
+ * measurement helper are gone. A generation that stalls (release retained) or cannot be proven
+ * drained is not removed mid-run: it is deferred to the terminal settle.
  */
 export class HeldRunCommandCache implements RunCommandCache {
-  private readonly holder: CommandCacheHolder;
-  private readonly registries: ExecutionRegistry[] = [];
-  private openRoots = 0;
-  private unclean = false;
+  private current: CacheGeneration;
+  private retiring: CacheGeneration | undefined;
+  private startup: StartupRecord | undefined;
+  private replacementBlocked = false;
+  private terminal = false;
+  private readonly watched: ExecutionRegistry[] = [];
   private settling: Promise<void> | undefined;
 
   constructor(
     holder: CommandCacheHolder,
     private readonly completedCapture?: (registry: ExecutionRegistry) => CompletedCredentialFreeCapture | undefined,
+    private readonly lifetime?: ExecutorLifetime,
+    private readonly rotation?: CacheRotationOptions,
   ) {
-    this.holder = holder;
+    this.current = this.newGeneration(holder);
   }
 
-  current(): { readonly dir: string } | undefined {
-    if (this.settling !== undefined || !this.holder.alive()) return undefined;
-    return { dir: this.holder.path };
-  }
-
-  watchRegistry(registry: ExecutionRegistry): void {
-    this.registries.push(registry);
-  }
-
-  track(launch: EffectLaunch): EffectLaunch {
-    return async (spec, deadlineMs, startupCleanup) => {
-      this.openRoots += 1;
-      let settled = false;
-      const settle = (clean: boolean): void => {
-        if (!clean) this.unclean = true;
-        if (!settled) {
-          settled = true;
-          this.openRoots -= 1;
-        }
-      };
-      const verifiedStartupCleanup = watchStartupCleanup(startupCleanup);
-      let handle: CodexRootHandle;
-      try {
-        handle = await launch(spec, deadlineMs, startupCleanup);
-      } catch (error) {
-        // Only this attempt's launcher certificate accounts for a rejected root.
-        settle(verifiedStartupCleanup(error));
-        throw error;
-      }
-      return {
-        started: handle.started,
-        supervisorPid: handle.supervisorPid,
-        transport: handle.transport,
-        snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
-        observe: (timeoutMs) => handle.observe(timeoutMs),
-        waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
-        dispose: async (timeoutMs) => {
-          let outcome: DisposeOutcome;
-          try {
-            outcome = await handle.dispose(timeoutMs);
-          } catch (error) {
-            settle(false);
-            throw error;
-          }
-          settle(outcome.clean);
-          return outcome;
-        },
-        get failed() { return handle.failed; },
-        whenFailed: handle.whenFailed,
-      };
+  private newGeneration(holder: CommandCacheHolder): CacheGeneration {
+    return {
+      holder,
+      reservations: 0,
+      openRoots: 0,
+      unclean: false,
+      closed: false,
+      rotationPending: false,
+      // A new generation answers for every registry that is still live.
+      registries: this.watched.filter((registry) => registry.state() !== "disposed"),
+      again: false,
+      retireStarted: false,
+      deferredLogged: false,
+      finished: false,
     };
   }
 
+  reserve(): CacheReservation | undefined {
+    if (this.settling !== undefined || this.terminal) return undefined;
+    const generation = this.current;
+    if (generation.closed || !generation.holder.alive()) return undefined;
+    generation.reservations += 1;
+    let state: "reserved" | "launching" | "cancelled" = "reserved";
+    let wrapped = false;
+    return {
+      dir: generation.holder.path,
+      launch: (inner) => {
+        if (wrapped) throw new Error("command cache reservation launch already wrapped");
+        wrapped = true;
+        return this.trackedLaunch(generation, inner, () => {
+          if (state !== "reserved") throw new Error("command cache reservation is no longer available");
+          state = "launching";
+          generation.reservations -= 1;
+          generation.openRoots += 1;
+        });
+      },
+      cancel: () => {
+        if (state !== "reserved") return;
+        state = "cancelled";
+        generation.reservations -= 1;
+        this.generationChanged(generation);
+      },
+    };
+  }
+
+  watchRegistry(registry: ExecutionRegistry): void {
+    this.watched.push(registry);
+    for (const generation of [this.current, this.retiring]) {
+      if (generation !== undefined && !generation.finished) generation.registries.push(registry);
+    }
+  }
+
+  /** Wrap the real launch: once invoked, the reservation becomes an open root. */
+  private trackedLaunch(generation: CacheGeneration, launch: EffectLaunch, begin: () => void): EffectLaunch {
+    return (spec, deadlineMs, startupCleanup) => {
+      begin(); // synchronous: a second use throws
+      return this.runTracked(generation, launch, spec, deadlineMs, startupCleanup);
+    };
+  }
+
+  private async runTracked(
+    generation: CacheGeneration,
+    launch: EffectLaunch,
+    spec: CodexEffectLaunchSpec,
+    deadlineMs: number | undefined,
+    startupCleanup: StartupCleanupAuthorization | undefined,
+  ): Promise<CodexRootHandle> {
+    let settled = false;
+    const settle = (clean: boolean, disposed: boolean): void => {
+      if (!clean) generation.unclean = true;
+      if (!settled) {
+        settled = true;
+        generation.openRoots -= 1;
+      }
+      if (disposed) this.rootDisposed(generation);
+      else this.generationChanged(generation);
+    };
+    const verifiedStartupCleanup = watchStartupCleanup(startupCleanup);
+    let handle: CodexRootHandle;
+    try {
+      handle = await launch(spec, deadlineMs, startupCleanup);
+    } catch (error) {
+      // Only this attempt's launcher certificate accounts for a rejected root.
+      settle(verifiedStartupCleanup(error), false);
+      throw error;
+    }
+    return {
+      started: handle.started,
+      supervisorPid: handle.supervisorPid,
+      transport: handle.transport,
+      snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+      observe: (timeoutMs) => handle.observe(timeoutMs),
+      waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
+      dispose: async (timeoutMs) => {
+        let outcome: DisposeOutcome;
+        try {
+          outcome = await handle.dispose(timeoutMs);
+        } catch (error) {
+          settle(false, true);
+          throw error;
+        }
+        settle(outcome.clean, true);
+        return outcome;
+      },
+      get failed() { return handle.failed; },
+      whenFailed: handle.whenFailed,
+    };
+  }
+
+  /** The current generation's attestation. */
   drained(): boolean {
-    return !this.unclean && this.openRoots === 0 && this.registries.every((registry) => {
-      if (!registry.isPoisoned()) return true;
-      // Read the executor-owned evidence for this exact registry at settlement;
-      // later poison invalidates it even after disposal has cleared live tables.
-      const proof = this.completedCapture?.(registry);
-      return proof !== undefined && registry.state() === "disposed" && registry.acceptsCompletedCapture(proof);
+    return this.drainedOf(this.current);
+  }
+
+  private drainedOf(generation: CacheGeneration): boolean {
+    return !generation.unclean && generation.openRoots === 0 && generation.reservations === 0
+      && generation.inFlight === undefined && generation.registries.every((registry) => {
+        if (!registry.isPoisoned()) return true;
+        // Read the executor-owned evidence for this exact registry at settlement;
+        // later poison invalidates it even after disposal has cleared live tables.
+        const proof = this.completedCapture?.(registry);
+        return proof !== undefined && registry.state() === "disposed" && registry.acceptsCompletedCapture(proof);
+      });
+  }
+
+  // ─── measurement ───────────────────────────────────────────────────────────────
+
+  private get measuring(): CacheRotationOptions | undefined {
+    return this.rotation !== undefined && this.rotation.budgetBytes > 0 ? this.rotation : undefined;
+  }
+
+  private admitting(generation: CacheGeneration): boolean {
+    return generation === this.current && !generation.closed && !this.terminal && this.settling === undefined;
+  }
+
+  /** A reservation-launched root of `generation` was disposed (clean or not). Never awaited. */
+  private rootDisposed(generation: CacheGeneration): void {
+    this.scheduleMeasure(generation);
+    this.generationChanged(generation);
+  }
+
+  /** Something that gates a generation's retirement or the next replacement changed. */
+  private generationChanged(generation: CacheGeneration): void {
+    if (generation === this.retiring) this.maybeRetire();
+  }
+
+  private scheduleMeasure(generation: CacheGeneration): void {
+    if (this.measuring === undefined || !this.admitting(generation) || generation.rotationPending) return;
+    if (generation.inFlight !== undefined) {
+      generation.again = true;
+      return;
+    }
+    this.startMeasure(generation);
+  }
+
+  private startMeasure(generation: CacheGeneration): void {
+    const options = this.measuring;
+    if (options === undefined || !this.admitting(generation) || generation.rotationPending) return;
+    const now = (options.now ?? Date.now)();
+    const interval = options.minIntervalMs ?? DEFAULT_CACHE_MEASURE_MIN_INTERVAL_MS;
+    if (generation.lastStartedAt !== undefined && now - generation.lastStartedAt < interval) {
+      // Too soon: the next root disposal after the interval starts it.
+      generation.again = true;
+      return;
+    }
+    try { options.admitCapture(); } catch { return; }
+    generation.lastStartedAt = now;
+    generation.again = false;
+    const abort = new AbortController();
+    generation.queuedAbort = abort;
+    const token = generation.holder.token;
+    const done = (async (): Promise<void> => {
+      let result: CacheMeasureResult;
+      try {
+        result = await options.measure(token, abort.signal);
+      } catch {
+        result = { state: "unknown", reason: "protocol" };
+      }
+      this.measured(generation, result);
+      if (result.state === "unknown" && result.settlement !== undefined) {
+        options.log.warn("codex command cache measurement helper unresolved", { cache: token, reason: result.reason });
+        // The helper's actual end (close, or exit plus a bounded stdout drain), never the
+        // delivery: this generation is not retired or removed while it may still be reading
+        // the directory.
+        await result.settlement.catch(() => undefined);
+      }
+    })();
+    generation.inFlight = done;
+    this.lifetime?.join(done);
+    void done.finally(() => {
+      if (generation.inFlight === done) {
+        generation.inFlight = undefined;
+        generation.queuedAbort = undefined;
+      }
+      this.measurementEnded(generation);
     });
   }
 
+  /** Apply a result to the generation that was measured, and only while it still admits. */
+  private measured(generation: CacheGeneration, result: CacheMeasureResult): void {
+    const options = this.measuring;
+    // Defensive: one measurement is in flight per generation and a rotation-pending generation
+    // starts no new one, so a result can only reach the generation it measured; adoption also
+    // aborts the replaced generation's queued measurement. `admitting` still pins it to `current`.
+    if (options === undefined || !this.admitting(generation)) return;
+    if (result.state === "cancelled") return;
+    const cache = generation.holder.token;
+    if (result.state === "complete") {
+      options.log.info("codex command cache measured", { cache, state: "complete", bytes: result.bytes });
+      if (result.bytes < options.budgetBytes) return;
+    } else {
+      options.log.info("codex command cache measured", { cache, state: "unknown", reason: result.reason });
+    }
+    generation.rotationPending = true;
+    options.log.info("codex command cache rotation pending", { cache, budgetBytes: options.budgetBytes });
+    this.tryRotate();
+  }
+
+  private measurementEnded(generation: CacheGeneration): void {
+    if (generation === this.retiring) {
+      this.maybeRetire();
+      return;
+    }
+    if (generation.again && this.admitting(generation) && !generation.rotationPending) this.scheduleMeasure(generation);
+  }
+
+  // ─── rotation ─────────────────────────────────────────────────────────────────
+
+  private tryRotate(): void {
+    const options = this.measuring;
+    const generation = this.current;
+    if (options === undefined || !generation.rotationPending || !this.admitting(generation)) return;
+    if (!generation.holder.alive() || this.retiring !== undefined || this.startup !== undefined || this.replacementBlocked) return;
+    // A refusal before anything was spawned clears the latch, so a later root disposal
+    // re-measures and retries. (A failed start that did spawn keeps `rotationPending`.)
+    try { options.admitCapture(); } catch { generation.rotationPending = false; return; }
+    let invoked = false;
+    const start = (): Promise<void> => {
+      invoked = true;
+      return this.startReplacement(generation, options);
+    };
+    if (this.lifetime === undefined) {
+      void start();
+      return;
+    }
+    // Admitted work: a lifetime that has closed refuses without invoking, so nothing spawns.
+    // Defensive: the catch is unreachable today (admitCapture already asserted the lifetime
+    // open above), kept so a future refusal here cannot leave rotationPending stuck.
+    this.lifetime.admit(start).catch(() => { if (!invoked) generation.rotationPending = false; });
+  }
+
+  private async startReplacement(generation: CacheGeneration, options: CacheRotationOptions): Promise<void> {
+    const record: StartupRecord = { token: randomUUID() };
+    this.startup = record;
+    let holder: CommandCacheHolder;
+    try {
+      holder = await options.startHolder(record.token, {
+        onSpawned: (settlement) => {
+          record.settlement = settlement;
+          // Join only: this callback judges nothing.
+          this.lifetime?.join(settlement);
+        },
+      });
+    } catch (error) {
+      // Latch the failed start. Defensive: `rotationPending` also stays set for this generation,
+      // so nothing re-calls `tryRotate` for it; the latch only guards a later generation or a
+      // future caller from starting a second replacement after a spawned failure.
+      this.replacementBlocked = true;
+      this.startup = undefined;
+      const settlement = record.settlement ?? (error instanceof CommandCacheStartError ? error.settlement : undefined);
+      this.judgeSettlement(settlement);
+      options.log.warn("codex command cache replacement failed; rotation blocked", {
+        cache: generation.holder.token, replacement: record.token, error: errMessage(error),
+      });
+      return;
+    }
+    // Adoption is one synchronous decision over the state as it is NOW.
+    if (!this.terminal && this.settling === undefined && (this.lifetime?.isOpen() ?? true)
+      && this.current === generation && !generation.closed && generation.holder.alive()) {
+      const next = this.newGeneration(holder);
+      generation.closed = true;
+      generation.queuedAbort?.abort();
+      this.current = next;
+      this.retiring = generation;
+      this.startup = undefined;
+      options.log.info("codex command cache rotated", { from: generation.holder.token, to: holder.token });
+      this.maybeRetire();
+      return;
+    }
+    // Ready too late to be used: release the never-used holder and judge ITS cleanup.
+    options.log.warn("codex command cache replacement abandoned", { cache: generation.holder.token, replacement: record.token });
+    let released: CacheCleanupResult;
+    try {
+      released = await holder.release(true, options.waits.releaseMs);
+    } catch {
+      released = { state: "error", reason: "protocol" };
+    }
+    const actual = record.settlement
+      ?? (released.state === "pending" && released.settlement !== undefined ? released.settlement : Promise.resolve(released));
+    const judged = actual.then((outcome) => {
+      if (!cleanedUp(outcome)) this.lifetime?.distrust();
+      return outcome;
+    }, () => {
+      this.lifetime?.distrust();
+      return { state: "error", reason: "protocol" } as CacheCleanupResult;
+    });
+    this.lifetime?.retain(judged);
+    void judged.then((outcome) => {
+      if (this.startup === record) this.startup = undefined;
+      if (cleanedUp(outcome)) this.tryRotate();
+      else this.replacementBlocked = true;
+    });
+  }
+
+  /** Judge a helper's ACTUAL close for an ownership-specific cleanup: anything but a removal
+   *  forbids the lifetime seal. */
+  private judgeSettlement(settlement: Promise<CacheCleanupResult> | undefined): void {
+    if (settlement === undefined || this.lifetime === undefined) return;
+    this.lifetime.retain(settlement.then((outcome) => {
+      if (!cleanedUp(outcome)) this.lifetime!.distrust();
+    }));
+  }
+
+  // ─── finite retirement of a replaced generation ────────────────────────────────
+
+  private maybeRetire(): void {
+    const generation = this.retiring;
+    const options = this.rotation;
+    if (generation === undefined || options === undefined || generation.retireStarted || this.terminal) return;
+    if (generation.reservations !== 0 || generation.openRoots !== 0 || generation.inFlight !== undefined) return;
+    const alive = generation.holder.alive();
+    if (!this.drainedOf(generation)) {
+      // Not provably drained (a live poisoned registry, an unclean root): nothing is released
+      // or removed mid-run and nothing is distrusted. The terminal settle judges it.
+      if (!generation.deferredLogged) {
+        generation.deferredLogged = true;
+        options.log.warn("codex command cache retirement deferred to terminal settle", { cache: generation.holder.token });
+      }
+      return;
+    }
+    generation.retireStarted = true;
+    const retirement = this.retire(generation, alive, options);
+    this.lifetime?.retain(retirement);
+  }
+
+  private async retire(generation: CacheGeneration, alive: boolean, options: CacheRotationOptions): Promise<void> {
+    const token = generation.holder.token;
+    const stalled = (): void => {
+      options.log.warn("codex command cache retirement stalled; rotation suppressed", { cache: token });
+    };
+    const cleared = (): void => {
+      generation.finished = true;
+      if (this.retiring === generation) this.retiring = undefined;
+      this.tryRotate();
+    };
+    try {
+      const result = alive
+        ? await generation.holder.release(true, options.waits.releaseMs)
+        : await options.remove(token, options.waits.removeMs);
+      this.observeCleanup(result);
+      logCacheOutcome(options.log, alive ? "codex command cache retired" : "codex command cache removed after holder loss", token, true, result);
+      if (cleanedUp(result)) cleared();
+      else if (result.state === "pending" && result.settlement !== undefined) {
+        void result.settlement.then((actual) => { if (cleanedUp(actual)) cleared(); else stalled(); }, stalled);
+      } else stalled();
+    } catch (error) {
+      this.lifetime?.distrust();
+      options.log.warn("codex command cache retirement failed", { cache: token, error: errMessage(error) });
+      stalled();
+    }
+  }
+
+  // ─── terminal settle ───────────────────────────────────────────────────────────
+
   /**
    * Settle the cache once, at the run's terminal registry teardown. Idempotent; never
-   * throws; logs every outcome and never changes the run's.
+   * throws; logs every outcome and never changes the run's. Each generation not yet
+   * retired (the current one, and a replaced one whose retirement did not start) is judged:
    *   - holder alive: release(drained); a retained or failed result is a warn with its reason,
    *     a slow answer is "pending" (the holder settles on its own, never killed);
    *   - holder lost and drained: `--remove-cache` (the worker's registry attests the drain),
    *     a slow answer is likewise "pending";
    *   - holder lost and not drained: retained for the startup reaper.
+   * A measurement helper still running is waited for (up to `waits.releaseMs`); past that the
+   * release is chained after its ACTUAL close and retained by the lifetime, so nothing is
+   * deleted before the helper closes.
    * `waits` bounds the release and the removal answers (ms).
    */
   settle(
@@ -6356,26 +7334,77 @@ export class HeldRunCommandCache implements RunCommandCache {
     waits: { readonly releaseMs: number; readonly removeMs: number },
   ): Promise<void> {
     if (this.settling !== undefined) return this.settling;
-    const token = this.holder.token;
-    // Compute BEFORE the flag flips current(): no launch can start past this point.
-    const alive = this.holder.alive();
-    const drained = this.drained();
+    // Reservations stop here; nothing queued may still spawn.
+    this.terminal = true;
+    const targets = [this.retiring, this.current].filter(
+      (generation): generation is CacheGeneration => generation !== undefined && !generation.retireStarted,
+    );
+    for (const generation of targets) {
+      generation.closed = true;
+      generation.queuedAbort?.abort();
+    }
     this.settling = (async () => {
-      try {
-        if (alive) {
-          const result = await this.holder.release(drained, waits.releaseMs);
-          logCacheOutcome(log, "codex command cache released", token, drained, result);
-        } else if (drained) {
-          const result = await remove(token, waits.removeMs);
-          logCacheOutcome(log, "codex command cache removed after holder loss", token, drained, result);
-        } else {
-          log.warn("codex command cache retained for the startup reaper", { cache: token, drained, reason: "holder lost" });
-        }
-      } catch (error) {
-        log.warn("codex command cache settle failed; retained for the startup reaper", { cache: token, error: errMessage(error) });
-      }
+      await Promise.all(targets.map((generation) => this.settleGeneration(generation, log, remove, waits)));
     })();
+    this.lifetime?.retain(this.settling);
     return this.settling;
+  }
+
+  private async settleGeneration(
+    generation: CacheGeneration,
+    log: Pick<Logger, "info" | "warn">,
+    remove: (token: string, timeoutMs: number) => Promise<CacheCleanupResult>,
+    waits: { readonly releaseMs: number; readonly removeMs: number },
+  ): Promise<void> {
+    const token = generation.holder.token;
+    try {
+      const measurement = generation.inFlight;
+      if (measurement !== undefined && !await settlesWithinMs(measurement, waits.releaseMs)) {
+        log.warn("codex command cache measurement helper unresolved at settle; cleanup chained after its close", { cache: token });
+        // Chained after the helper's actual close; owned by the lifetime (no deadline) when there is one.
+        const chained = measurement.then(() => this.settleGeneration(generation, log, remove, waits));
+        this.lifetime?.retain(chained);
+        return;
+      }
+      // Compute BEFORE anything else can change the picture: no launch can start past this point.
+      const alive = generation.holder.alive();
+      const drained = this.drainedOf(generation);
+      if (alive) {
+        const result = await generation.holder.release(drained, waits.releaseMs);
+        this.observeCleanup(result);
+        logCacheOutcome(log, "codex command cache released", token, drained, result);
+      } else if (drained) {
+        const result = await remove(token, waits.removeMs);
+        this.observeCleanup(result);
+        logCacheOutcome(log, "codex command cache removed after holder loss", token, drained, result);
+      } else {
+        this.lifetime?.distrust();
+        log.warn("codex command cache retained for the startup reaper", { cache: token, drained, reason: "holder lost" });
+      }
+    } catch (error) {
+      this.lifetime?.distrust();
+      log.warn("codex command cache settle failed; retained for the startup reaper", { cache: token, error: errMessage(error) });
+    }
+  }
+
+  /**
+   * A `pending` result's `settlement` is the helper's ACTUAL settlement and has no deadline: release waits
+   * for the holder channel to close, and remove waits for the helper process, which is never killed. It is
+   * retained deliberately, unbounded: a release/remove timeout never counts as settlement, never permits
+   * source-use demotion, and never enables conflicting reuse while source-capable work is unresolved. The
+   * cost is that a helper that never settles keeps the lifetime seal, and so this execution reservation,
+   * pending indefinitely, which the approved #3404 plan (disclosure 4) accepts for cleanup tails. Bounding
+   * it as unproven delivery needs an owner decision on the source-lease and reservation consequences.
+   */
+  private observeCleanup(result: CacheCleanupResult): void {
+    if (!this.lifetime) return;
+    if (result.state === "pending" && result.settlement) {
+      this.lifetime.retain(result.settlement.then(actual => {
+        if (actual.state !== "removed" && actual.state !== "absent") this.lifetime!.distrust();
+      }, () => this.lifetime!.distrust()));
+    } else if (result.state !== "removed" && result.state !== "absent") {
+      this.lifetime.distrust();
+    }
   }
 }
 
@@ -6495,6 +7524,8 @@ export function commandSandboxArgv(
  *     displace or drop the boundary dirs (the fixed prefix always wins on a collision).
  *   - the OTHER allowlisted vars (NIX_SSL_CERT_FILE / LOCALE_ARCHIVE) are folded in.
  *   - an optional startup-resolved Docker host is set after the toolEnv fold.
+ *   - the worker's optional Go concurrency defaults (GOFLAGS=-p=N, GOMAXPROCS=N; issue #3382)
+ *     are set after the fold; absent settings add no key.
  *   - a `toolEnv` entry can NEVER overwrite a boundary literal (PATH/TMPDIR/LANG/HOME) or a
  *     PROTECTED_ENV_KEYS member — {@link COMMAND_ENV_PROTECTED_KEYS} unions both, because
  *     PROTECTED_ENV_KEYS alone omits PATH/TMPDIR/LANG. `commandEffectSpec` later overrides
@@ -6521,6 +7552,8 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>,
     if (isGitConfigEnvKey(k)) continue;
     env[k] = v;
   }
+  // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
+  Object.assign(env, goConcurrencyEnv());
   if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
   return env;
 }
@@ -6653,16 +7686,39 @@ export function makeDefaultSpawnCommand(
   capturedMemory?: CapturedMemoryContext,
 ): SpawnCommandSeam {
   return async (argv, opts): Promise<SpawnCommandResult> => {
+      const effectiveWallMs = opts.long_running === true ? longWallMs : wallMs;
+      const originalDeadline = opts.deadlineAt;
+      if (originalDeadline !== undefined && (!Number.isFinite(originalDeadline) || Date.now() >= originalDeadline)) {
+        throw new CommandDeadlineError(effectiveWallMs, false);
+      }
+      const deadlineAbort = new AbortController();
+      let deadlineExpired = false;
+      let cancelCacheReservation: (() => void) | undefined;
+      const timer = originalDeadline === undefined ? undefined : setTimeout(() => {
+        deadlineExpired = true;
+        deadlineAbort.abort();
+      }, Math.min(originalDeadline - Date.now(), 2_147_483_647));
+      const commandSignal = originalDeadline === undefined ? opts.signal
+        : AbortSignal.any([deadlineAbort.signal, ...(opts.signal ? [opts.signal] : [])]);
+      try {
       if (capturedMemory && isBrokerModelCommand(opts.modelCommand)
         && !isBrokerModelCommand(opts.modelCommand, capturedMemory)) throw new Error("memory command context binding mismatch");
       if (capturedMemory && isBrokerModelCommand(opts.modelCommand, capturedMemory)
         && (!capturedMemory.commands.isCurrent(capturedMemory.context, capturedMemory.flight, capturedMemory.lifecycleRevision)
           || !capturedMemory.commands.admitsCommands(capturedMemory.context))) throw new Error("captured memory admission closed");
       const [cmd, ...rest] = argv;
+      // Issue #3675: the reservation wraps the REAL launch, so a launch that never reaches it (a
+      // pre-spawn abort or deadline, a refused registry reservation) ends as a cancel, not unclean.
       const withCache = cacheForLaunch(cache, launch);
+      cancelCacheReservation = withCache.cancel;
+      const boundedLaunch: typeof launch = originalDeadline === undefined ? withCache.launch : (spec, startupMs) => {
+        if (opts.signal?.aborted) throw new Error("command aborted before launch");
+        if (Date.now() >= originalDeadline) throw new CommandDeadlineError(effectiveWallMs, false);
+        return withCache.launch(spec, Math.max(1, Math.min(startupMs ?? reapDeadlineMs, originalDeadline - Date.now())));
+      };
       const launched = await launchRegisteredEffectRoot(
         registry,
-        withCache.launch,
+        boundedLaunch,
         commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv, mode, withCache.dir, true),
         reapDeadlineMs,
         "command",
@@ -6670,9 +7726,11 @@ export function makeDefaultSpawnCommand(
       );
       let memory: Awaited<ReturnType<typeof enrollMemoryCommand>>;
       try {
-        memory = await enrollMemoryCommand(capturedMemory, opts.modelCommand, registry, launched.root, launched.handle, reapDeadlineMs, opts.signal);
+        memory = await enrollMemoryCommand(capturedMemory, opts.modelCommand, registry, launched.root, launched.handle, reapDeadlineMs, commandSignal);
       } catch (error) {
-        await boundedCommandWait(registry.reapRoot(launched.root, reapDeadlineMs), reapDeadlineMs);
+        const reaped = await boundedCommandWait(registry.reapRoot(launched.root, reapDeadlineMs), reapDeadlineMs);
+        if (!reaped.ok) throw new Error(COMMAND_ROOT_UNREAPED);
+        if (deadlineExpired && !opts.signal?.aborted) throw new CommandDeadlineError(effectiveWallMs);
         throw error;
       }
       let stdout = "";
@@ -6723,14 +7781,15 @@ export function makeDefaultSpawnCommand(
 
       let onAbort: (() => void) | undefined;
       const aborted = new Promise<"aborted">((resolve) => {
-        if (opts.signal?.aborted) resolve("aborted");
-        else if (opts.signal) {
+        if (commandSignal?.aborted) resolve("aborted");
+        else if (commandSignal) {
           onAbort = () => resolve("aborted");
-          opts.signal.addEventListener("abort", onAbort, { once: true });
+          commandSignal.addEventListener("abort", onAbort, { once: true });
         }
       });
-      const effectiveWallMs = opts.long_running === true ? longWallMs : wallMs;
-      const terminal = launched.handle.waitChild(effectiveWallMs).then((result) => ({ kind: "exit" as const, code: result.code }))
+      const remainingWallMs = originalDeadline === undefined ? effectiveWallMs : Math.max(0, Math.min(effectiveWallMs, originalDeadline - Date.now()));
+      const terminal = (remainingWallMs <= 0 ? Promise.resolve({ kind: "deadline" as const })
+        : launched.handle.waitChild(remainingWallMs).then((result) => ({ kind: "exit" as const, code: result.code })))
         .catch((error: unknown) => (error instanceof SupervisedChildExitTimeoutError ? { kind: "deadline" as const } : { kind: "failed" as const, error }));
       const ordinary = Promise.race([
         terminal,
@@ -6744,7 +7803,7 @@ export function makeDefaultSpawnCommand(
       // A pressure outcome conveys tool feedback, never ordinary disposal authority.
       // Keep this root owned in the foreground until exit, abort, cap or wall deadline.
       const cleanupReason = first.kind === "memory" ? await ordinary : first;
-      if (onAbort && opts.signal) opts.signal.removeEventListener("abort", onAbort);
+      if (onAbort && commandSignal) commandSignal.removeEventListener("abort", onAbort);
       let cleanupError: unknown;
       let reaped = false;
       try {
@@ -6766,6 +7825,7 @@ export function makeDefaultSpawnCommand(
       }
       if (memoryPressure) return { code: COMMAND_CAPTURE_KILLED_CODE, stdout, stderr, memoryPressure };
       if (cleanupError) throw cleanupError;
+      if (cleanupReason.kind === "aborted" && deadlineExpired && !opts.signal?.aborted) throw new CommandDeadlineError(effectiveWallMs);
       if (cleanupReason.kind === "aborted" || (cleanupReason.kind === "deadline" && opts.signal?.aborted)) throw new Error("command aborted");
       if (cleanupReason.kind === "deadline") throw new CommandDeadlineError(effectiveWallMs);
       if (cleanupReason.kind === "failed") throw cleanupReason.error;
@@ -6774,6 +7834,11 @@ export function makeDefaultSpawnCommand(
         stdout,
         stderr,
       };
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        // A no-op once the launch ran; otherwise the reservation never became a root.
+        cancelCacheReservation?.();
+      }
   };
 }
 
@@ -6822,19 +7887,27 @@ function makeBoundaryProcessSpawner(
     if (!command) throw new Error("boundary process argv is empty");
     // Issue #1598: a command-identity boundary process (a post-run durability sink) uses the
     // run's cache like any command; a worker_pat one never does.
-    const withCache = request.identity === "command" && !isCaptureRequest(request) ? cacheForLaunch(cache, launch) : { launch };
-    const spec: CodexEffectLaunchSpec = request.identity === "command"
-      ? commandEffectSpec(request.cwd, request.cwd, command, args, request.env, mode, withCache.dir)
-      : {
-          identity: "worker_pat",
-          command,
-          args,
-          cwd: request.cwd,
-          env: request.env,
-          supervisorBin: SUPERVISOR_BIN,
-        };
-    bindCaptureLaunch(request, spec, mode);
-    const handle = await withCache.launch(spec, deadlineMs, startupCleanup);
+    const withCache: { dir?: string; launch: EffectLaunch; cancel: () => void } =
+      request.identity === "command" && !isCaptureRequest(request)
+        ? cacheForLaunch(cache, launch) : { launch, cancel: () => undefined };
+    let handle: CodexRootHandle;
+    try {
+      const spec: CodexEffectLaunchSpec = request.identity === "command"
+        ? commandEffectSpec(request.cwd, request.cwd, command, args, request.env, mode, withCache.dir)
+        : {
+            identity: "worker_pat",
+            command,
+            args,
+            cwd: request.cwd,
+            env: request.env,
+            supervisorBin: SUPERVISOR_BIN,
+          };
+      bindCaptureLaunch(request, spec, mode);
+      handle = await withCache.launch(spec, deadlineMs, startupCleanup);
+    } finally {
+      // A no-op once the launch ran; otherwise the reservation never became a root.
+      withCache.cancel();
+    }
     // stderr is consumed by GitCache for all boundary processes. The provider
     // adapter below drains its otherwise-unused stderr independently.
     return {
@@ -6896,9 +7969,4 @@ async function defaultLaunchProviderRoot(
   const transport = createCodexTransport({ inbound: stdout, outbound: stdin });
   const root = registeredRoot(handle, "provider");
   return { root, transport, supervisorPid: handle.supervisorPid ?? -1 };
-}
-
-/** The server-resolved per-harness effort travels on the existing claim field. */
-function codexEffort(ctx: RunContext): HarnessEffort | undefined {
-  return ctx.config?.default_effort;
 }

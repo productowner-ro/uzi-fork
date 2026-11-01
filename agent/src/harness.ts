@@ -52,7 +52,14 @@ export class EpochCleanupUnprovenError extends TrustedExecutionRefusal {
 }
 
 export type HarnessKind = "claude" | "codex";
-export type HarnessEffort = "low" | "medium" | "high" | "xhigh" | "max";
+/** Closed set of effort levels a claim may carry. Keep in lockstep with Go `agenttmpl.EffortLevels`.
+ *  `runtime` is a server-side preference token that is resolved before the claim and never appears
+ *  on one, so it is deliberately absent here. */
+export const HARNESS_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type HarnessEffort = (typeof HARNESS_EFFORTS)[number];
+export function isHarnessEffort(value: unknown): value is HarnessEffort {
+  return typeof value === "string" && (HARNESS_EFFORTS as readonly string[]).includes(value);
+}
 export type SessionPresence = "present" | "absent" | "unknown";
 export type JsonObject = Readonly<Record<string, unknown>>;
 
@@ -351,7 +358,25 @@ export interface HarnessAgent {
   skills: readonly string[]; // canonical bare names, explicit [] disables all
 }
 
+/** A level the runtime reported, in the stored vocabulary (`other` for an unrecognized one). */
+export type ObservedEffort =
+  | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "other";
+
+/** PRD #3244 M2: what the runtime itself reported for the lead's model and effort. `effort: null`
+ *  with real evidence means the runtime sent no effort; `undefined` plus `unknown` means no reading. */
+export interface RuntimeConfigObservation {
+  model?: string;
+  modelEvidence: "claude_init" | "codex_thread_response" | "unknown";
+  effort?: ObservedEffort | null;
+  effortEvidence: "claude_init" | "claude_get_settings" | "codex_sent" | "codex_runtime_default" | "unknown";
+}
+
 export interface RunTurnRequest {
+  /** Called at most once per turn from the adapter's own path; the adapter never lets it throw into
+   *  the turn. Absent when the owner does not want a reading for this turn. */
+  onRuntimeConfig?: (obs: RuntimeConfigObservation) => void;
+  /** Worker-owned lazy root dispatch boundary, after all asynchronous setup. */
+  rootDispatch?: { prepare(): Promise<void>; check(): boolean | void };
   semanticPlanning?: import("./semantic-plan.js").SemanticPlanning;
   /** Worker has materialized and bound the current claim evidence reader. */
   ciEvidencePrepared?: boolean;
@@ -445,6 +470,11 @@ export type BoundaryStep =
   | "checkpoint_import_mutation"
   | "checkpoint_import_readback"
   | "checkpoint_code_head"
+  | "checkpoint_code_head_runner_tip"
+  | "checkpoint_code_head_tracking"
+  | "checkpoint_code_head_default_tip"
+  | "checkpoint_code_head_pin"
+  | "checkpoint_code_head_changed_files"
   | "checkpoint_bridge"
   | "checkpoint_post_import"
   | "checkpoint_steer"
@@ -601,6 +631,8 @@ export interface CodexExecutionSafety {
   // `finally`, after every sink has settled, to drop the roots/handlers. Idempotent
   // (disposeTools is), so a backstop dispose in the executor never double-disposes.
   dispose(request: BoundaryRequest): Promise<ToolDisposal>;
+  /** Exact successful terminal outcome, still backed by all cleanup evidence. */
+  acceptsTerminalDisposal(outcome: ToolDisposal): boolean;
 }
 
 // M3 addition required on the existing outer Executor contract in executor.ts:

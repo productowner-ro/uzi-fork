@@ -58,7 +58,7 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	subWant := map[string][]string{
-		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "extend", "follow-up", "answer", "inputs", "expedite", "resume-now", "mr-rework", "pause", "resume", "rework", "export", "recovery", "discard", "fetches", "held"},
+		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "extend", "follow-up", "answer", "inputs", "expedite", "resume-now", "mr-rework", "pause", "resume", "rework", "export", "recovery", "discard", "fetches", "held", "lead-config"},
 		// backlog is the PRD #98 M7 read; `file` (PRD #365 M2) files a recommendation
 		// as a forge issue from the CLI, mirroring `findings file`.
 		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats", "file"},
@@ -72,7 +72,7 @@ func TestCommandTree(t *testing.T) {
 		"project-sync": {"status", "resync"},
 		"handoff":      {"rm", "review"},
 		"job":          {"create", "get", "result", "cancel", "list", "files", "file"},
-		"admin":        {"users", "runs", "workers", "usage", "rate-limits", "products", "review-bots"},
+		"admin":        {"users", "runs", "workers", "usage", "rate-limits", "products", "review-bots", "maintenance"},
 		"skill":        {"status", "install"},
 		"auth":         {"token", "status"},
 	}

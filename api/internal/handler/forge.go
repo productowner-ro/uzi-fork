@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -176,7 +177,8 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 		// PRD #84 M2: the static per-repo capability hint. Filter-ed at the write path,
 		// so what the DTO surfaces is always a vocabulary-legal set. Normalized to a
 		// non-nil empty slice ([] over null) so the JSON shape is stable for the web.
-		RequiredCapabilities: capsOrEmpty(r.RequiredCapabilities),
+		RequiredCapabilities:        capsOrEmpty(r.RequiredCapabilities),
+		IgnoredInferredCapabilities: capsOrEmpty(r.IgnoredInferredCapabilities),
 	}
 	if r.CodeCrossCheckGuidance.Valid {
 		dto.CodeCrossCheckGuidance = &r.CodeCrossCheckGuidance.String
@@ -539,6 +541,16 @@ func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
 		h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, held)
 		return
 	}
+	prerequisites, err := h.q.CountLivePrerequisiteClosuresForConnection(r.Context(), store.CountLivePrerequisiteClosuresForConnectionParams{ConnectionID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count prerequisite closures for connection delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if prerequisites > 0 {
+		writePrerequisiteConflict(w, prerequisites)
+		return
+	}
 	rows, err := h.q.DeleteForgeConnectionForUser(r.Context(), store.DeleteForgeConnectionForUserParams{ID: id, UserID: user.ID})
 	if err != nil {
 		// A sweep recorded a salvage row between the count above and this delete: the
@@ -550,6 +562,14 @@ func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
 		// Same race for a held publication recorded between its count and this delete.
 		if isHeldRestrict(err) {
 			h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, -1)
+			return
+		}
+		if isPrerequisiteRestrict(err) {
+			count, countErr := h.q.CountLivePrerequisiteClosuresForConnection(r.Context(), store.CountLivePrerequisiteClosuresForConnectionParams{ConnectionID: id, UserID: user.ID})
+			if countErr != nil {
+				slog.Error("recount prerequisite closures for connection delete", "error", countErr)
+			}
+			writePrerequisiteConflict(w, count)
 			return
 		}
 		slog.Error("delete connection", "error", err)
@@ -1020,6 +1040,16 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		h.writeRepoHeldConflict(r.Context(), w, id, user.ID, held)
 		return
 	}
+	prerequisites, err := h.q.CountLivePrerequisiteClosuresForRepo(r.Context(), store.CountLivePrerequisiteClosuresForRepoParams{RepoID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count prerequisite closures for repo delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if prerequisites > 0 {
+		writePrerequisiteConflict(w, prerequisites)
+		return
+	}
 	// The :execrows return may be 0 if a concurrent enable slipped in between the
 	// fetch above and this delete — that is the D6 `enabled = false` guard working, so
 	// treat 0 rows as an already-gone no-op and still return 204, never 500.
@@ -1034,11 +1064,38 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 			h.writeRepoHeldConflict(r.Context(), w, id, user.ID, -1)
 			return
 		}
+		if isPrerequisiteRestrict(err) {
+			count, countErr := h.q.CountLivePrerequisiteClosuresForRepo(r.Context(), store.CountLivePrerequisiteClosuresForRepoParams{RepoID: id, UserID: user.ID})
+			if countErr != nil {
+				slog.Error("recount prerequisite closures for repo delete", "error", countErr)
+			}
+			writePrerequisiteConflict(w, count)
+			return
+		}
 		slog.Error("delete repo", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+const prerequisiteRestrictConstraint = "recovery_prerequisite_closures_live_run_id_fkey"
+
+func isPrerequisiteRestrict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == prerequisiteRestrictConstraint
+}
+
+// writePrerequisiteConflict also covers a marker committed after the pre-count.
+// The FK proves at least one live pointer even if the recount fails or races cleanup.
+func writePrerequisiteConflict(w http.ResponseWriter, count int64) {
+	if count < 1 {
+		count = 1
+	}
+	httpx.JSON(w, http.StatusConflict, map[string]any{
+		"error":                      "prerequisite pins protect recovery archives; wait for their lifecycle to settle before removing this resource",
+		"prerequisite_closure_count": count,
+	})
 }
 
 // salvageRefListCap bounds how many live salvage rows a removal 409 names; the total row
@@ -1260,12 +1317,13 @@ type patchRepoRequest struct {
 	// no-op. Its own exclusive path — cannot be combined with the trust flags.
 	RepoDevboxOptIn *bool `json:"repo_devbox_opt_in"`
 	// RepoRequiredCapabilities is the static per-repo capability hint (PRD #84 M2): the
-	// non-provisionable capabilities every run on this repo requires (today {docker}).
+	// non-provisionable capabilities every run on this repo requires ({docker,jvm}).
 	// Pointer so an omitted field is a no-op; a present (possibly empty) slice replaces
-	// the stored set. Its own exclusive path. The list is Filter-ed against the
+	// the stored set. It may share a request with ignored inference. The list is Filter-ed against the
 	// server-owned vocabulary before storage, so an unknown/spoofed name is dropped and
 	// never persisted (enqueue-time validation, Decision 4).
-	RepoRequiredCapabilities *[]string `json:"required_capabilities"`
+	RepoRequiredCapabilities        *[]string `json:"required_capabilities"`
+	RepoIgnoredInferredCapabilities *[]string `json:"ignored_inferred_capabilities"`
 	// RepoFoldImproveUziBacklog is the per-repo capability flag (PRD #686 M1). Pointer
 	// so an omitted field is a no-op; a present value replaces the stored flag. Its own
 	// exclusive path — cannot be combined with the devbox, trust or capability paths.
@@ -1282,7 +1340,7 @@ func optBoolToPgtype(v *bool) pgtype.Bool {
 	return pgtype.Bool{Bool: *v, Valid: true}
 }
 
-// PatchRepo updates one of five exclusive settings groups for an owner or admin.
+// PatchRepo updates one exclusive settings group for an owner or admin.
 // Guidance and checker-instruction consent form one atomic group. The router
 // mounts this handler under cookie authentication and CSRF enforcement.
 func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
@@ -1321,8 +1379,9 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	devboxSet := req.RepoDevboxOptIn != nil
 	trustSet := req.RepoSkillsEnabled != nil || req.RepoClaudemdEnabled != nil
 	capsSet := req.RepoRequiredCapabilities != nil
+	ignoredSet := req.RepoIgnoredInferredCapabilities != nil
 	foldSet := req.RepoFoldImproveUziBacklog != nil
-	// Each of the five settings groups is its own exclusive path — at most one per
+	// Each settings group is its own exclusive path, at most one per
 	// request. b2i counts how many are present so a combined request is rejected
 	// uniformly rather than pairwise.
 	b2i := func(b bool) int {
@@ -1331,12 +1390,12 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		}
 		return 0
 	}
-	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet)+b2i(foldSet)+b2i(codeSet) > 1 {
-		httpx.Error(w, http.StatusBadRequest, "code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, and the trust flags cannot be combined in one request")
+	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet || ignoredSet)+b2i(foldSet)+b2i(codeSet) > 1 {
+		httpx.Error(w, http.StatusBadRequest, "code cross-check inputs, repo_devbox_opt_in, capability settings (required_capabilities/ignored_inferred_capabilities), repo_fold_improve_uzi_backlog, and the trust flags cannot be combined in one request")
 		return
 	}
-	if !devboxSet && !trustSet && !capsSet && !foldSet && !codeSet {
-		httpx.Error(w, http.StatusBadRequest, "provide code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, or at least one trust flag")
+	if !devboxSet && !trustSet && !capsSet && !ignoredSet && !foldSet && !codeSet {
+		httpx.Error(w, http.StatusBadRequest, "provide code cross-check inputs, repo_devbox_opt_in, required_capabilities, ignored_inferred_capabilities, repo_fold_improve_uzi_backlog, or at least one trust flag")
 		return
 	}
 
@@ -1366,6 +1425,14 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		} else {
 			repo, err = h.q.SetRepoDevboxOptInForUser(r.Context(), store.SetRepoDevboxOptInForUserParams{ID: id, RepoDevboxOptIn: *req.RepoDevboxOptIn, UserID: user.ID})
 		}
+	case capsSet && ignoredSet:
+		caps := capability.Filter(*req.RepoRequiredCapabilities)
+		ignored := capability.Filter(*req.RepoIgnoredInferredCapabilities)
+		if user.IsAdmin {
+			repo, err = h.q.SetRepoCapabilityPolicy(r.Context(), store.SetRepoCapabilityPolicyParams{ID: id, RequiredCapabilities: caps, IgnoredInferredCapabilities: ignored})
+		} else {
+			repo, err = h.q.SetRepoCapabilityPolicyForUser(r.Context(), store.SetRepoCapabilityPolicyForUserParams{ID: id, RequiredCapabilities: caps, IgnoredInferredCapabilities: ignored, UserID: user.ID})
+		}
 	case capsSet:
 		// Filter against the server-owned vocabulary BEFORE storage (Decision 4): an
 		// unknown/spoofed name is dropped and never persisted, and the stored set is
@@ -1375,6 +1442,13 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 			repo, err = h.q.SetRepoRequiredCapabilities(r.Context(), store.SetRepoRequiredCapabilitiesParams{ID: id, RequiredCapabilities: caps})
 		} else {
 			repo, err = h.q.SetRepoRequiredCapabilitiesForUser(r.Context(), store.SetRepoRequiredCapabilitiesForUserParams{ID: id, RequiredCapabilities: caps, UserID: user.ID})
+		}
+	case ignoredSet:
+		caps := capability.Filter(*req.RepoIgnoredInferredCapabilities)
+		if user.IsAdmin {
+			repo, err = h.q.SetRepoIgnoredInferredCapabilities(r.Context(), store.SetRepoIgnoredInferredCapabilitiesParams{ID: id, IgnoredInferredCapabilities: caps})
+		} else {
+			repo, err = h.q.SetRepoIgnoredInferredCapabilitiesForUser(r.Context(), store.SetRepoIgnoredInferredCapabilitiesForUserParams{ID: id, IgnoredInferredCapabilities: caps, UserID: user.ID})
 		}
 	case foldSet:
 		if user.IsAdmin {
@@ -1392,5 +1466,15 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
+	response := map[string]any{"repo": repoToDTO(repo)}
+	var overlap []string
+	for _, cap := range repo.RequiredCapabilities {
+		if slices.Contains(repo.IgnoredInferredCapabilities, cap) {
+			overlap = append(overlap, cap)
+		}
+	}
+	if len(overlap) > 0 {
+		response["warning"] = "Explicitly required capabilities remain required despite ignored inference: " + strings.Join(overlap, ", ")
+	}
+	httpx.JSON(w, http.StatusOK, response)
 }

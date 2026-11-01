@@ -47,6 +47,10 @@ export interface User {
    *  creation and overridable on the run view — so the two disagreeing is the normal
    *  state of a user who overrode one run, not a sync bug to fix. */
   wait_on_limit: boolean;
+  /** PRD #3522: weekly usage reserve threshold (1..100), null when off. */
+  weekly_reserve_pct?: number | null;
+  /** PRD #3522: also pause running runs at the reserve (default true). */
+  weekly_reserve_pause_running?: boolean;
   /** PRD #1020: this user's opt-in to an alert when the poller observes their
    *  Anthropic usage window has reset earlier than its previously reported reset
    *  time. Default true; toggled from their own Settings. */
@@ -141,7 +145,7 @@ export interface CrossCheckPinDTO {
   resolved_model: string | null;
   resolved_effort: string;
   model_source: "pin" | "worker default";
-  effort_source: "pin" | "worker default";
+  effort_source: "pin" | "worker default" | "cross-check default";
   active: boolean;
 }
 
@@ -158,7 +162,23 @@ export interface ModelSettingCell {
   source: string;
 }
 
+/** One harness's cell of the ordinary reasoning-effort setting (PRD #3247), parallel to
+ *  ModelSettingCell. `effort` is the stored token (null = Default, a level, or
+ *  "runtime"); `resolved_effort` is the level a claim sends, null exactly when `mode`
+ *  is "runtime_default". `source` is user_default | builtin; labelled by
+ *  fixtures/model-settings/contract.json. */
+export interface EffortSettingCell {
+  harness: Harness;
+  effort: string | null;
+  default_effort: string;
+  default_source: string;
+  resolved_effort: string | null;
+  source: string;
+  mode: "explicit" | "runtime_default";
+}
+
 export interface UserSettings {
+  vault_auto_reunlock?: boolean;
   cross_check_pins?: CrossCheckPinDTO[];
   /** @deprecated PRD #1551 D2: superseded by the explicit per-harness lanes below.
    *  Kept for one compatibility release as a server-projected legacy field — the
@@ -191,6 +211,9 @@ export interface UserSettings {
   /** Read-only resolved view of both judge lanes (PRD #3245), claude then codex.
    *  Never sent on a PUT. Optional for older servers. */
   judge_models?: ModelSettingCell[];
+  /** Read-only resolved view of both ordinary effort preferences (PRD #3247), claude
+   *  then codex. Never sent on a PUT. Optional for older servers. */
+  effort_settings?: EffortSettingCell[];
   /** Per-user run-summary model override (PRD #362 M2); null means inherit the
    *  instance summary_model (which itself falls back to haiku). Written through
    *  PUT /me/settings alongside judge_model, validated by the same model rules. */
@@ -223,6 +246,10 @@ export interface UserSettings {
    *  default ON. null/absent reads as enabled; an explicit false opts this account out. The
    *  instance kill-switch (AppSettings.now_summary_enabled) is separate. */
   now_summary_enabled?: boolean | null;
+  /** PRD #3522: weekly usage reserve threshold (1..100), null when off. */
+  weekly_reserve_pct?: number | null;
+  /** PRD #3522: also pause running runs at the reserve (default true). */
+  weekly_reserve_pause_running?: boolean;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
@@ -233,6 +260,7 @@ export interface UserSettings {
 // is applied (null clears it), a field absent is left unchanged — so the model
 // card and the Appearance picker save independently over the one endpoint.
 export interface UserSettingsPatch {
+  vault_auto_reunlock?: boolean;
   cross_check_pins?: { stage: "plan" | "code"; harness: Harness; model?: string | null; effort?: string | null }[];
   /** @deprecated PRD #1551 D3: the legacy single-model field. New clients (the grouped
    *  Run Defaults card) send default_claude_model / default_codex_model instead and never
@@ -538,6 +566,7 @@ export interface PipelineStatus {
 }
 
 export interface Repo {
+  ignored_inferred_capabilities?: string[];
   /** Separate checker consent; absent on older APIs means off. */
   cross_check_repo_instructions_enabled?: boolean;
   code_cross_check_guidance?: string | null;
@@ -861,6 +890,15 @@ export interface LatestRun {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
+  // Read-time reason holding this queued run back; optional for api/web rollout skew.
+  queue_reason?: QueueReason | null;
+  // Read-time owner projection; foreign/admin shared reads redact account details.
+  // Eligibility includes the per-run spread and is not a promised start time.
+  codex_admission_class?: CodexAdmissionClass | null;
+  codex_admission_eligible_at?: string | null;
+  /** Owner-only active account cooldown; eligibility includes server spread, not dispatch time. */
+  account_cooldown_class?: CodexAdmissionClass | null;
+  account_cooldown_eligible_at?: string | null;
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
@@ -1000,6 +1038,10 @@ export interface ForgeConfig {
 // every field is always present. default_theme is the instance-default UI theme
 // (PRD #21).
 export interface AppSettings {
+  vault_reunlock_days?: string;
+  // Settings are a string map; callers accept only optional, otherwise required.
+  // Missing on older APIs must also be treated as required.
+  vault_policy?: string;
   autopilot_label: string;
   // PRD #764: the single run-eligibility label (default "uzi"). An issue is runnable
   // iff it carries this label; served as a raw string like every other setting.
@@ -1168,6 +1210,8 @@ export type SettingSource = "env" | "db" | "default";
 // non-secret effective values; `secrets` reports, per secret key, whether a value
 // is configured (never the value itself); `sources` reports every key's source.
 export interface SettingsResponse {
+  // Always reported by current GET/PUT handlers; absent on older APIs is unknown.
+  unprotected_users?: number;
   settings: AppSettings;
   secrets: Record<string, boolean>;
   sources: Record<string, SettingSource>;
@@ -1353,6 +1397,26 @@ export interface AppearanceState {
   };
 }
 
+export type VaultMode = "protected" | "unprotected";
+export type VaultPolicy = "optional" | "required";
+
+// Mode is independent of wrapper presence: protected users may still need enrollment.
+export interface VaultStatus {
+  mode: VaultMode;
+  policy: VaultPolicy;
+  unlocked: boolean;
+  exists: boolean;
+}
+
+// The shared Go toggle DTO omits rotation_advice for disable.
+export interface VaultToggleResponse {
+  mode: VaultMode;
+  rotation_advice?: string;
+}
+
+export type VaultEnableResponse = Required<VaultToggleResponse> & { mode: "protected" };
+export type VaultDisableResponse = Pick<VaultToggleResponse, "mode"> & { mode: "unprotected" };
+
 // SessionResponse is the auth/session bootstrap body (login, register, me). It
 // carries the user, the instance forge labels the board and issue-creation UI
 // need before their first call (PRD #19 M2, PRD #764: the single `uzi`
@@ -1378,12 +1442,10 @@ export interface SessionResponse {
   /** @deprecated PRD #1167: use `appearance.defaults.dark_theme` instead. The instance
    *  dark-polarity default (the legacy single-theme instance default). */
   default_theme: string;
-  // Vault status (PRD #32): whether the user's per-user secret vault is unlocked
-  // in the server process. Optional so a server that predates the field reads as
-  // unlocked (no banner, legacy behavior) rather than falsely locked. `exists`
-  // (PRD #45) is whether a vault row exists at all; with has_password it lets a
-  // passwordless user's SPA pick the passphrase-create dialog vs the unlock banner.
-  vault?: { unlocked: boolean; exists?: boolean };
+  // Older sessions may omit vault or its newer metadata. Missing mode/policy
+  // must be treated as protected/required, never inferred from exists. Preserve
+  // the pre-vault unlocked fallback when the entire object is absent.
+  vault?: Pick<VaultStatus, "unlocked"> & Partial<Omit<VaultStatus, "unlocked">>;
   // has_password is false for OIDC-only users (NULL password_hash; PRD #45). Absent
   // (older server, or a password user) reads as true — no passphrase-create dialog.
   has_password?: boolean;
@@ -1532,6 +1594,68 @@ export interface ReleaseCheckStatus {
   partial?: boolean;
 }
 
+// ── Instance maintenance mode (PRD #3454) ───────────────────────────────────
+
+// QueueReason is why a queued run is held back, beyond waiting for a worker: instance
+// maintenance, the owner's weekly usage reserve ("weekly_reserve", PRD #3522), or a temporary
+// provider admission hold. Precedence is in that order.
+export type QueueReason = "maintenance" | "weekly_reserve" | "codex_rate_limit" | "codex_overload";
+export type CodexAdmissionClass = "rate_limit" | "overload";
+
+// MaintenanceState is `GET /api/maintenance` (any signed-in user): whether intake is paused,
+// since when, and the admin's plain-text reason. Render the reason via stripDisplayCell.
+export interface MaintenanceState {
+  active: boolean;
+  since: string | null;
+  reason: string | null;
+}
+
+// MaintenanceRunItem is one run in an admin readout category. tag says whether the run will
+// finish on its own ("progressing") or needs its owner to act ("needs_owner"); null when the
+// category does not tag (active, queued).
+export interface MaintenanceRunItem {
+  run_id: string;
+  kind: string;
+  status: string;
+  owner_label: string;
+  repo: string | null;
+  since: string | null;
+  tag: "progressing" | "needs_owner" | null;
+  hold_id: string | null;
+}
+
+export interface MaintenanceIdleWorker {
+  worker_id: string;
+  owner_label: string;
+  run_id: string;
+  since: string | null;
+}
+
+// MaintenanceCategory: an exact count plus up to 50 items.
+export interface MaintenanceCategory<T> {
+  count: number;
+  items: T[];
+}
+
+// MaintenanceReadout is the drain snapshot. clear = no active, held or custody blockers
+// visible as of as_of; queued and idle_bound_workers are informational.
+export interface MaintenanceReadout {
+  as_of: string;
+  clear: boolean;
+  active: MaintenanceCategory<MaintenanceRunItem>;
+  held: MaintenanceCategory<MaintenanceRunItem>;
+  custody: MaintenanceCategory<MaintenanceRunItem>;
+  queued: MaintenanceCategory<MaintenanceRunItem>;
+  idle_bound_workers: MaintenanceCategory<MaintenanceIdleWorker>;
+}
+
+// AdminMaintenance is `GET`/`PUT /api/admin/maintenance` (admin): the state with who last
+// changed it, plus the readout.
+export interface AdminMaintenance {
+  state: MaintenanceState & { by_label: string | null };
+  readout: MaintenanceReadout;
+}
+
 // HealthDoc is the admin-health document (PRD #1484 M1): the response of
 // `GET /api/admin/health` (RequireAdminRO). It mirrors `apitypes.HealthDocDTO`
 // byte-for-byte (snake_case JSON keys). Admin-only by route — it carries owner and
@@ -1573,6 +1697,8 @@ export interface HealthCheck {
   group: string;
   title: string;
   severity: string;
+  // Presentation-only opt-in; does not affect severity, counts, blocking or episodes.
+  attention_banner?: boolean;
   summary: string;
   // When the check first went non-ok, where the source has one, else null.
   since: string | null;
@@ -1589,6 +1715,8 @@ export interface HealthCheck {
 export interface HealthEvidence {
   label: string;
   value: string;
+  run_id?: string;
+  owner_id?: string;
 }
 
 // ── CLI tokens (PRD #64) ──────────────────────────────────────────────────
@@ -2033,6 +2161,8 @@ export type RunNowResponse = {
   ineligible_matched?: number | null;
   started: LastFireStarted[];
   skips: LastFireSkip[];
+  // PRD #3454: set when the fire started runs while uzi is in maintenance mode.
+  notice?: string | null;
 };
 
 export interface CIEpisodeDTO {
@@ -2355,7 +2485,23 @@ export interface WorkerRollPacing {
   retained_version?: string;
 }
 
+/** Advisory owner-only snapshot; expiry never verifies forge recovery or grants authority. */
+export interface ForgeOriginCooldown {
+  origin: string;
+  cooled_until: string;
+  half_open_run_id: string | null;
+  state: "cooling" | "half_open" | "retry_eligible_unverified" | "legacy_serialized_until_upgrade" | "reserved_unverified";
+  detail: string;
+}
+
 export interface Worker {
+  forge_origin_cooldowns?: ForgeOriginCooldown[];
+  // Optional for compatibility with APIs predating manual owner cordons.
+  manual_cordoned_at?: string | null;
+  manual_cordoned_by?: string | null;
+  manual_cordoned_by_label?: string | null;
+  manual_cordon_reason?: string | null;
+  effective_cordoned?: boolean;
   // Omitted when absent, invalid or older than the API's independent receipt TTL.
   roll_pacing?: WorkerRollPacing;
   id: string;
@@ -2363,7 +2509,7 @@ export interface Worker {
   status: string; // "offline" | "online"
   // Hosted workers (PRD #58). kind is never null — the column is NOT NULL DEFAULT
   // 'external' — so every worker carries one and a pre-#58 row reports "external".
-  // hosted_size is the preset name ("s"|"m"|"l", lowercase on the wire) and is null
+  // hosted_size is the preset name ("s"|"m"|"l"|"l-highmem", lowercase on the wire) and is null
   // for an external worker. hosted_generation is deliberately not here: it is
   // controller-internal and the DTO does not carry it.
   kind: "external" | "hosted";
@@ -2714,7 +2860,7 @@ export type StopKind =
 export type JudgeVerdict = "ideal" | "ok" | "issues";
 
 export type RunHealth =
-  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle";
+  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle" | "waiting_account_cooldown";
 
 // FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
 // server-side from the post-fix pipeline; not_code is the agent's "not a code
@@ -2953,7 +3099,75 @@ export interface SemanticDriftDTO {
   contradiction: boolean;
 }
 
+/** PRD #3244: one recorded lead-config row. Model strings are untrusted worker-attested text. */
+export interface LeadPhaseConfig {
+  phase: "plan" | "implement";
+  phase_entry: number;
+  seq: number;
+  harness: "claude" | "codex";
+  requested_model: string | null;
+  requested_model_source: LeadModelSource;
+  requested_model_fixed_at: "create" | "claim";
+  requested_effort: string | null;
+  requested_effort_mode: "explicit" | "runtime_default";
+  requested_effort_source: LeadEffortSource;
+  requested_effort_fixed_at: "create" | "claim";
+  observed_model: string | null;
+  observed_model_evidence: "claude_init" | "codex_thread_response" | "unknown" | null;
+  observed_effort: string | null;
+  observed_effort_evidence:
+    | "claude_init"
+    | "claude_get_settings"
+    | "codex_sent"
+    | "codex_runtime_default"
+    | "unknown"
+    | null;
+  truncated: boolean;
+  reported_at: string;
+}
+
+export type LeadModelSource =
+  | "run_override"
+  | "schedule_pin"
+  | "user_planning_default"
+  | "user_default"
+  | "template"
+  | "builtin";
+
+export type LeadEffortSource =
+  | "run_override"
+  | "user_planning_default"
+  | "user_default"
+  | "template"
+  | "builtin";
+
+/** PRD #3244: Run.lead_config. phases holds the highest-seq row per phase of the highest claim
+ *  generation that has rows, plan first; claim_generation is 0 when none. */
+export interface RunLeadConfig {
+  applicable: boolean;
+  claim_generation: number;
+  current: boolean;
+  phases: LeadPhaseConfig[];
+}
+
 export interface Run {
+  forge_origin_cooldown?: ForgeOriginCooldown;
+  capability_provenance?: {
+    hints_known: boolean;
+    inference_known: boolean;
+    capabilities: {
+      capability: string;
+      sources: string[];
+      required: boolean;
+      inference_ignored: boolean;
+      triggers: { path: string; reason: string }[];
+      truncated: boolean;
+    }[];
+  };
+  /** Repo display path on detail reads; absent on older servers, empty when unavailable. */
+  repo_path?: string;
+  /** Frozen repo inference policy; explicit requirements take precedence. */
+  ignored_inferred_capabilities?: string[];
   completion_pending?: CompletionPendingDTO;
   semantic_gate?: import("./semanticGate").SemanticGateDTO;
   semantic_drift?: SemanticDriftDTO;
@@ -3110,6 +3324,21 @@ export interface Run {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
+  /** Read-time queue hold (see LatestRun.queue_reason). Optional for rollout skew. */
+  queue_reason?: QueueReason | null;
+  /** PRD #3522: why the weekly usage reserve holds this queued run (e.g. "weekly usage reserve:
+   *  72% >= 70%"); absent when not held or not queued. */
+  reserve_hold_reason?: string | null;
+  /** PRD #3522: RFC3339 end of the owner's manual-resume override of the weekly usage reserve
+   *  (the next weekly reset); absent/null when no override is active. */
+  reserve_exempt_until?: string | null;
+  // Read-time owner projection; foreign/admin shared reads redact account details.
+  // Eligibility includes the per-run spread and is not a promised start time.
+  codex_admission_class?: CodexAdmissionClass | null;
+  codex_admission_eligible_at?: string | null;
+  /** Owner-only active account cooldown; eligibility includes server spread, not dispatch time. */
+  account_cooldown_class?: CodexAdmissionClass | null;
+  account_cooldown_eligible_at?: string | null;
   /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
    *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
    *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH
@@ -3408,6 +3637,10 @@ export interface Run {
    *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
    *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
+   *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
+   *  "retained_recovery_adoption_failed" means integrity checks refused adoption of retained
+   *  work: always owner-held with local work and custody preserved, no automatic retry.
+   *  Only the owner can Resume or Cancel, through the existing owner authorization.
    *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
@@ -3432,8 +3665,12 @@ export interface Run {
    *  the next retry a `vault_locked` park resumes at once the vault is unlocked. The
    *  recovery-park analog of retry_not_before (the usage-limit park's stamp) and a SEPARATE
    *  field: a run parks on at most one of the two at a time. Null for a run that has never
-   *  recovery-parked. ISO-8601 string, like every other timestamp on this type. */
-  recovery_retry_not_before: string | null;
+   *  recovery-parked. For forge_unreachable and retained_recovery_exhausted, explicit null means owner-held;
+   *  a valid timestamp means timed retry (including when already due). Missing or invalid
+   *  timing is unknown. For retained_recovery_adoption_failed this is always null and must
+   *  never produce a retry countdown, even if a malformed response supplies a timestamp.
+   *  ISO-8601 string, like every other timestamp on this type. */
+  recovery_retry_not_before?: string | null;
   /** PRD #1392 M1: how many times this run has forge-parked in its lifetime — the
    *  FORGE-ONLY counter the cap decides on. 0 for a run that has never forge-parked
    *  (including every empty-turn park, which never touches it). Rendered as the "N" in
@@ -3465,6 +3702,10 @@ export interface Run {
   home_bytes?: number;
   cache_bytes?: number;
   disk_truncated?: boolean;
+  /** PRD #3244: the lead agent's configured and runtime-reported model and effort. Set on the
+   *  single-run read (GET /api/runs/{id}) for lead-lane runs only; absent on list rows and on runs
+   *  without a lead agent. */
+  lead_config?: RunLeadConfig;
   /** PRD #84 M4: the run's inferred/hinted scheduling requirements, surfaced RAW so the
    *  web derives the plan-gate readiness display from them plus the assigned worker's
    *  capabilities (there is no server-computed "capability_block" field — the 409 the
@@ -3518,7 +3759,9 @@ export interface Run {
   pause_requested_at?: string | null;
   /** PRD #1497 M1 widens pause_mode with "wall": the system-authored wall-park request mode the
    *  timeout sweep stamps at the deadline (alongside the owner's "milestone"/"now"). */
-  pause_mode?: "milestone" | "now" | "wall" | null;
+  pause_mode?: "milestone" | "now" | "wall" | "reserve" | null;
+  // PRD #3522: "reserve" is the system pause request the weekly usage reserve files; it parks
+  // after the current milestone and cannot be withdrawn by the owner (cancel 409s).
   pause_after_count?: number | null;
   checkpoint_tip_at?: string | null;
   /** PRD #1226 M5 (D8): the honest-state completion fields — the wire contract the web + CLI
@@ -3751,7 +3994,22 @@ export interface PlanCrossCheckFinding {
   rationale: string;
 }
 
+export interface CodeCrossCheckCoverage {
+  version: 1;
+  entries: { path: string; status: "examined" | "excluded" | "unassessed"; reason: string; recorded_read: boolean }[];
+  inventory_incomplete: boolean;
+  omitted_paths: number;
+  omitted_count_exact: boolean;
+  unknown_judgments: number;
+  invalid_judgments: number;
+  omitted_judgments: number;
+  activity_complete: boolean;
+  reasons: string[];
+}
+
 export interface CodeCrossCheckSummary {
+  /** Raw JSON from the API; the card validates it before rendering. */
+  coverage?: unknown;
   custom_guidance_applied?: boolean;
   guidance_digest?: string;
   repo_instructions_enabled?: boolean;
@@ -3787,7 +4045,7 @@ export interface PlanCrossCheckSummary {
   checker_model: string | null;
   checker_effort: string | null;
   checker_model_source: "pin" | "worker default" | null;
-  checker_effort_source: "pin" | "worker default" | null;
+  checker_effort_source: "pin" | "worker default" | "cross-check default" | null;
   usage: RunUsage | null;
   historical: boolean;
 }
@@ -3872,6 +4130,7 @@ export type RunSummaryItem = Omit<
   "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
+  | "capability_provenance" | "lead_config"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
@@ -3929,6 +4188,10 @@ export interface SelfUsage {
   lifetime_unreported_run_count: number;
   last7_subscription_run_count: number;
   last7_unreported_run_count: number;
+  /** Issue #3686: PRs uzi runs opened, each counted once for its earliest run's user and
+   *  created_at window. Absent on older APIs: render no PR text, never a fabricated 0. */
+  lifetime_pr_count?: number;
+  last7_pr_count?: number;
 }
 
 // AdminUsageUser preserves lifetime figures and adds seven-day figures to the factory breakdown.
@@ -3951,6 +4214,9 @@ export interface AdminUsageUser {
    *  per-user breakdown discloses a non-metered component like the factory total. */
   subscription_run_count: number;
   unreported_run_count: number;
+  /** Issue #3686: this user's lifetime and seven-day PR counts. Absent on older APIs. */
+  pr_count?: number;
+  last7_pr_count?: number;
 }
 
 // AdminUsage is the factory-wide view (GET /api/admin/usage, admin-only): the
@@ -4005,7 +4271,8 @@ export type RateLimitSource = (typeof RATE_LIMIT_SOURCES)[number];
 export type MyRateLimits =
   | {
       status: "ok";
-      five_hour: RateLimitWindow;
+      /** Absent when the account has no 5-hour window (plans where Anthropic removed it). */
+      five_hour?: RateLimitWindow;
       seven_day: RateLimitWindow;
       source: RateLimitSource;
       synced_at: string; // ISO-8601
@@ -4088,6 +4355,8 @@ export interface AdminRateLimitUser {
   id: string;
   email: string;
   name: string;
+  // Older rows omit mode; absence means protected, independently of lock state.
+  vault_mode?: VaultMode;
   vault_locked: boolean;
   tokens: TokenRateLimits[];
 }
@@ -4163,6 +4432,8 @@ export interface CodexAdminRateLimitRow {
   id: string;
   email: string;
   name: string;
+  // Older rows omit mode; absence means protected, independently of lock state.
+  vault_mode?: VaultMode;
   vault_locked: boolean;
   accounts: CodexAccountRateLimit[];
 }
@@ -4806,7 +5077,8 @@ export interface AgentSelectionInput {
 // reconciles by REST refetch (mount/reconnect/state/health), so a dropped frame
 // self-heals — its handling lands in M3.
 export interface WsEvent {
-  type: "message" | "state" | "health" | "input";
+  // "refresh" (PRD #3244) is data-less like "health": a stored lead-config row changed, so re-read.
+  type: "message" | "state" | "health" | "input" | "refresh";
   seq?: number;
   kind?: string;
   agent?: string | null;

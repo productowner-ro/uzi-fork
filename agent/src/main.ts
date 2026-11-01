@@ -1,6 +1,10 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind, type Config } from "./config.js";
+import { configureGoConcurrency } from "./go-concurrency.js";
+import { acquireWorkerLifetime } from "./authority-lock.js";
+import { installWorkerLifetime, requireWorkerLifetime } from "./completion-authority.js";
+import { AuthorityRuntime } from "./authority-runtime.js";
 import { createLogger, type Logger } from "./log.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
@@ -50,15 +54,23 @@ import { SECRET_PATH_PREFIXES, workerSecretDenyPaths } from "./guardrails.js";
 import type { ClaimCodexSecrets } from "./protocol.js";
 import type { CommandSandboxMode } from "./config.js";
 import { ensureRunnerTmpdir } from "./runner-tmpdir.js";
+import { createPodEpoch, restoreEpochRuntimeTmpdir } from "./pod-epoch-lock.js";
+import { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
+import { PodEpochSettlementError, runPodEpochShadow } from "./pod-epoch-reclaim.js";
 
 export function buildWorkerGitCache(
   config: Pick<Config, "dataDir" | "recoveryDecodedLimitBytes">,
   log: Logger,
   terminalRecordProtection: GitCacheOptions["terminalRecordProtection"],
+  /** issue #3404 M2: the production GitCache always asks the completion authority before a hooked
+   *  effect; with no active transaction a hooked effect refuses before it runs. */
+  authority: Pick<AuthorityRuntime, "hooks">,
 ): GitCache {
   return new GitCache(config.dataDir, log, undefined, {
     recoveryDecodedLimitBytes: config.recoveryDecodedLimitBytes,
     terminalRecordProtection,
+    authority: authority.hooks,
+    authorityRequired: true,
   });
 }
 
@@ -180,6 +192,9 @@ export interface BuildRunExecutorDeps {
   /** PRD #1493 M3: true when the sandbox is running degraded (mode off, or
    *  best-effort on a Landlock-less kernel); the CodexExecutor writes one feed line per run. */
   codexSandboxDegraded: boolean;
+  /** Issue #3675: per-run command-cache rotation threshold in bytes (0 disables;
+   *  absent leaves the executor's rotation off). */
+  codexCommandCacheRunBytes?: number;
 }
 
 /**
@@ -299,6 +314,7 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
         // withBoundary AFTER run() returns, and executeClaim's finally calls safety.dispose
         // once the last sink settles — so run()'s finally must leave the registry ALIVE.
         deferRegistryTeardown: true,
+        ...(deps.codexCommandCacheRunBytes === undefined ? {} : { commandCacheRunBytes: deps.codexCommandCacheRunBytes }),
       },
     );
     return { executor, homeDir: runHome };
@@ -331,6 +347,39 @@ async function main(): Promise<void> {
   // #3031 E1: the FIRST statement, after the static import graph and before any app spawn or
   // claim. It pins the exact tsx esbuild child (or none); nothing is ever enrolled later.
   recordMaintenanceBootstrap(snapshotMaintenanceBootstrap());
+  // Register cancellation before bounded lock waits, config/token reads or any
+  // protected startup access. Runtime shutdown hooks are installed once built.
+  const controller = new AbortController();
+  let shutdownRuntime: (() => void) | undefined;
+  for (const sig of ["SIGINT", "SIGTERM"] as const) {
+    process.on(sig, () => {
+      shutdownSignal = sig;
+      fatalLog?.info("shutting down", { signal: sig, phase: lifecyclePhase, cause: "signal" });
+      try { shutdownRuntime?.(); } finally { controller.abort(); }
+    });
+  }
+  if (process.env.UZI_EPOCH_LOCK !== undefined && process.env.UZI_EPOCH_LOCK !== "1") {
+    throw new Error("UZI_EPOCH_LOCK must be unset or 1");
+  }
+  const epochEnabled = process.env.UZI_EPOCH_LOCK === "1";
+  if (epochEnabled && process.env.UZI_DATA_DIR !== "/data") {
+    throw new Error("epoch workers require UZI_DATA_DIR=/data");
+  }
+  const epochRuntime = epochEnabled ? createPodEpoch() : undefined;
+  const epochBootstrap = epochRuntime ? inspectPodEpochBootstrap({
+    UZI_POD_UID: process.env.UZI_POD_UID,
+    UZI_POD_EPOCH_RUNTIME: process.env.UZI_POD_EPOCH_RUNTIME,
+    UZI_POD_EPOCH_EVIDENCE_FILE: process.env.UZI_POD_EPOCH_EVIDENCE_FILE,
+  }, epochRuntime) : undefined;
+  const epochOwnership = epochRuntime && epochBootstrap
+    ? await epochRuntime.acquire({ firstMode: epochBootstrap.firstMode, signal: controller.signal })
+    : undefined;
+  const epochConsumption = epochOwnership && epochBootstrap
+    ? await epochOwnership.consume(epochBootstrap.podUid)
+    : undefined;
+  if (epochOwnership) restoreEpochRuntimeTmpdir(epochOwnership);
+  // The raw Node descriptor stays open until process exit, including every
+  // shutdown writer. It is CLOEXEC and never handed to run children.
   // PRD #51 M4: under the uid split, run the worker with umask 002 so (a) the runner-owned
   // /data subtrees the worker mkdirs (runner clone parents, per-run SDK HOME, provision)
   // are group-`runner`-writable — runner and runner-cmd children can then create/access their per-run
@@ -346,10 +395,27 @@ async function main(): Promise<void> {
   log.addSecret(config.workerToken);
   fatalLog = log;
   lifecyclePhase = "startup";
+  if (epochOwnership) log.info("pod epoch participation", {
+    mode: epochOwnership.mode, consumption: epochConsumption?.result,
+  });
+  // Issue #3382: optional Go build concurrency defaults for every scrubbed command env.
+  configureGoConcurrency(config.goConcurrency);
+  log.info("go concurrency defaults", {
+    build_parallelism: config.goConcurrency.buildParallelism ?? "unset",
+    max_procs: config.goConcurrency.maxProcs ?? "unset",
+  });
   // #3031 E6: bounded, non-gating posture diagnostics; the producer never gates on them.
   const bootstrap = maintenanceBootstrapRoots();
   log.info("terminal maintenance bootstrap posture", { ...readMaintenancePosture(),
     bootstrap: bootstrap === undefined ? "refused" : bootstrap.length });
+
+  // Issue #3404 M1a: take the process-lifetime worker lock W before ensureRunnerTmpdir, any
+  // registration, sweep or admission. A second compatible worker, a missing util-linux flock,
+  // an unsupported filesystem, untrusted lock metadata, or an unavailable descriptor path
+  // (/proc/self/fd, needed to create the lock through a held directory) refuses startup (fatal handler). The
+  // descriptor is retained for the whole process; nothing here can release it.
+  installWorkerLifetime(await acquireWorkerLifetime(config.dataDir, { signal: controller.signal }));
+  log.info("worker lifetime lock acquired");
 
   // Issue #3153: when TMPDIR lives under the (now persistent) `<dataDir>/runner`, confirm it is a
   // real, worker-owned, writable directory BEFORE anything uses a temp path. A symlink or
@@ -462,7 +528,10 @@ async function main(): Promise<void> {
   const memory = config.memoryGuard?.enabled
     ? new WorkerMemoryRuntime(config.memoryGuard, client, log, { secrets: [config.workerToken] })
     : undefined;
-  const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId));
+  // Issue #3404 M2 U3: the authority runtime over the W capability acquired at startup. Every
+  // production path that reaches a hooked GitCache effect opens its transaction through it.
+  const authority = new AuthorityRuntime({ lifetime: requireWorkerLifetime(), workerToken: config.workerToken, log });
+  const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId), authority);
 
   // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
   // (the bare clone/fetch, the fetch-back, the outbox reserve), preflights the volume at claim and
@@ -550,6 +619,7 @@ async function main(): Promise<void> {
       dockerWiring: config.dockerWiring,
       codexCommandSandbox: config.codexCommandSandbox,
       codexSandboxDegraded: config.codexHarness.degraded,
+      codexCommandCacheRunBytes: config.codexCommandCacheRunBytes,
     });
   // PRD #1429 M3: the Codex advice-harness factory judge/review thread into
   // runReadOnlyModelPass (model-pass.ts) so a Codex judge/review claim (secrets.codex
@@ -616,6 +686,7 @@ async function main(): Promise<void> {
     log,
   });
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
+    authority,
     maintenanceExclusion,
     memoryRuntime: memory,
     recoveryLiveTiming: buildRecoveryLiveTiming(config.executor, log),
@@ -880,7 +951,7 @@ async function main(): Promise<void> {
   // issue #1786: the operator retained-source channel (a local 0600 Unix socket, started and closed
   // by Worker.run). Its idle probe reads the worker's own active sets, hence the late-bound `worker`.
   const retainedSource = new RetainedSourceServer({
-    dataDir: config.dataDir, git, client, gate: dindGate, runner, log,
+    dataDir: config.dataDir, git, client, gate: dindGate, runner, log, authority,
     isIdle: () => worker?.isIdle() ?? false,
   });
   notifyRetained = () => { void retainedSource.reportRetained(); };
@@ -913,32 +984,14 @@ async function main(): Promise<void> {
     memory,
   );
 
-  // Signal handlers FIRST, before anything that can take real time. Until these
-  // are installed a SIGTERM hits Node's default disposition and terminates the
-  // process immediately, so a container stopped during startup dies rather than
-  // shutting down — and the HOME reclaim below is exactly the kind of startup work
-  // that can be in flight when a rollout sends SIGTERM.
-  const controller = new AbortController();
-  for (const sig of ["SIGINT", "SIGTERM"] as const) {
-    process.on(sig, () => {
-      shutdownSignal = sig;
-      log.info("shutting down", { signal: sig, phase: lifecyclePhase, cause: "signal" });
-      // PRD #218 M1: trigger the run lane's graceful shutdown FIRST — it marks every
-      // in-flight run and aborts its controller so each fetches its committed work back
-      // into the worker bare as it unwinds (the sweeper then requeues a run whose tree
-      // is safe). shutdown() does no git and is synchronous; the fetch-backs run inside
-      // the unwinding execute()s, which the claim-loop drain — gated by `worker.run`
-      // below — waits for within the container's termination grace. controller.abort()
-      // then unblocks the loops as today.
-      // Revoke memory authority before any cancellation can begin or await IO.
-      void worker.shutdownMemory();
-      runner.shutdown();
-      // PRD #1906 M4: abort any in-flight isolated research session too; each reports its
-      // run failed as it unwinds, so the drain does not wait out the run's timeout.
-      isolatedRunner.shutdown();
-      controller.abort();
-    });
-  }
+  // Preserve shutdown ordering: revoke memory, initiate run-lane drain, then
+  // abort loops. The early signal handler also cancels startup lock waits.
+  shutdownRuntime = () => {
+    void worker.shutdownMemory();
+    runner.shutdown();
+    isolatedRunner.shutdown();
+  };
+  if (controller.signal.aborted) shutdownRuntime();
 
   // PRD #108 M6: one-off reclaim of HOMEs stranded by the pre-fix cleanup, which
   // could not remove the Go module cache's 0555 directories (167.3 MB measured for
@@ -995,6 +1048,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (epochBootstrap && epochOwnership && epochConsumption) {
+    const result = await runPodEpochShadow({
+      bootstrap: epochBootstrap, ownership: epochOwnership, consumption: epochConsumption,
+      dockerHost: config.dockerWiring.dockerHost, git, client, signal: controller.signal,
+    });
+    if (result !== undefined) log.info("pod_epoch_reclaim", { ...result });
+  }
+  if (controller.signal.aborted) return;
+
   lifecyclePhase = "worker";
   await worker.run(controller.signal);
   lifecyclePhase = "stopped";
@@ -1034,6 +1096,9 @@ if (isEntrypoint) {
       process.stderr.write(JSON.stringify({ level: "error", msg: "fatal", error: message,
         cause: "exception", phase: lifecyclePhase, exit_code: 1 }) + "\n");
     }
+    // Unsettled owned filesystem work can keep the event loop alive. Terminate
+    // with EX still held; only process exit releases epoch ownership in this case.
+    if (err instanceof PodEpochSettlementError) process.exit(1);
     process.exitCode = 1;
   });
 }

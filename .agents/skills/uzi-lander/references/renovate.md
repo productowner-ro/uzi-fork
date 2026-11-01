@@ -6,23 +6,24 @@ around it. `S` is `.agents/skills/uzi-lander/scripts/`.
 ## Before touching one
 
 - **Diff its target against `origin/main`** (`git show origin/main:<file>`): another merge
-  may already satisfy it, a redundant PR Renovate will auto-close.
+  may already satisfy it, a redundant PR to close (step 4 of the code-change section).
 - **Renovate authors as the repo owner**, so the ruleset's non-author approval can never
   be met: merge with `--admin` directly (references/merge-mechanics.md).
 - **Never push to a `renovate/*` branch.** Renovate rebases and force-pushes it, clobbering
   your commit; `S/land-prep.sh` refuses one. A needed fix goes on your own branch (below).
-- **Renovate rebases only at night** (`renovate.json` `schedule` plus `updateNotScheduled:
+- **Renovate works only in its weekly window, Saturday 00:00-06:59 Bucharest** (`renovate.json`
+  `schedule`, `automergeSchedule`, `lockFileMaintenance.schedule`, plus `updateNotScheduled:
   false`), except vulnerability-alert PRs (`[security]`), which bypass the schedule and
-  hourly limit and can open and update by day. A conflicting non-security Renovate PR
-  normally waits until night: tick its rebase checkbox (honoured outside the schedule, on
-  Renovate's next run, up to 4 h away), or re-apply the same bump on your own branch off `main` and let Renovate close its PR.
-- **Patch updates automerge** (`renovate.json`, first `packageRules` entry): on a run inside
-  its night schedule, Renovate rebases a behind branch, then merges once every check is green,
+  hourly limit and can open and update any day. A conflicting non-security Renovate PR
+  normally waits for the next window: tick its rebase checkbox (honoured outside the schedule, on
+  Renovate's next run, up to 4 h away), or re-apply the same bump on your own branch off `main` and close its PR once yours merges.
+- **Patch updates automerge** (`renovate.json`, patch `packageRules` entry): on a run inside
+  its weekly window, Renovate rebases a behind branch, then merges once every check is green,
   at most one PR per run. A green patch PR can therefore still be open: awaiting the next
   scheduled run, mid-rebase, in a group that also carries a minor or digest (a group
   automerges only when every update in it does), or excluded (the agent runtimes: Codex runtime,
   `@anthropic-ai/claude-agent-sdk`). Land it by hand like any other.
-  A red `main` after a night with no lander merge may be one of these.
+  A red `main` after a Saturday-morning window with no lander merge may be one of these.
 - **A pending `renovate/stability-days` blocks automerge** even though GitHub does not require
   it (`internalChecksFilter: strict`), and a release with no timestamp can keep it pending
   indefinitely. Keep the age guard; such a PR needs a manual landing (next bullet).
@@ -52,7 +53,7 @@ anything the rules below do not settle.
 
 `renovate.json` extends `config:recommended`, so `separateMajorMinor` is on: a package at
 `1.2` with `1.3` and `2.0` available gets two PRs. Landing the major supersedes the minor
-(Renovate auto-closes it once the major merges, or close it yourself). A major is breaking
+(close it once the major merges). A major is breaking
 by definition, so vet it first: read the breaking-changes entries in the PR body's Release
 Notes (`gh pr view <n> --json body -q .body`) or the upstream CHANGELOG between the two
 versions, for anything touching how uzi uses the package.
@@ -133,7 +134,7 @@ Treat it as Renovate-class, plus:
 ## A Renovate PR red because the new version needs a code change
 
 Do NOT fix it on the Renovate branch. Make your own branch that bumps the dep and carries the
-fix, and let Renovate auto-close its PR.
+fix, then close its PR.
 
 1. **Diagnose against both versions first.** Reproduce in a throwaway worktree (off the
    Renovate branch, or off `main` with the version installed) and run the same thing on the
@@ -151,5 +152,8 @@ fix, and let Renovate auto-close its PR.
    approval, then `gh pr comment <n> --body "@coderabbitai review"` overrides the skip
    regardless of title. Otherwise one local reviewer, or CI alone with the decision stated.
    Admin-merge when green.
-4. **Renovate auto-closes its PR** on its next run once `main` is at the target version.
-   Do not close it by hand; to not wait, fire a run (the `/renovate` skill has how).
+4. **Close Renovate's PR once fresh `origin/main` satisfies every update it contains,**
+   coordinated pins included; a digest needs the matching digest, not a "newer" one. Verify
+   each file, then `gh pr close N --comment "Superseded by #M (merged SHA)."`. Leave it open
+   while any update is unsatisfied. Renovate's later ignore or recreate behaviour depends on
+   the PR's branch/title identity and update type (a closed major "to vN" PR can suppress later vN releases).

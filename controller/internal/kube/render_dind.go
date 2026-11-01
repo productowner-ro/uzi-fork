@@ -209,7 +209,7 @@ var (
 // size, including jumbo frames). Validate syntax and length before any numeric
 // comparison so shell integer width and octal parsing cannot affect the result.
 // Successful discovery can only lower Docker's default MTU of 1500. Incomplete
-// discovery warns and preserves the original daemon argv without generating config.
+// discovery warns and preserves unchanged MTU defaults without generating config.
 // Docker 29 accepts default-network-opts only in daemon JSON, so keep that
 // setting in a private sidecar-local file and the listener/bridge MTU in argv.
 func rootfulDindCommand(netDir string) []string {
@@ -218,8 +218,8 @@ func rootfulDindCommand(netDir string) []string {
     exit 1
 }
 fallback() {
-    printf 'dind MTU warning: %s; starting dockerd with unchanged defaults\n' "$1" >&2
-    exec dockerd --host=tcp://127.0.0.1:2375 --tls=false
+    printf 'dind MTU warning: %s; starting dockerd with unchanged MTU defaults\n' "$1" >&2
+    exec dockerd --host=tcp://127.0.0.1:2375 --tls=false --dns-search=. --dns-opt=ndots:0
 }
 [ -d "$1" ] || fallback "network interface directory unavailable: $1"
 min=
@@ -248,7 +248,7 @@ done
 umask 077
 config=$(mktemp /tmp/uzi-dind-daemon.XXXXXX) || fail "cannot create daemon config in /tmp"
 printf '{"default-network-opts":{"bridge":{"com.docker.network.driver.mtu":"%s"}}}\n' "$min" > "$config" || fail "cannot write daemon config: $config"
-exec dockerd --host=tcp://127.0.0.1:2375 --tls=false "--mtu=$min" "--config-file=$config"
+exec dockerd --host=tcp://127.0.0.1:2375 --tls=false --dns-search=. --dns-opt=ndots:0 "--mtu=$min" "--config-file=$config"
 `, "dind-mtu", netDir}
 }
 
@@ -303,6 +303,7 @@ func dindContainer(cfg RenderConfig) corev1.Container {
 	var sc *corev1.SecurityContext
 	var env []corev1.EnvVar
 	var command []string
+	var args []string
 	var probeCmd string
 	var dataDir string
 
@@ -335,6 +336,8 @@ func dindContainer(cfg RenderConfig) corev1.Container {
 		// readiness signal (the socket existing is not the daemon being up).
 		probeCmd = "docker -H " + dindLoopbackTCP + " info >/dev/null 2>&1"
 	} else {
+		// Keep the image entrypoint for rootless setup and pass daemon DNS defaults through it.
+		args = []string{"--dns-search=.", "--dns-opt=ndots:0"}
 		uid, gid := dindUID, dindGID
 		runAsNonRoot := true // uid 1000 is non-root
 		dataDir = dindDataDir
@@ -361,6 +364,7 @@ func dindContainer(cfg RenderConfig) corev1.Container {
 		Image:           cfg.DinDImage,
 		RestartPolicy:   &always,
 		Command:         command, // nil for rootless (image entrypoint), set for non-rootless
+		Args:            args,    // rootless only; rootful passes daemon flags in its shell command
 		Env:             env,
 		SecurityContext: sc,
 		Resources:       cfg.dindResources(),
@@ -533,15 +537,25 @@ var dindMeterResources = corev1.ResourceRequirements{
 // the worker's freshness bound turns a stale sample into "no sample". A failed stat
 // prints one fixed line to the container's stderr (stat's own output stays discarded) so
 // a meter that can never sample is visible in `kubectl logs`, not silent.
+//
+// It exits 0 promptly on SIGTERM (issue #3421). Native sidecars stop in reverse order
+// after the worker, so the meter is signalled before dind; the shell is PID 1 of the
+// container's PID namespace, where the kernel drops a signal that has no handler, so
+// without the trap it would hold the pod stop until grace expiry and exit 137. The
+// trap alone is not enough: a trap waits for a FOREGROUND child to finish, so the sleep
+// runs in the background under an interruptible `wait`. The orphaned sleep dies when
+// the meter container's private PID namespace is torn down after its PID 1 exits.
+// TestDindMeterScriptExitsZeroPromptlyOnSIGTERM guards this.
 func dindMeterScript() string {
 	return fmt.Sprintf(`set -u
+trap 'exit 0' TERM
 while :; do
   if s=$(stat -f -c '%%S %%b %%f %%c %%d' %[1]s 2>/dev/null); then
     t=$(date +%%s) && printf 'v1 %%s %%s\n' "$t" "$s" > %[2]s.tmp && mv -f %[2]s.tmp %[2]s
   else
     echo "dind-meter: statfs sample failed" >&2
   fi
-  sleep %[3]d
+  sleep %[3]d & wait $!
 done
 `, dindMeterDataDir, dindMeterFile, dindMeterIntervalSeconds)
 }

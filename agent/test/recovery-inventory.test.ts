@@ -1,8 +1,10 @@
+import { CredentialSwitchSignal } from "../src/steering.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Readable } from "node:stream";
 import { makeScratchRoot } from "./fixture-repo.js";
 import { it } from "node:test";
+import type { ProcessQuiescence, QuiesceRunRequest, QuiesceRunOutcome } from "../src/run-quiescence.js";
 import { RunRunner } from "../src/runner.js";
 import { prepareFrozenHeld, type HeldGit } from "../src/frozen-held.js";
 import { RequestError } from "../src/client.js";
@@ -12,8 +14,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { RecoveryCoordinator, canonicalJson, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type RecoveryArchiveClient, type RecoveryRecord } from "../src/recovery.js";
-import { createHash, createHmac } from "node:crypto";
+import { RecoveryCoordinator, canonicalJson, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type RecoveryArchiveClient, type RecoveryRecord, type RecoveryCoordinatorOptions } from "../src/recovery.js";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { buildRecoveryLiveTiming } from "../src/main.js";
@@ -822,6 +824,92 @@ it("review G2 V1 rollback replays a lost held FINAL without exact observations o
     assert.equal(f.state.produced, 0);
   } finally { await f.close(); }
 });
+
+for (const representation of ["legacy", "reused", "failed-reuse", "rollback", "abort", "io"] as const) {
+  it(`coverage reuse ${representation}: frozen re-proof preserves FINAL compatibility`, async t => {
+    const f = await fixture();
+    try {
+      const data = path.join(f.root, "data"), bare = path.join(data, "repos", "repo.git");
+      await fs.mkdir(path.dirname(bare), { recursive: true, mode: 0o700 });
+      const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_AUTHOR_NAME: "fixture", GIT_AUTHOR_EMAIL: "fixture@example.test",
+        GIT_COMMITTER_NAME: "fixture", GIT_COMMITTER_EMAIL: "fixture@example.test" };
+      const git = (args: string[], input?: string) => execFileSync("git", ["--git-dir", bare, ...args],
+        { env, input, encoding: "utf8", stdio: "pipe" }).trim();
+      execFileSync("git", ["init", "--bare", bare], { env, stdio: "pipe" });
+      await fs.chmod(bare, 0o700);
+      const blob = git(["hash-object", "-w", "--stdin"], "retained bytes\n");
+      const tree = git(["mktree"], `100644 blob ${blob}\tRETAINED.txt\n`);
+      const head = git(["commit-tree", tree, "-m", "retained work"]);
+      git(["update-ref", "refs/remotes/origin/main", head]);
+      f.context.barePath = bare;
+      f.context.defaultIdentity = { ref: "refs/remotes/origin/main", sha: head };
+      f.state.candidates = [{ sha: head, pinRef: `refs/owed/${head}`, contexts: [structuredClone(f.context)] }];
+      f.state.ancestors = new Set([head]);
+      const cache = new GitCache(data, nullLogger(), undefined, testGitCacheOptions());
+      const first = await cache.buildRecoveryCoverage(bare, { ...f.context, generation: 1 }, [head], head);
+      const build = cache.buildRecoveryCoverage.bind(cache);
+      Object.assign(f.git, { buildRecoveryCoverage: representation === "legacy"
+        ? (...args: Parameters<typeof build>) => build(args[0], args[1], args[2], args[3])
+        : build, readRecoveryCoverageClaim: cache.readRecoveryCoverageClaim.bind(cache) });
+      const record = await f.coordinator.freezeInventory({ context: f.context,
+        currentSha: first.sha, originalSourceSha: first.sha, defaultBranch: "main" });
+      assert.ok(record);
+      Object.assign(f.git, { buildRecoveryCoverage: build });
+      assert.equal(record.sourceSha === first.sha, representation !== "legacy");
+      const source = record.sourceSha, digest = record.coverageDigest!;
+      const pin = `refs/uzi-coverage/${f.context.runId}/${f.context.generation}/${digest}`;
+      for (const ref of git(["for-each-ref", "--format=%(refname)", "refs/uzi-coverage/"]).split("\n"))
+        git(["update-ref", "-d", ref]);
+      if (representation === "abort" || representation === "io") {
+        git(["update-ref", pin, source]);
+        const failure = representation === "abort" ? new DOMException("cancelled", "AbortError") :
+          Object.assign(new Error("object read failed"), { code: "EIO" });
+        t.mock.method(cache as unknown as { readMarkerWrapperGraph(): Promise<unknown> }, "readMarkerWrapperGraph",
+          async () => { throw failure; });
+        await assert.rejects(f.coordinator["frozenCoverageProven"](record), error => error === failure);
+        assert.equal(git(["rev-parse", pin]), source, "operational failures do not mutate the frozen pin");
+        assert.equal(f.finals.length, 0);
+        return;
+      }
+      if (representation === "failed-reuse") {
+        git(["update-ref", pin, source]);
+        t.mock.method(cache as unknown as { reusableRecoveryCoverage(): Promise<boolean> }, "reusableRecoveryCoverage", async () => false);
+        assert.equal(await f.coordinator["frozenCoverageProven"](record), false);
+        assert.equal(git(["rev-parse", pin]), source, "failed required reuse must not overwrite an immutable inventory pin");
+        await f.capture(record);
+        assert.equal(f.finals.length, 0);
+        return;
+      }
+      if (representation === "rollback") {
+        Object.assign(f.git, { buildRecoveryCoverage:
+          (...args: Parameters<typeof build>) => build(args[0], args[1], args[2], args[3]) });
+        assert.equal(await f.coordinator["frozenCoverageProven"](record), false, "old worker cannot falsely prove a reused record");
+        await f.capture(record);
+        assert.equal(f.finals.length, 0);
+        return;
+      }
+      assert.equal(await f.coordinator["frozenCoverageProven"](record), true);
+      assert.equal(git(["rev-parse", pin]), source, "rebuilding after cleanup restores the exact frozen source");
+      await f.capture(record);
+      assert.equal(f.state.uploads, 1);
+      assert.equal(f.finals.length, 1);
+      const stored = (await f.coordinator.inspect(f.context.runId))[0]!;
+      assert.equal(stored.finalAcknowledged, true);
+      assert.equal(stored.sourceSha, source);
+      assert.equal(stored.coverageDigest, digest);
+      if (representation === "reused") {
+        let submissions = 0;
+        Object.assign(f.client, { proveRecoveryArchiveRedundancy: async () => { submissions++; throw new Error("no claim expected"); } });
+        const budget = f.coordinator["startRedundancyBudget"]();
+        const claims = await f.coordinator["buildRedundancyClaims"]([stored], f.context.generation, bare, budget);
+        assert.deepEqual(claims, [], "the optional reader cannot attest an old message with the new inventory digest");
+        await f.coordinator["submitRedundancyClaims"](claims, budget);
+        assert.equal(submissions, 0);
+      }
+    } finally { await f.close(); }
+  });
+}
 
 for (const shape of ["65 heads", "large commit", "non-UTF8 commit"] as const) {
   it(`review G3 archive FINAL accepts producer-valid coverage with ${shape}`, async () => {
@@ -2484,7 +2572,148 @@ for (const kind of ["issue", "mr_rework"] as const) for (const cause of sourceDi
     });
   }
 
-async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = os.tmpdir(), receiptModel = false, runId = "run-1") {
+// Independent literal oracle for the complete producer vocabulary (#3467).
+const processCodes3467 = [
+  "status_unreadable", "status_unparsable", "unreadable_unattributed", "unreadable_no_other_claim",
+  "own_attempt", "live_attempt_conflict", "terminal_attempt", "unmarked_in_scope",
+  "unattributed_in_scope", "exclusive_idle_identity_unreadable", "exclusive_idle_status_unreadable",
+  "exclusive_idle_status_unparsable", "exclusive_idle_writer_present",
+];
+const private3467 = "private-detail-comm-cwd-argv-environment";
+function process3467(reasons: unknown[], state: "unverified" | "survivors" = "unverified"): ProcessQuiescence {
+  return { state, detail: private3467, killed: [987654321, 987654322],
+    processes: reasons.map(reason => ({ pid: 987654323, uid: 987654324, comm: private3467,
+      cwd: private3467, argv: private3467, environment: private3467, reason })) } as ProcessQuiescence;
+}
+const missing3467 = { quiescence_state: "missing", quiescence_process_counts: {}, killed: 0 };
+const cases3467 = [
+  { name: "unattributed", process: () => process3467(["unreadable_unattributed", "unreadable_unattributed"]),
+    sibling: true, counts: { unreadable_unattributed: 2 }, state: "unverified", killed: 2 },
+  { name: "survivors", process: () => process3467(["own_attempt", "terminal_attempt"], "survivors"),
+    sibling: false, counts: { own_attempt: 1, terminal_attempt: 1 }, state: "survivors", killed: 2 },
+  { name: "unknown composed non-string", process: () => process3467(["raw-malicious-reason", "own_attempt:kill_unconfirmed",
+      { toString() { assert.fail("reason must never be coerced"); } }]),
+    sibling: false, counts: { other: 3 }, state: "unverified", killed: 2 },
+  { name: "missing", process: () => undefined, sibling: false, counts: {}, state: "missing", killed: 0 },
+  { name: "throwing builder", process: () => {
+      const result = process3467(["own_attempt"]);
+      Object.defineProperty(result.processes[0], "reason", { get() { throw new Error(private3467); } });
+      return result;
+    }, sibling: true, counts: {}, state: "missing", killed: 0 },
+  { name: "overflow repeats", process: () => process3467([...processCodes3467, "status_unreadable",
+      "exclusive_idle_writer_present", "raw-malicious-reason"]), sibling: true,
+    counts: { status_unreadable: 2, status_unparsable: 1, unreadable_unattributed: 1, unreadable_no_other_claim: 1,
+      own_attempt: 1, live_attempt_conflict: 1, terminal_attempt: 1, unmarked_in_scope: 1, other: 7 },
+    state: "unverified", killed: 2 },
+  ...processCodes3467.map(code => ({ name: code, process: () => process3467([code]), sibling: false,
+    counts: { [code]: 1 }, state: "unverified", killed: 2 })),
+];
+for (const after of [false, true]) for (const sample of cases3467) {
+  it(`#3467 real runner coordinator bounded process fields ${sample.name} after=${after}`, async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    const trace: string[] = [], requests: QuiesceRunRequest[] = [];
+    const f = await fixture("runner", path.resolve(import.meta.dirname, "../../.uzi/scratch"), false, "run-1", { quiesceRun: async request => {
+      requests.push(request); trace.push(request.site!);
+      const process = !after || request.site === "inventory_source:after_runner_git" ? sample.process() :
+        { state: "quiescent", processes: [], killed: [], detail: "" };
+      return { process, docker: { state: "not_wired", removed: [], detail: "" } } as QuiesceRunOutcome;
+    } });
+    try {
+      const record = await f.freeze(); assert.ok(record);
+      f.git.readInventoryCloneHeads = async () => {
+        trace.push("inventory");
+        return { kind: "verified", heads: [], clones: [{ clonePath: "/fixture/owned", branch: "task", runId: "run-1" }], foreignOwners: [] } as never;
+      };
+      f.git.worktreeStatus = async () => { trace.push("status"); return []; };
+      const sibling = Promise.resolve();
+      if (sample.sibling) f.runnerState().executionTails.set("sibling", sibling);
+      const capturedLogs: Array<{ message: string; fields: unknown }> = [];
+      f.log.warn = (message, fields) => { capturedLogs.push({ message, fields }); throw new Error(private3467); };
+      const outcome = await f.capture(record);
+      const check = after ? "process_not_quiescent_after_git" : "process_not_quiescent_before_git";
+      const expected = { quiescence_state: sample.state, quiescence_process_counts: sample.counts,
+        killed: sample.killed, other_claim_in_flight: sample.sibling };
+      const serialized = JSON.stringify([f.producerDiagnostics, capturedLogs]);
+      for (const forbidden of [private3467, "987654321", "987654322", "987654323", "987654324",
+          "raw-malicious-reason", "own_attempt:kill_unconfirmed", '"detail"', '"comm"', '"cwd"', '"argv"', '"environment"'])
+        assert.equal(serialized.includes(forbidden), false, "privacy: " + forbidden);
+      // Assert producer data BEFORE coordinator normalization can hide a privacy/folding regression.
+      assert.deepEqual(f.producerDiagnostics, [{ check, summary: expected }], "producer bounded schema and exact folding");
+      assert.deepEqual(capturedLogs, [{ message: "recovery: inventory source boundary retained", fields: {
+        run_id: "run-1", generation: 7, capture_id: record.captureId, source_boundary_reason: check, ...expected,
+      } }], "coordinator logs all bounded process fields even when logger throws");
+      assert.deepEqual(trace, after ? ["inventory", "inventory_source", "status", "inventory_source:after_runner_git"] :
+        ["inventory", "inventory_source"], "sole quiesce seam and exact source proof trace");
+      assert.deepEqual(requests.map(request => request.otherClaimInFlight), after ? [sample.sibling, sample.sibling] : [sample.sibling]);
+      assert.deepEqual(f.boundaryResults, ["retained"]);
+      assert.equal(f.boundaryActions(), 0);
+      assert.equal(f.runnerState().inventoryReservations.size, 0);
+      assert.equal(f.runnerState().executionTails.has("run-1"), false);
+      assert.equal(f.runnerState().executionTails.get("sibling"), sample.sibling ? sibling : undefined);
+      const reason = "inventory_source_not_quiescent:" + check;
+      assert.equal(outcome.reason, reason);
+      assert.equal((await f.make("runner").inspect("run-1"))[0]!.reason, reason, "MAC-authenticated restart reason");
+      assert.deepEqual(f.finals, []); assert.equal(f.state.open, true);
+    } finally { await f.close(); Object.defineProperty(process, "platform", platform); }
+  });
+}
+
+for (const check of ["process_not_quiescent_before_git", "process_not_quiescent_after_git"] as const) {
+  const valid = { quiescence_state: "survivors", quiescence_process_counts: { own_attempt: 2, other: 1, terminal_attempt: 0 },
+    killed: 3, other_claim_in_flight: true };
+  const malformed: Array<{ name: string; summary?: unknown; expected?: Record<string, unknown> }> = [
+    { name: "legacy" },
+    { name: "extra fields discarded", summary: { ...valid, detail: private3467, pid: 987654321, argv: private3467 },
+      expected: { ...valid, quiescence_process_counts: { own_attempt: 2, other: 1 } } },
+    ...["arbitrary", "__proto__", "constructor", "own_attempt:kill_unconfirmed"].map(key => ({ name: key,
+      summary: { ...valid, quiescence_process_counts: { [key]: 1 } } })),
+    ...["raw-state", undefined, {}, 1].map(state => ({ name: "state " + String(state), summary: { ...valid, quiescence_state: state } })),
+    ...[NaN, Infinity, -1, 0.5, Number.MAX_SAFE_INTEGER + 1, "2"].flatMap(count => [
+      { name: "count " + String(count), summary: { ...valid, quiescence_process_counts: { own_attempt: count } } },
+      { name: "killed " + String(count), summary: { ...valid, killed: count } },
+    ]),
+    ...["true", 1, null, {}].map(value => ({ name: "boolean " + String(value), summary: { ...valid, other_claim_in_flight: value } })),
+    { name: "excess buckets", summary: { ...valid, quiescence_process_counts: Object.fromEntries(processCodes3467.slice(0, 9).map(code => [code, 1])) } },
+    { name: "throw after boolean", summary: Object.defineProperty({ other_claim_in_flight: true }, "quiescence_state",
+      { get() { throw new Error(private3467); } }) },
+  ];
+  for (const sample of malformed) it(`#3467 coordinator independent summary validation ${check} ${sample.name}`, async () => {
+    const f = await fixture(true, path.resolve(import.meta.dirname, "../../.uzi/scratch"));
+    try {
+      const record = await f.freeze(); assert.ok(record);
+      f.state.sourceRefused = true;
+      f.state.secondDiagnostic = { check: "boundary_exception" };
+      f.state.diagnostic = { check, ...(sample.name === "legacy" ? {} : { summary: sample.summary }) } as InventorySourceDiagnostic;
+      const bool = (sample.summary as { other_claim_in_flight?: unknown } | undefined)?.other_claim_in_flight;
+      const expected = sample.expected ?? { ...missing3467, ...(typeof bool === "boolean" ? { other_claim_in_flight: bool } : {}) };
+      const outcome = await f.capture(record);
+      assert.deepEqual(f.logs, [{ run_id: "run-1", generation: 7, capture_id: record.captureId,
+        source_boundary_reason: check, ...expected }], "independent coordinator safe schema");
+      assert.equal(outcome.reason, "inventory_source_not_quiescent:" + check);
+      assert.equal((await f.make().inspect("run-1"))[0]!.reason, outcome.reason);
+      assert.deepEqual(f.finals, []); assert.equal(f.state.open, true);
+    } finally { await f.close(); }
+  });
+  it(`#3467 throwing summary accessor preserves first check ${check}`, async () => {
+    const f = await fixture(true, path.resolve(import.meta.dirname, "../../.uzi/scratch"));
+    try {
+      const record = await f.freeze(); assert.ok(record);
+      f.state.sourceRefused = true;
+      f.state.secondDiagnostic = { check: "boundary_exception" };
+      f.state.diagnostic = Object.defineProperty({ check }, "summary", { get() { throw new Error(private3467); } });
+      const outcome = await f.capture(record);
+      assert.deepEqual(f.logs, [{ run_id: "run-1", generation: 7, capture_id: record.captureId,
+        source_boundary_reason: check, ...missing3467 }]);
+      assert.equal(outcome.reason, "inventory_source_not_quiescent:" + check);
+      assert.equal((await f.make().inspect("run-1"))[0]!.reason, outcome.reason);
+    } finally { await f.close(); }
+  });
+}
+
+async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = os.tmpdir(), receiptModel = false, runId = "run-1",
+  runnerOptions: ConstructorParameters<typeof RunRunner>[6] = {}) {
+  await fs.mkdir(rootParent, { recursive: true });
   const root = makeScratchRoot("inventory-", rootParent);
   const context: PositiveOwedCandidateContext = {
     runId, generation: 7, kind: "issue", branch: "task",
@@ -2499,12 +2728,16 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
     reserveError: undefined as Error | undefined,
     finalError: undefined as Error | undefined,
     oversized: false, cloneHeads: [] as string[], cloneReadable: true,
-    sourceRefused: false, sourceProofRefused: false, diagnostic: undefined as InventorySourceDiagnostic | undefined, cloneCause: undefined as string | undefined, uploads: 0, pinDeletes: 0, statusReads: 0, thin: false,
+    sourceRefused: false, sourceProofRefused: false, diagnostic: undefined as InventorySourceDiagnostic | undefined, secondDiagnostic: undefined as InventorySourceDiagnostic | undefined, cloneCause: undefined as string | undefined, uploads: 0, pinDeletes: 0, statusReads: 0, thin: false,
     produceWait: undefined as Promise<void> | undefined, produced: 0,
     onProduce: undefined as (() => void) | undefined,
     beforeFinalAck: undefined as (() => Promise<void>) | undefined,
   };
   const logs: Array<Record<string, unknown>> = [];
+  const producerDiagnostics: InventorySourceDiagnostic[] = [];
+  const boundaryResults: string[] = [];
+  let boundaryActions = 0;
+  let runnerState: { executionTails: Map<string, Promise<void>>; inventoryReservations: Set<string> } | undefined;
   const aggregates: string[][] = [];
   const finals: unknown[][] = [];
   let reserves = 0;
@@ -2618,6 +2851,7 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
     },
   };
   const git = {
+    worktreeStatus: async () => [] as string[],
     recoverySettlementRoot: path.join(root, "settlement"),
     deleteRecoveryPin: async () => { state.pinDeletes++; state.candidates = []; },
     readInventoryCloneHeads: async () => state.cloneReadable
@@ -2658,16 +2892,24 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
   const make = (sourceBoundary: boolean | "runner" = false,
     pendingGenerationReport?: (runId: string, generation: number) => boolean,
     onAuthoritativeGenerationReleased?: (runId: string, generation: number) => void,
-    testHooks?: { maintenanceBudget: () => MaintenanceBudget; afterPinObserve?: () => Promise<void> }) => {
+    testHooks?: { maintenanceBudget: () => MaintenanceBudget; afterPinObserve?: () => Promise<void> },
+    timing: Pick<RecoveryCoordinatorOptions, "liveBackoffBaseMs" | "liveBackoffCapMs" | "liveMaxPerPass" | "isExecuting"> = {}) => {
     let physical: { withInventorySourceBoundary(context: InventorySourceBoundaryContext,
       action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained"> };
     const coordinator = new RecoveryCoordinator({
     recoveryRoot: path.join(root, "journal"), workerToken: "local-worker-fixture",
-    log, client: client as never, git: git as never, now: () => state.now, pendingGenerationReport, onAuthoritativeGenerationReleased, testHooks,
-    withInventorySourceBoundary: sourceBoundary === "runner" ? (context, action) =>
-      physical.withInventorySourceBoundary(context, action) : sourceBoundary ? async (context, action) => {
+    log, client: client as never, git: git as never, now: () => state.now, pendingGenerationReport, onAuthoritativeGenerationReleased, testHooks, ...timing,
+    withInventorySourceBoundary: sourceBoundary === "runner" ? async (context, action) => {
+      const result = await physical.withInventorySourceBoundary({ ...context, reportDiagnostic: diagnostic => {
+        producerDiagnostics.push(diagnostic);
+        return context.reportDiagnostic?.(diagnostic);
+      } }, async prove => { boundaryActions++; await action(prove); });
+      boundaryResults.push(result);
+      return result;
+    } : sourceBoundary ? async (context, action) => {
       if (state.sourceRefused) {
         if (state.diagnostic) context.reportDiagnostic?.(state.diagnostic);
+        if (state.secondDiagnostic) context.reportDiagnostic?.(state.secondDiagnostic);
         return "retained";
       }
       await action(async () => {
@@ -2680,9 +2922,13 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
       return "passed";
     } : undefined,
     });
-    if (sourceBoundary === "runner") physical = new RunRunner(client as never, git as never,
-      () => { throw new Error("unreached executor"); }, nullLogger(), 20, undefined,
-      { recovery: coordinator }) as unknown as typeof physical;
+    if (sourceBoundary === "runner") {
+      const runner = new RunRunner(client as never, git as never,
+        () => { throw new Error("unreached executor"); }, log, 20, undefined,
+        { ...runnerOptions, recovery: coordinator });
+      physical = runner as unknown as typeof physical;
+      runnerState = runner as unknown as typeof runnerState;
+    }
     return coordinator;
   };
   const coordinator = make(sourceBoundary);
@@ -2693,7 +2939,8 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
     record, barePath: context.barePath, defaultBranch: "main",
   });
   return { root, context, state, logs, aggregates, finals, coordinator, make, freeze, capture, git,
-    captures, reserveKeys, committedReceipts, client, log,
+    captures, reserveKeys, committedReceipts, client, log, producerDiagnostics, boundaryResults,
+    runnerState: () => runnerState!, boundaryActions: () => boundaryActions,
     reserves: () => reserves, close: () => fs.rm(root, { recursive: true, force: true }) };
 }
 
@@ -4708,7 +4955,20 @@ function issue3152Backoff(c: RecoveryCoordinator, saved: RecoveryRecord) {
         const finalsBefore = f.finals.length;
         await live(3);
         issue3152Assert(lines, before, { path: "live", reason: c.reason, ...(c.field ? { field: c.field } : {}) }, rec);
-        assert.equal(f.finals.length, finalsBefore, "an exit never reaches FINAL");
+        if (c.name === "not_live_candidate") {
+          // The invalidated identity stays excluded; reconstruction may now settle
+          // an independently proven fresh archive for the same generation (#3561).
+          const old = (await f.coordinator.inspect(rec.runId)).find(r => r.captureId === rec.captureId)!;
+          assert.ok(old);
+          assert.equal(old.reason, "inventory_snapshot_changed");
+          assert.equal(old.finalRequest, undefined);
+          assert.ok(f.finals.length - finalsBefore <= 1, "reconstruction can settle at most one fresh archive");
+          for (const call of f.finals.slice(finalsBefore)) {
+            const disposition = call[3] as RecoveryFinalDisposition;
+            assert.equal(disposition.kind, "archive");
+            assert.notEqual((disposition as { capture_id: string }).capture_id, old.serverCaptureId);
+          }
+        } else assert.equal(f.finals.length, finalsBefore, "an exit never reaches FINAL");
       } finally { await f.close(); }
     });
   }
@@ -5015,3 +5275,1098 @@ it("issue3152 live_pass_cap is not logged for dropped records that are not inven
     assert.deepEqual(lines, []);
   } finally { await f.close(); }
 });
+
+for (const key of [undefined, "uzi/task/11111111-1111-4111-8111-111111111111"]) {
+  it("task checkpoint held policy rejects an unbound or foreign key at freeze and journal reload: " + key, async () => {
+    const runId = "22222222-2222-4222-8222-222222222222";
+    const f = await fixture(true, os.tmpdir(), false, runId);
+    try {
+      f.context.kind = "task";
+      for (const candidate of f.state.candidates) for (const context of candidate.contexts) context.kind = "task";
+      const policy = { version: 1 as const, blocked: false, everKnown: false, flaggedCommits: [],
+        ciGlobs: null, confirmedTip: H, checkpointKey: key, extraFloors: [] };
+      const refused = await f.coordinator.freezeInventory({
+        context: f.context, currentSha: H, defaultBranch: "main", heldPolicy: policy,
+      });
+      assert.ok(refused);
+      assert.equal(refused.heldPolicy, undefined, "invalid confirmation cannot become a persisted scan floor");
+      const authorized = { ...policy, checkpointKey: "uzi/task/22222222-2222-4222-8222-222222222222" };
+      await patchAuthenticated(f, refused, { heldPolicy: authorized });
+      assert.deepEqual((await f.make().inspect(runId))[0]?.heldPolicy, authorized,
+        "the exact run key survives an authenticated journal reload without changing branch identity");
+      await patchAuthenticated(f, refused, { heldPolicy: policy });
+      assert.deepEqual(await f.make().inspect(runId), [],
+        "a valid journal MAC cannot authorize another task key or an unbound confirmed tip");
+    } finally { await f.close(); }
+  });
+}
+
+// #3544: diagnostics describe existing refusals without changing custody decisions.
+function issue3544Lines(f: Awaited<ReturnType<typeof fixture>>) {
+  const lines: Array<Record<string, unknown>> = [];
+  f.log.info = (message, fields) => {
+    if (message === "recovery: inventory reconstruction") lines.push(structuredClone(fields!));
+  };
+  return lines;
+}
+
+for (const branch of ["source_ancestry_unproven", "root_context_uncovered"] as const) {
+  it(`#3544 coverage refusal identifies ${branch}`, async () => {
+    const f = await fixture(true);
+    try {
+      const lines = issue3544Lines(f);
+      f.state.sourceRefused = true;
+      const old = await f.freeze(); assert.ok(old);
+      await f.capture(old);
+      f.state.sourceRefused = false;
+      if (branch === "source_ancestry_unproven") f.state.cloneHeads = [H2];
+      else {
+        f.state.candidates.push({ sha: H2, pinRef: "refs/owed/PRIVATE-CONTEXT", contexts: [f.context] });
+        f.state.ancestors.add(H2);
+      }
+      await f.coordinator.resumePending(undefined, [(await f.coordinator.inspect("run-1"))[0]!]);
+      assert.equal((await f.coordinator.inspect("run-1"))[0]?.reason, "inventory_snapshot_changed");
+      assert.deepEqual(lines, [{ path: "boot", reason: branch, run_id: "run-1", generation: 7, capture_id: old.captureId }]);
+      assert.equal(f.finals.length, 0);
+      assert.equal(JSON.stringify(lines).includes("PRIVATE-CONTEXT"), false);
+    } finally { await f.close(); }
+  });
+}
+
+it("#3561 reconstruction replaces an invalidated match and reuses its eligible replacement", async () => {
+  const f = await fixture(true);
+  try {
+    const lines = issue3544Lines(f);
+    await f.coordinator.snapshotOwedInventory();
+    const [old] = await f.coordinator.materializeBootInventory(); assert.ok(old);
+    assert.equal(lines.at(-1)?.reason, "snapshot_created");
+    await f.coordinator.materializeBootInventory();
+    assert.equal(lines.at(-1)?.reason, "matching_snapshot_reused");
+    const count = lines.length;
+    await f.coordinator.materializeBootInventory();
+    assert.equal(lines.length, count, "unchanged matching outcome is not logged every pass");
+    f.state.sourceRefused = true;
+    await f.capture(old);
+    f.state.sourceRefused = false;
+    f.state.candidates.push({ sha: H2, pinRef: "refs/owed/temporary", contexts: [f.context] });
+    f.state.ancestors.add(H2);
+    await f.coordinator.resumePending(undefined, [(await f.coordinator.inspect("run-1"))[0]!]);
+    f.state.candidates.pop(); // synthetic characterization only; real-source test below accounts for pins
+    const oldBytes = await fs.readFile(issue3561File(f, old));
+    const [fresh] = await f.coordinator.materializeBootInventory();
+    assert.ok(fresh);
+    assert.notEqual(fresh.captureId, old.captureId, "a positively re-proven invalidated match needs a fresh identity");
+    assert.equal(lines.at(-1)?.reason, "snapshot_created");
+    assert.equal(fresh.reason, undefined);
+    const [same] = await f.coordinator.materializeBootInventory();
+    assert.equal(same?.captureId, fresh.captureId, "repeat reconstruction reuses the eligible replacement");
+    assert.equal(lines.at(-1)?.reason, "matching_snapshot_reused");
+    assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes);
+    assert.equal(f.finals.length, 0);
+    assert.equal(f.state.pinDeletes, 0);
+  } finally { await f.close(); }
+});
+
+for (const mode of ["generation", "kind", "executing", "inventory_feature", "hold_unavailable", "ownership_unsupported", "provenance_unavailable", "inventory_not_inactive", "nonpreferred_context", "current_source_missing", "source_boundary_retained", "source_proof_unavailable"] as const) {
+  it(`#3544 reconstruction refusal identifies ${mode}`, async () => {
+    const f = await fixture(true);
+    try {
+      const lines = issue3544Lines(f);
+      let context = f.context;
+      if (mode === "generation") context = { ...context, generation: null } as unknown as PositiveOwedCandidateContext;
+      if (mode === "kind") context = { ...context, kind: null } as unknown as PositiveOwedCandidateContext;
+      if (mode === "executing") (f.coordinator as any).isExecuting = () => true;
+      if (mode === "inventory_feature") f.state.feature = false;
+      if (mode === "hold_unavailable") f.state.open = false;
+      if (mode === "ownership_unsupported") delete (f.client as any).getRunOwnership;
+      if (mode === "provenance_unavailable") {
+        await fs.mkdir(path.join(f.root, "journal", "run-1"), { recursive: true });
+        await fs.writeFile(path.join(f.root, "journal", "run-1", "untrusted.json"), '{"private":"PRIVATE-PROVENANCE"}');
+      }
+      if (mode === "inventory_not_inactive") f.state.status = "running";
+      if (mode === "nonpreferred_context") { await f.freeze(); context = { ...context, branch: "other" }; }
+      if (mode === "current_source_missing") f.state.candidates = [];
+      if (mode === "source_boundary_retained") f.state.sourceRefused = true;
+      if (mode === "source_proof_unavailable") f.state.sourceProofRefused = true;
+      f.git.discoverOwedCandidates = async () => [{ context, candidates: structuredClone(f.state.candidates) }];
+      await f.coordinator.snapshotOwedInventory();
+      assert.deepEqual(await f.coordinator.materializeBootInventory(), []);
+      assert.equal(lines.at(-1)?.reason, mode);
+      const count = lines.length;
+      await f.coordinator.materializeBootInventory();
+      assert.equal(lines.length, count);
+      assert.equal(f.finals.length, 0); assert.equal(f.state.pinDeletes, 0);
+      assert.equal(JSON.stringify(lines).includes("PRIVATE-PROVENANCE"), false);
+      for (const line of lines) assert.ok(Object.keys(line).every(k => ["path", "reason", "run_id", "generation", "capture_id"].includes(k)));
+    } finally { await f.close(); }
+  });
+}
+
+it("#3544 reconstruction diagnostics remain bounded and throwing logs do not alter snapshots", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3544Lines(f);
+    const c = f.coordinator as any;
+    for (let n = 0; n < 300; n++) c.noteRedriveExit("boot", { runId: `run-${n}`, generation: 7, captureId: "" }, "current_source_missing", undefined, true);
+    assert.equal((c.inventoryDiagnosticLogged ?? c.redriveExitLogged).size, 256);
+    assert.equal(lines.length, 300);
+    c.noteRedriveExit("boot", { runId: "run-299", generation: 7, captureId: "" }, "current_source_missing", undefined, true);
+    assert.equal(lines.length, 300);
+    f.log.info = () => { throw new Error("PRIVATE-LOGGER"); };
+    await f.coordinator.snapshotOwedInventory();
+    const [record] = await f.coordinator.materializeBootInventory();
+    assert.ok(record);
+    assert.equal(record.reason, undefined);
+    assert.equal(f.finals.length, 0);
+  } finally { await f.close(); }
+});
+
+for (const publish of [false, true]) {
+  it(`#3561 real GitCache heartbeat reconstruction after ${publish ? "confirmed publication restores the fingerprint" : "changed inventory stays owed"}`, async () => {
+    const f = await fixture(true, os.tmpdir(), true);
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+    const git = (cwd: string, args: string[], input?: string) => execFileSync("git", ["-C", cwd, ...args],
+      { env, input, encoding: "utf8", timeout: 10000 }).trim();
+    try {
+      const data = path.join(f.root, "real-data"), bare = path.join(data, "repos", "repo.git"), remote = path.join(f.root, "published.git");
+      await fs.mkdir(path.dirname(bare), { recursive: true });
+      for (const dir of [bare, remote]) execFileSync("git", ["init", "--bare", dir], { env, stdio: "pipe", timeout: 10000 });
+      const tree = git(bare, ["mktree"], "");
+      const commit = (message: string, parent?: string) => git(bare, ["hash-object", "-t", "commit", "-w", "--stdin"],
+        `tree ${tree}\n${parent ? `parent ${parent}\n` : ""}author Fixture <fixture@example.com> 946684800 +0000\ncommitter Fixture <fixture@example.com> 946684800 +0000\n\n${message}\n`);
+      const base = commit("base"), h = commit("original", base), h2 = commit("transient head", h);
+      git(bare, ["update-ref", "refs/remotes/origin/main", base]);
+      Object.assign(f.context, { barePath: bare, defaultIdentity: { ref: "refs/remotes/origin/main", sha: base } });
+      const bind = (cache: GitCache) => Object.assign(f.git, {
+        enumerateOwedCandidates: cache.enumerateOwedCandidates.bind(cache),
+        discoverOwedCandidates: cache.discoverOwedCandidates.bind(cache),
+        buildRecoveryCoverage: cache.buildRecoveryCoverage.bind(cache),
+        readInventoryCloneHeads: cache.readInventoryCloneHeads.bind(cache),
+        committedTrackingOwnership: cache.committedTrackingOwnership.bind(cache),
+        ancestry: cache.ancestry.bind(cache),
+        produceRecoveryBundle: cache.produceRecoveryBundle.bind(cache),
+      });
+      let cache = new GitCache(data, f.log, undefined, testGitCacheOptions());
+      bind(cache);
+      const earlier = { ...f.context, runId: "earlier-context", generation: 6, branch: "earlier" };
+      assert.equal((await cache.updateTrackingRef(bare, earlier.branch, h, { context: earlier })).kind, "updated");
+      assert.deepEqual((await cache.enumerateOwedCandidates(bare, earlier.runId)).map(r => r.sha), [h]);
+      git(bare, ["push", remote, `${h}:refs/heads/published`]);
+      const confirmed = git(bare, ["ls-remote", remote, "refs/heads/published"]).split(/\s+/)[0]!;
+      assert.equal(confirmed, h);
+      assert.equal((await cache.updateTrackingRef(bare, f.context.branch, h, { context: f.context, remotelyConfirmedSha: confirmed })).kind, "updated");
+      assert.deepEqual(await cache.enumerateOwedCandidates(bare, "run-1"), []);
+      f.state.status = "running";
+      const old = await f.coordinator.freezeInventory({ context: f.context, currentSha: h, defaultBranch: "main", locallyQuiescent: true });
+      assert.ok(old);
+      f.state.sourceRefused = true;
+      await f.capture(old);
+      assert.equal(f.state.uploads, 1);
+      // A running claim may rewrite and then restore H. GitCache must retain the displaced H2.
+      assert.equal((await cache.updateTrackingRef(bare, f.context.branch, h2, { context: f.context, remotelyConfirmedSha: h })).kind, "updated");
+      assert.equal((await cache.updateTrackingRef(bare, f.context.branch, h, { context: f.context, remotelyConfirmedSha: h })).kind, "updated");
+      const owed = await cache.enumerateOwedCandidates(bare, "run-1");
+      assert.deepEqual(owed.map(r => r.sha), [h2]);
+      f.state.status = "cancelled"; f.state.sourceRefused = false;
+      await f.coordinator.resumePending(undefined, [(await f.coordinator.inspect("run-1"))[0]!]);
+      assert.equal((await f.coordinator.inspect("run-1"))[0]?.reason, "inventory_snapshot_changed");
+      if (publish) {
+        // Real independent publication and the existing positive-confirmation reconciler,
+        // never a raw pin deletion or a fake enumeration omitting H2.
+        git(bare, ["push", remote, `${h2}:refs/heads/published`]);
+        const tip = git(bare, ["ls-remote", remote, "refs/heads/published"]).split(/\s+/)[0]!;
+        assert.equal(tip, h2);
+        await cache.reconcileOwedCandidates(bare, "run-1", tip);
+        assert.deepEqual(await cache.enumerateOwedCandidates(bare, "run-1"), []);
+        assert.equal(git(remote, ["cat-file", "-t", h2]), "commit", "the displaced source survives independent publication");
+      }
+      // A new cache and coordinator read the persisted Git metadata and authenticated journals.
+      cache = new GitCache(data, f.log, undefined, testGitCacheOptions()); bind(cache);
+      const restarted = f.make(true);
+      const runner = new RunRunner(f.client as never, f.git as never,
+        () => { throw new Error("unreached executor"); }, f.log, 20, "local-worker-fixture", { recovery: restarted });
+      const lines = issue3544Lines(f);
+      // The earlier context comes from real persisted owed metadata, not an injected listing.
+      assert.deepEqual((await cache.enumerateOwedCandidates(bare, earlier.runId)).map(r => r.sha), [h]);
+      const list = f.client.listRecoveryHolds.bind(f.client);
+      (f.client as any).listRecoveryHolds = async (id: string) => id === "earlier-context" ? { run_id: id, holds: [] } : list(id);
+      (restarted as any).liveMaxPerPass = 1;
+      f.state.closeOnRelease = true;
+      const oldBytes = await fs.readFile(issue3561File(f, old));
+      let inspectedBeforeAck = false;
+      f.state.beforeFinalAck = async () => {
+        assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes, "historical refusal and signed bytes survive until settlement");
+        inspectedBeforeAck = true;
+      };
+      const visits: Array<{ pass: number; reason: unknown }> = [];
+      for (let pass = 0; pass < 4; pass++) {
+        const from = lines.length;
+        f.state.now += 3_600_000;
+        await runner.resumeLiveRecoveries(f.state.now);
+        visits.push(...lines.slice(from).map(l => ({ pass, reason: l.reason })));
+      }
+      // Settlement assertions precede diagnostics so the baseline red identifies liveness.
+      assert.equal(f.finals.length, 1, "reconstruction must obtain one exact archive FINAL ACK");
+      assert.equal(f.state.open, false, "the exact fixture hold must settle");
+      const records = await restarted.inspect("run-1");
+      const fresh = records.find(r => r.captureId !== old.captureId);
+      assert.ok(fresh?.finalAcknowledged, "the eligible replacement receives the ACK");
+      assert.equal(inspectedBeforeAck, true);
+      assert.deepEqual(visits.slice(0, 2), [
+        { pass: 0, reason: "hold_unavailable" },
+        { pass: 1, reason: "snapshot_created" },
+      ], "the earlier context rotates before the target, rather than starving it");
+      assert.ok(lines.some(l => l.path === "live" && l.reason === "snapshot_created" && l.capture_id === fresh.captureId));
+      assert.equal(f.state.pinDeletes, 0, "diagnostics never retire source records");
+      assert.deepEqual((await cache.enumerateOwedCandidates(bare, earlier.runId)).map(r => r.sha), [h], "the sibling source remains protected");
+    } finally { await f.close(); }
+  });
+}
+
+it("#3544 reconstruction keeps the pending immutable FINAL identity instead of replacing it", async () => {
+  const f = await fixture();
+  try {
+    const old = await f.freeze(); assert.ok(old);
+    f.state.finalError = new Error("API unavailable");
+    await f.capture(old);
+    const saved = (await f.coordinator.inspect("run-1"))[0]!;
+    assert.ok(saved.finalRequest);
+    f.state.candidates.push({ sha: H2, pinRef: "refs/owed/new", contexts: [f.context] });
+    f.state.ancestors.add(H2);
+    const lines = issue3544Lines(f);
+    await f.coordinator.snapshotOwedInventory();
+    assert.deepEqual(await f.coordinator.materializeBootInventory(), []);
+    assert.equal(lines.at(-1)?.reason, "pending_final");
+    assert.equal(lines.at(-1)?.capture_id, old.captureId);
+    assert.deepEqual((await f.coordinator.inspect("run-1"))[0]!.finalRequest, saved.finalRequest);
+    assert.equal(f.state.uploads, 1);
+    assert.equal(f.finals.length, 1);
+  } finally { await f.close(); }
+});
+
+it("#3544 reconstruction retains a pending held-publication identity before freezing", async () => {
+  const f = await v2FrozenFixture();
+  try {
+    f.state.finalError = new Error("FINAL unavailable");
+    await f.operate();
+    const saved = (await f.coordinator.inspect(f.context.runId))[0]!;
+    assert.equal(saved.finalRequest?.disposition.kind, "held_publication");
+    const lines = issue3544Lines(f);
+    await f.coordinator.snapshotOwedInventory();
+    assert.deepEqual(await f.coordinator.materializeBootInventory(), []);
+    assert.equal(lines.at(-1)?.reason, "pending_held_final");
+    assert.deepEqual((await f.coordinator.inspect(f.context.runId))[0]!.finalRequest, saved.finalRequest);
+    assert.equal(f.state.produced, 0);
+  } finally { await f.close(); }
+});
+
+it("#3544 unchanged reconstruction refusals stay deduplicated across live passes without a capture", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3544Lines(f);
+    f.state.status = "running";
+    await issue3152LivePasses(f, f.coordinator, 3);
+    assert.deepEqual(lines, [{ path: "live", reason: "inventory_not_inactive", run_id: "run-1", generation: 7 }]);
+    assert.equal(f.state.uploads, 0);
+    assert.equal(f.finals.length, 0);
+  } finally { await f.close(); }
+});
+
+type Issue3561Fixture = Awaited<ReturnType<typeof fixture>>;
+const issue3561File = (f: Issue3561Fixture, r: Pick<RecoveryRecord, "runId" | "captureId">) => path.join(f.root, "journal", r.runId, r.captureId + ".json");
+
+// Represent independently persisted capture identities, then authenticate them through
+// the production reader. No source inventory or release authority is fabricated here.
+async function issue3561Sibling(f: Issue3561Fixture, record: RecoveryRecord, patch: Partial<RecoveryRecord> = {}) {
+  const { mac: _mac, ...payload } = JSON.parse(await fs.readFile(issue3561File(f, record), "utf8"));
+  const body = { ...payload, captureId: randomUUID(), ...patch };
+  const key = createHmac("sha256", "local-worker-fixture").update("uzi-recovery-journal-v1").digest();
+  await fs.writeFile(issue3561File(f, body), JSON.stringify({ ...body, mac: createHmac("sha256", key).update(canonicalJson(body)).digest("hex") }));
+  const read = (await f.coordinator.inspect(body.runId)).find(r => r.captureId === body.captureId);
+  assert.ok(read, "sibling fixture must pass the real MAC and shape reader");
+  return read;
+}
+
+async function issue3561Invalidated(f: Issue3561Fixture) {
+  f.state.sourceRefused = true;
+  const old = await f.freeze(); assert.ok(old);
+  await f.capture(old);
+  await patchAuthenticated(f, old, { reason: "inventory_snapshot_changed" });
+  f.state.sourceRefused = false;
+  return (await f.coordinator.inspect(f.context.runId)).find(r => r.captureId === old.captureId)!;
+}
+
+for (const proof of ["unproven", "unavailable"] as const) {
+  it(`#3561 ${proof} ancestry retains the invalidated match without stamping signed bytes`, async () => {
+    const f = await fixture(true);
+    try {
+      const old = await issue3561Invalidated(f), before = await fs.readFile(issue3561File(f, old));
+      if (proof === "unproven") f.state.cloneHeads = [H2]; else f.state.cloneReadable = false;
+      let writes = 0;
+      const c = f.coordinator as any;
+      const write = c.writeExistingRecord.bind(c);
+      c.writeExistingRecord = (...args: any[]) => {
+        if (args[0].captureId === old.captureId) { writes++; throw new Error("ancestry selection attempted a journal write"); }
+        return write(...args);
+      };
+      const same = await f.freeze();
+      assert.equal(same?.captureId, old.captureId);
+      assert.deepEqual(await fs.readFile(issue3561File(f, old)), before);
+      assert.equal(writes, 0); assert.equal(f.state.produced, 1); assert.equal(f.state.uploads, 1);
+    } finally { await f.close(); }
+  });
+}
+
+for (const blocked of ["clone", "earlier journal"] as const) {
+  it(`#3561 stable uncovered ${blocked} creates no new records bundles uploads or FINALs across restart`, async () => {
+    const f = await fixture(true);
+    try {
+      const old = await issue3561Invalidated(f);
+      if (blocked === "clone") f.state.cloneHeads = [H2];
+      else {
+        const holds = f.client.listRecoveryHolds.bind(f.client);
+        f.client.listRecoveryHolds = async (...args: Parameters<typeof holds>) => {
+          const view = await holds(...args);
+          return { ...view, holds: [...view.holds, { hold_id: "hold-6", generation: 6, inventory_guarded: true, has_available_capture: false }] };
+        };
+        assert.ok(await f.coordinator.pin({ runId: "run-1", generation: 6, kind: "issue", branch: "earlier", sourceSha: H2, inventoryGuarded: true }),
+          "the exact earlier hold must permit a real authenticated source journal");
+      }
+      const before = await fs.readFile(issue3561File(f, old));
+      const count = (await f.coordinator.inspect("run-1")).length;
+      let c = f.coordinator;
+      for (let pass = 0; pass < 6; pass++) {
+        if (pass === 3) c = f.make(true);
+        f.state.now += 3_600_000;
+        await c.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+        assert.equal((await c.inspect("run-1")).length, count, `pass ${pass}: no replacement under unchanged incomplete coverage`);
+        assert.equal(f.state.produced, 1); assert.equal(f.state.uploads, 1); assert.equal(f.reserves(), 1); assert.equal(f.finals.length, 0);
+        assert.equal(f.state.open, true); assert.equal(f.state.pinDeletes, 0);
+        assert.deepEqual(await fs.readFile(issue3561File(f, old)), before);
+      }
+    } finally { await f.close(); }
+  });
+}
+
+for (const excluded of ["unauthenticated", "producer", "unknown origin", "not invalidated", "quiescence breach", "saved FINAL", "FINAL ACK", "completion receipt"] as const) {
+  it(`#3561 replacement eligibility excludes ${excluded}`, async () => {
+    const runId = "11111111-1111-4111-8111-111111111111";
+    const f = await fixture(true, os.tmpdir(), false, runId);
+    try {
+      let old = await f.freeze(); assert.ok(old);
+      if (excluded === "saved FINAL" || excluded === "FINAL ACK") {
+        old = await issue3152SaveFinal(f, old);
+      }
+      await patchAuthenticated(f, old, { reason: excluded === "not invalidated" ? undefined : excluded === "quiescence breach" ? "inventory_quiescence_breach" : "inventory_snapshot_changed",
+        ...(excluded === "FINAL ACK" ? { finalAcknowledged: true } : {}) });
+      if (excluded === "completion receipt") {
+        const receipt = JSON.parse(await fs.readFile(new URL("../../fixtures/completed-publication/state-ack.json", import.meta.url), "utf8")).ack.completed_publication_receipt;
+        await patchAuthenticated(f, old, { completionReceipt: { ...receipt, run_id: runId, generation: 7, branch: f.context.branch, final_head: H, observed_branch_head: H } });
+      }
+      if (excluded === "producer" || excluded === "unknown origin") {
+        const next = await issue3561Sibling(f, old, { captureId: excluded === "producer" ? "maintenance-v1-00000000-0000-4000-8000-000000000001" : "maintenance-invalid" });
+        await fs.unlink(issue3561File(f, old)); old = next;
+      }
+      if (excluded === "unauthenticated") {
+        const file = issue3561File(f, old), raw = JSON.parse(await fs.readFile(file, "utf8"));
+        await fs.writeFile(file, JSON.stringify({ ...raw, mac: "0".repeat(64) }));
+      }
+      const before = await fs.readFile(issue3561File(f, old));
+      const counts = [f.state.produced, f.state.uploads, f.reserves(), f.finals.length];
+      const same = excluded === "producer"
+        ? await (f.coordinator as any).producerPermit.run({ captureIds: new Set([old.captureId]), live: () => true }, () => f.freeze())
+        : await f.freeze();
+      if (excluded === "unauthenticated" || excluded === "unknown origin") assert.equal(same, undefined);
+      else assert.equal(same?.captureId, old.captureId);
+      assert.deepEqual(await fs.readFile(issue3561File(f, old)), before);
+      assert.deepEqual([f.state.produced, f.state.uploads, f.reserves(), f.finals.length], counts);
+    } finally { await f.close(); }
+  });
+}
+
+for (const order of ["invalidated first", "eligible first"] as const) {
+  it(`#3561 mixed records preserve eligible precedence and pending FINAL veto: ${order}`, async () => {
+    const f = await fixture(true);
+    try {
+      const old = await issue3561Invalidated(f);
+      const eligible = await issue3561Sibling(f, old, { reason: undefined, state: "pinned", bundlePath: undefined, byteSize: undefined, checksum: undefined, serverCaptureId: undefined });
+      const pending = await f.coordinator.freezeInventory({ context: f.context, currentSha: H2, originalSourceSha: H2, defaultBranch: "main" }); assert.ok(pending);
+      f.state.ancestors.add(H2);
+      const saved = await issue3152SaveFinal(f, pending);
+      const savedBytes = await fs.readFile(issue3561File(f, saved));
+      const c = f.coordinator as any, read = c.newReconstructionRecords.bind(c);
+      c.newReconstructionRecords = async (...args: any[]) => {
+        const rows: RecoveryRecord[] | undefined = await read(...args);
+        if (!rows) return rows;
+        const ids = order === "invalidated first" ? [old.captureId, eligible.captureId, saved.captureId] : [eligible.captureId, old.captureId, saved.captureId];
+        return [...rows].sort((a, b) => ids.indexOf(a.captureId) - ids.indexOf(b.captureId));
+      };
+      const count = (await f.coordinator.inspect("run-1")).length;
+      const costs = [f.state.produced, f.state.uploads, f.reserves(), f.finals.length];
+      assert.equal((await f.freeze())?.captureId, eligible.captureId, "existing eligible match precedes invalidated candidates and the allocation veto");
+      assert.deepEqual([f.state.produced, f.state.uploads, f.reserves(), f.finals.length], costs);
+      await fs.unlink(issue3561File(f, eligible));
+      assert.equal(await f.freeze(), undefined, "a distinct pending FINAL vetoes fresh allocation when no eligible match remains");
+      assert.equal((await f.coordinator.inspect("run-1")).length, count - 1);
+      assert.deepEqual(await fs.readFile(issue3561File(f, saved)), savedBytes);
+      assert.deepEqual([f.state.produced, f.state.uploads, f.reserves(), f.finals.length], costs);
+    } finally { await f.close(); }
+  });
+}
+
+it("#3561 stale uploaded archive cannot mint a twin FINAL after fresh reconstruction", async () => {
+  const f = await fixture(true, os.tmpdir(), true);
+  try {
+    const old = await issue3561Invalidated(f);
+    const fresh = await issue3561Sibling(f, old, { reason: undefined, state: "pinned", bundlePath: undefined, byteSize: undefined, checksum: undefined, serverCaptureId: undefined });
+    f.state.sourceRefused = true; await f.capture(fresh); f.state.sourceRefused = false;
+    const ready = (await f.coordinator.inspect("run-1")).find(r => r.captureId === fresh.captureId)!;
+    assert.notEqual(ready.serverCaptureId, old.serverCaptureId);
+    const oldBytes = await fs.readFile(issue3561File(f, old)), bundle = await fs.readFile(old.bundlePath!);
+    await (f.coordinator as any).finalizeInventory(old);
+    assert.equal(f.finals.length, 0, "an invalidated old reference must not mint the twin archive FINAL");
+    assert.equal(f.state.open, true);
+    assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes);
+    assert.deepEqual(await fs.readFile(old.bundlePath!), bundle);
+    await (f.coordinator as any).finalizeInventory(ready);
+    assert.equal(f.finals.length, 1);
+    assert.equal(f.state.open, false);
+    assert.equal((await f.coordinator.inspect("run-1")).find(r => r.captureId === ready.captureId)?.finalAcknowledged, true);
+  } finally { await f.close(); }
+});
+
+for (const kind of ["saved FINAL", "FINAL ACK", "completion receipt", "non-invalidated"] as const) {
+  it(`#3561 archive mint guard preserves ${kind} handling`, async () => {
+    const f = await fixture(true, os.tmpdir(), false, "11111111-1111-4111-8111-111111111111");
+    try {
+      f.state.sourceRefused = true; const r = await f.freeze(); assert.ok(r); await f.capture(r); f.state.sourceRefused = false;
+      let record = (await f.coordinator.inspect(f.context.runId))[0]!;
+      if (kind !== "non-invalidated") {
+        record = await issue3152SaveFinal(f, record);
+        await patchAuthenticated(f, record, { reason: "inventory_snapshot_changed", ...(kind === "FINAL ACK" || kind === "completion receipt" ? { finalAcknowledged: true } : {}) });
+        record = (await f.coordinator.inspect(f.context.runId))[0]!;
+      }
+      if (kind === "completion receipt") {
+        const receipt = JSON.parse(await fs.readFile(new URL("../../fixtures/completed-publication/state-ack.json", import.meta.url), "utf8")).ack.completed_publication_receipt;
+        await patchAuthenticated(f, record, { completionReceipt: { ...receipt, run_id: f.context.runId, generation: 7, branch: f.context.branch, final_head: H, observed_branch_head: H } });
+        record = (await f.coordinator.inspect(f.context.runId))[0]!;
+      }
+      const before = f.finals.length, request = structuredClone(record.finalRequest);
+      await (f.coordinator as any).finalizeInventory(record);
+      assert.equal(f.finals.length, before + (kind === "FINAL ACK" || kind === "completion receipt" ? 0 : 1));
+      if (request) assert.deepEqual((await f.coordinator.inspect(f.context.runId))[0]?.finalRequest, request);
+    } finally { await f.close(); }
+  });
+}
+
+it("#3561 generation cycle serializes concurrent replacement before source reads", async () => {
+  const f = await fixture(true);
+  let release!: () => void;
+  let first: Promise<RecoveryRecord | undefined> | undefined, second: Promise<RecoveryRecord | undefined> | undefined;
+  try {
+    const old = await issue3561Invalidated(f);
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const enumerate = f.git.enumerateOwedCandidates.bind(f.git);
+    let reads = 0;
+    f.git.enumerateOwedCandidates = async (...args: Parameters<typeof enumerate>) => {
+      if (++reads === 1) { entered(); await gate; }
+      return enumerate(...args);
+    };
+    const c = f.coordinator as any, cycleKey = c.cycleKey.bind(c);
+    const reconstruction = c.newReconstructionRecords.bind(c);
+    let attempts = 0;
+    c.newReconstructionRecords = (...args: any[]) => { attempts++; return reconstruction(...args); };
+    let keyReads = 0, secondAtCycle!: () => void;
+    const queued = new Promise<void>(resolve => { secondAtCycle = resolve; });
+    c.cycleKey = async (...args: any[]) => {
+      const key = await cycleKey(...args);
+      if (++keyReads === 2) secondAtCycle();
+      return key;
+    };
+    first = f.freeze(); await ready;
+    second = f.freeze(); await queued;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(attempts, 1, "second attempt cannot enter reconstruction before the held generation cycle");
+    assert.equal(reads, 1, "second attempt cannot overtake the held generation cycle");
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    assert.ok(a && b);
+    assert.notEqual(a.captureId, old.captureId, "healthy replacement obtains a fresh identity");
+    assert.equal(a.captureId, b.captureId);
+    assert.equal((await f.coordinator.inspect("run-1")).length, 2);
+  } finally { release?.(); await Promise.allSettled([first, second]); await f.close(); }
+});
+
+it("#3561 journal ownership prevents replacement writes until its holder releases", async () => {
+  const f = await fixture(true);
+  let release!: () => void;
+  let held: Promise<void> | undefined, replacing: Promise<RecoveryRecord | undefined> | undefined;
+  try {
+    const old = await issue3561Invalidated(f), c = f.coordinator as any;
+    let entered!: () => void, built!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const coverageReady = new Promise<void>(resolve => { built = resolve; });
+    held = c.withJournalLock("run-1", async () => { entered(); await gate; }); await ready;
+    const coverage = f.git.buildRecoveryCoverage.bind(f.git);
+    f.git.buildRecoveryCoverage = async (...args: Parameters<typeof coverage>) => { const value = await coverage(...args); built(); return value; };
+    let writes = 0;
+    const write = c.writeRecordUnlocked.bind(c);
+    c.writeRecordUnlocked = async (...args: any[]) => { writes++; return write(...args); };
+    const lock = c.withJournalLock.bind(c);
+    let selectionEntered = false, selectionAtLock!: () => void;
+    const queued = new Promise<void>(resolve => { selectionAtLock = resolve; });
+    c.withJournalLock = (run: string, action: () => Promise<unknown>, ...rest: unknown[]) => {
+      const waiting = lock(run, async () => { selectionEntered = true; return action(); }, ...rest);
+      selectionAtLock();
+      return waiting;
+    };
+    replacing = f.freeze(); await coverageReady; await queued;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(selectionEntered, false, "journal waiter cannot enter selection before the current holder");
+    assert.equal(writes, 0, "journal waiter cannot write before the current holder");
+    release(); await held;
+    const fresh = await replacing;
+    assert.ok(fresh);
+    assert.notEqual(fresh.captureId, old.captureId);
+    assert.equal(writes, 1);
+  } finally { release?.(); await Promise.allSettled([held, replacing]); await f.close(); }
+});
+
+// These route tests simulate upstream transport/quiescence facts, but execute both
+// production callers, the real freezeInventory, and the real downstream capture.
+async function issue3561RunnerCase(route: "terminal settlement" | "retained capture", proof: "verified" | "unproven", staleReference = false) {
+  const f = await fixture(true);
+  const budget = new MaintenanceBudget(60_000, () => 0);
+  try {
+    f.context.branch = "agent/issue-3561";
+    for (const candidate of f.state.candidates) candidate.contexts = [f.context];
+    const old = await issue3561Invalidated(f), oldBytes = await fs.readFile(issue3561File(f, old));
+    if (proof === "unproven") f.state.cloneHeads = [H2];
+    const signal = new AbortController().signal;
+    const downstream: string[] = [], captureIds: string[] = [], budgets: Array<MaintenanceBudget | undefined> = [];
+    let staleMinted = 0, staleFresh: RecoveryRecord | undefined, routeError: unknown;
+    Object.assign(f.client, { hasHeldPublicationV2: () => false });
+    Object.assign(f.git, {
+      retainCurrentOwedCandidate: async () => ({ kind: "updated", candidateSha: H, retainedShas: [] }),
+      withRecoveryOperation: async (_signal: AbortSignal, _deadline: number, action: (signal: AbortSignal) => Promise<unknown>, inherited?: MaintenanceBudget) =>
+        inherited ? MaintenanceBudget.run(inherited, () => action(inherited.signal)) : action(signal),
+      reserveRecoveryIteration: async () => ({ attempts: 1, deadline: Date.now() + 60_000, backoffMs: 0, claimGeneration: 7 }),
+      ensureClone: async () => f.context.barePath,
+      revParse: async () => H,
+    });
+    const runner = new RunRunner(f.client as never, f.git as never, () => { throw new Error("no model in route test"); },
+      f.log, 20, "local-worker-fixture", { recovery: f.coordinator });
+    const r = runner as any;
+    const flight: any = {
+      runId: f.context.runId, claimGeneration: 7, runKind: "issue", inventoryGuarded: true,
+      barePath: f.context.barePath, branch: f.context.branch, worktreePath: path.join(f.root, "kept-clone"),
+      owedContext: Promise.resolve(f.context), owedAnnounced: { heads: new Set(), archived: new Set() },
+      inventoryArchiveNotices: new Set(), ciConfigGuardGlobs: [], publishedRealTips: [],
+      runLog: f.log, executor: { sandboxesCommands: false }, cancel: new AbortController(),
+      cancellationBudget: budget, preserveRecoveryClone: true, preserveSession: true,
+      steering: { lifecycleSignal: () => signal, terminalLifecycleSignal: () => signal, claimFence: () => undefined,
+        isCancelled: () => false, pendingCredentialSwitch: () => undefined },
+      batcher: { emit() {} },
+    };
+    await fs.mkdir(flight.worktreePath); await fs.writeFile(path.join(flight.worktreePath, "source.txt"), "kept source");
+    const claim: any = { run_id: f.context.runId, kind: "issue", claim_generation: 7, issue_iid: 3561, inventory_guarded: true,
+      repo: { id: "00000000-0000-4000-8000-000000000008", default_branch: "main", clone_url: "https://fixture.invalid/repo" }, secrets: {} };
+    // Observe actual downstream arguments; do not substitute a freeze result.
+    const captureFrozen = r.captureFrozenInventory.bind(r);
+    r.captureFrozenInventory = async (...args: any[]) => { downstream.push(args[2].captureId); return captureFrozen(...args); };
+    const freeze = f.coordinator.freezeInventory.bind(f.coordinator);
+    Object.assign(f.coordinator, { freezeInventory: async (...args: Parameters<typeof freeze>) => {
+      budgets.push(MaintenanceBudget.current()); return freeze(...args);
+    } });
+    const capture = f.coordinator.captureAndUpload.bind(f.coordinator);
+    const stop = new CredentialSwitchSignal();
+    Object.assign(f.coordinator, { captureAndUpload: async (...args: Parameters<typeof capture>) => {
+      captureIds.push(args[0].record.captureId);
+      assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes, "freeze selection must not stamp or clear the old record");
+      let value: Awaited<ReturnType<typeof capture>> | undefined;
+      try {
+        if (staleReference) {
+          f.state.status = "failed";
+          // Freeze returned the retained old identity. Before its actual capture
+          // starts, another eligible capture exists; this caller still holds old.
+          f.state.cloneHeads = [];
+          const fresh = await issue3561Sibling(f, old, { reason: undefined, state: "pinned", bundlePath: undefined,
+            byteSize: undefined, checksum: undefined, serverCaptureId: undefined });
+          const c = f.coordinator as any, read = c.newReconstructionRecords.bind(c);
+          c.newReconstructionRecords = async (...values: any[]) => {
+            const rows: RecoveryRecord[] | undefined = await read(...values);
+            return rows && [...rows].sort((a, b) => Number(b.captureId === fresh.captureId) - Number(a.captureId === fresh.captureId));
+          };
+          assert.equal((await f.freeze())?.captureId, fresh.captureId, "independent eligible reconstruction works on the unmodified baseline too");
+          f.state.sourceRefused = true;
+          await capture({ record: fresh, barePath: f.context.barePath, defaultBranch: "main" });
+          f.state.sourceRefused = false;
+          staleFresh = (await f.coordinator.inspect(f.context.runId)).find(r => r.captureId === fresh.captureId)!;
+        }
+        // The running retained source may become terminal between its last check and capture.
+        f.state.status = "failed";
+        const before = f.finals.length;
+        value = await capture(...args);
+        if (staleReference) {
+          staleMinted = f.finals.length - before;
+          if (staleMinted === 0) {
+            assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes);
+            f.state.closeOnRelease = true;
+            await (f.coordinator as any).finalizeInventory(staleFresh!);
+          }
+        }
+      } catch (error) {
+        routeError = error;
+        if (route !== "retained capture") throw error;
+      }
+      if (route === "retained capture") throw stop; // stop before unrelated successor/model work
+      return value!;
+    } });
+    if (route === "terminal settlement") {
+      await r.settleGuardedInventory(claim, flight, H, undefined, undefined, true);
+    } else {
+      f.state.status = "running";
+      r.runFreeCapture = async (_claim: unknown, _flight: unknown, _deadline: number, _signal: AbortSignal, action: (held: unknown) => Promise<unknown>) =>
+        ({ kind: "observed_empty", value: await action({ signal }) });
+      r.assertHeldFreeCapture = () => {};
+      r.quiesceRun = async () => ({ blocked: false });
+      r.preflightDataVolume = async () => {};
+      r.checkWorkerResidueBeforeFetch = async () => {};
+      r.captureRecoveryRestorePoint = async () => ({ verified: true, published: false });
+      await assert.rejects(MaintenanceBudget.run(budget, () => r.recoverRetainedClaim(claim, flight, "issue-3561",
+        { runId: f.context.runId, clonePath: flight.worktreePath, attemptId: "predecessor" })), error => error === stop);
+    }
+    assert.equal(routeError, undefined, "downstream setup and actual capture must succeed before the controlled stop");
+    assert.equal(captureIds.length, 1, "the actual route must reach downstream archive capture");
+    if (staleReference) assert.equal(staleMinted, 0, "runner stale old reference must not mint a twin archive FINAL");
+    if (route === "terminal settlement") assert.deepEqual(downstream, captureIds);
+    if (proof === "verified") assert.notEqual(captureIds[0], old.captureId, "runner must drive the eligible fresh identity");
+    else assert.equal(captureIds[0], old.captureId, "unproven ancestry keeps the retained identity");
+    assert.ok(budgets.length > 0); assert.ok(budgets.every(b => b === budget));
+    assert.equal(flight.cancellationBudget, budget, "new ancestry work does not renew the existing allowance");
+    assert.equal(flight.preserveRecoveryClone, true);
+    assert.equal(await fs.readFile(path.join(flight.worktreePath, "source.txt"), "utf8"), "kept source");
+    // Existing finalization may persist its refusal again on the retained path.
+    // The no-write selection assertion above precedes that downstream operation.
+    if (proof === "verified" || staleReference) assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes);
+    else {
+      assert.equal((await f.coordinator.inspect(f.context.runId)).find(r => r.captureId === old.captureId)?.reason, "inventory_snapshot_changed");
+      assert.equal(f.finals.length, 0); assert.equal(f.state.uploads, 1);
+    }
+    if (staleReference) {
+      assert.equal(f.finals.length, 1);
+      assert.equal(f.state.open, false);
+      assert.equal((await f.coordinator.inspect(f.context.runId)).find(r => r.captureId === staleFresh?.captureId)?.finalAcknowledged, true);
+    }
+  } finally { budget.dispose(); await f.close(); }
+}
+
+for (const route of ["terminal settlement", "retained capture"] as const) {
+  for (const proof of ["verified", "unproven"] as const) {
+    it(`#3561 runner ${route} passes the ${proof === "verified" ? "fresh" : "retained"} identity from real freeze to downstream capture`,
+      () => issue3561RunnerCase(route, proof));
+  }
+  it(`#3561 runner ${route} blocks a stale archive mint while the fresh capture settles`,
+    () => issue3561RunnerCase(route, "unproven", true));
+}
+
+
+// #3614: actual queue/capture paths, with interface facts and an event-driven clock.
+function issue3614Gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+for (const setup of ["materialization-first", "saved-only compatibility"] as const) {
+  it(`#3614 heartbeat queue settles within 120s after ${setup} boot invalidation`, async () => {
+    const f = await fixture(true, os.tmpdir(), true);
+    let peerGate: ReturnType<typeof issue3614Gate> | undefined;
+    let pending: Promise<void> | undefined;
+    try {
+      f.state.sourceRefused = true;
+      const old = await f.freeze(); assert.ok(old); await f.capture(old);
+      f.state.sourceRefused = false;
+      let executing = true;
+      const timing = buildRecoveryLiveTiming("stub", f.log, { UZI_E2E_RECOVERY_FAST_REDRIVE: "1" });
+      assert.deepEqual(timing, { liveBackoffBaseMs: 1000, liveBackoffCapMs: 5000 });
+      const c = f.make(true, undefined, undefined, undefined, { ...timing, liveMaxPerPass: 4, isExecuting: () => executing });
+      const contexts = [f.context, ...Array.from({ length: 51 }, (_, i) => ({ ...f.context, runId: `z3614-${String(i).padStart(3, "0")}` }))];
+      const calls: Array<{ run: string; at: number }> = [];
+      const holds = f.client.listRecoveryHolds.bind(f.client);
+      Object.assign(f.client, { listRecoveryHolds: async (run: string) => {
+        calls.push({ run, at: f.state.now });
+        if (run === f.context.runId || run === "peer3614") return { ...await holds(run), run_id: run };
+        return { run_id: run, holds: [] };
+      } });
+      const enumerate = f.git.enumerateOwedCandidates.bind(f.git);
+      Object.assign(f.git, {
+        enumerateOwedCandidates: async (_bare: string, run: string) => run === "peer3614" ? [] : enumerate(),
+        discoverOwedCandidates: async () => contexts.map(context => ({ context, candidates: context === f.context ? structuredClone(f.state.candidates) : [] })),
+      });
+      const lines = issue3544Lines(f);
+      const changeRoots = () => {
+        executing = false;
+        f.state.ancestors.add(H2);
+        f.state.candidates.push({ sha: H2, pinRef: "refs/owed/late3614", contexts: [f.context] });
+      };
+      const materialize = c.materializeBootInventory.bind(c);
+      let boot = true;
+      Object.assign(c, { materializeBootInventory: async (...args: Parameters<typeof materialize>) => {
+        const value = await materialize(...args);
+        if (boot && setup === "materialization-first") changeRoots();
+        return value;
+      } });
+      await c.snapshotOwedInventory();
+      assert.equal((c as any).bootOwed.length, 52, "real discovery supplies all retained contexts");
+      await c.resumePending(undefined, await c.snapshotBootRecords(), true);
+      boot = false;
+      if (setup === "saved-only compatibility") {
+        changeRoots();
+        await c.resumePending(undefined, await c.snapshotBootRecords(), false);
+      }
+      const queue = (c as any).bootOwed as Array<{ context: PositiveOwedCandidateContext }>;
+      assert.equal(queue.length, 52);
+      assert.equal(queue.findIndex(e => canonicalJson(e.context) === canonicalJson(f.context)), 48, "boot rotated target behind exactly 48 contexts");
+      assert.ok(lines.some(l => l.reason === "root_context_uncovered" && l.capture_id === old.captureId), "actual boot FINAL coverage must invalidate the old archive");
+      const invalid = (await c.inspect(f.context.runId)).find(r => r.captureId === old.captureId)!;
+      assert.equal(invalid.reason, "inventory_snapshot_changed");
+      const before = await fs.readFile(issue3561File(f, invalid));
+
+      // An independent saved FINAL supplies real owned I/O in every live pass.
+      // Its retry is deliberately unresolved, so a covering target must bypass
+      // the discovery backlog rather than benefit from an empty instantaneous pass.
+      const peerContext = { ...f.context, runId: "peer3614", branch: "peer3614" };
+      const peer = await c.freezeInventory({ context: peerContext, currentSha: H, defaultBranch: "main", locallyQuiescent: true });
+      assert.ok(peer);
+      f.state.finalError = new Error("save independent peer FINAL");
+      await c.captureAndUpload({ record: peer, barePath: f.context.barePath, defaultBranch: "main" });
+      f.state.finalError = undefined;
+      assert.ok((await c.inspect("peer3614"))[0]?.finalRequest);
+      const release = f.client.releaseRecoveryCustody.bind(f.client);
+      let peerWaits = 0, peerEntered = issue3614Gate();
+      Object.assign(f.client, { releaseRecoveryCustody: async (...args: Parameters<typeof release>) => {
+        if (args[0] !== "peer3614") return release(...args);
+        peerWaits++;
+        peerGate = issue3614Gate();
+        peerEntered.resolve();
+        await peerGate.promise;
+        throw new Error("independent peer transport remains unavailable");
+      } });
+      f.state.closeOnRelease = true;
+      let checkedBeforeAck = false;
+      f.state.beforeFinalAck = async () => {
+        assert.deepEqual(await fs.readFile(issue3561File(f, invalid)), before, "old signed refusal remains protected until settlement");
+        checkedBeforeAck = true;
+      };
+      const runner = new RunRunner(f.client as never, f.git as never, () => { throw new Error("no model in queue regression"); },
+        f.log, 20, "local-worker-fixture", { recovery: c });
+      const start = f.state.now;
+      const initialCalls = calls.length;
+      const starts: number[] = [];
+      const live = c.resumeLive.bind(c);
+      Object.assign(c, { resumeLive: async (...args: Parameters<typeof live>) => {
+        if ((c as any).passes.size === 0 && f.state.now >= (c as any).nextPassAt) starts.push(f.state.now - start);
+        return live(...args);
+      } });
+      for (let elapsed = 5000; elapsed <= 120000; elapsed += 5000) {
+        f.state.now = start + elapsed;
+        peerEntered = issue3614Gate();
+        pending = runner.resumeLiveRecoveries(f.state.now);
+        await Promise.race([pending, peerEntered.promise]);
+        if (peerGate) {
+          const held = peerGate;
+          const callCount = calls.length;
+          for (let tick = 0; tick < 2; tick++) {
+            elapsed += 5000;
+            f.state.now = start + elapsed;
+            await runner.resumeLiveRecoveries(f.state.now);
+            assert.equal(calls.length, callCount, "heartbeat while pass is owned cannot start another discovery");
+          }
+          held.resolve();
+          peerGate = undefined;
+        }
+        await pending;
+        if (f.finals.some(row => row[0] === f.context.runId)) break;
+      }
+      const targetCalls = calls.slice(initialCalls).filter(e => e.run === f.context.runId);
+      assert.ok(peerWaits >= 1, "controlled I/O is exercised by actual retained-peer processing");
+      assert.ok(starts.every((at, i) => i === 0 || at - starts[i - 1]! === 15000), "completed-pass starts model the observed 15-second cadence");
+      assert.ok(targetCalls.length > 0, "target reconstruction must be revisited by 120 seconds");
+      assert.equal(f.finals.filter(row => row[0] === f.context.runId).length, 1, "target requires one exact covering FINAL ACK by 120 seconds");
+      assert.equal(f.state.open, false);
+      assert.equal(checkedBeforeAck, true);
+      assert.equal(starts.length, 1, "priority must settle the ready target in the first live pass; the single interval is explicit");
+      assert.equal(f.state.now - start, 15000, "the settling pass includes the controlled ten-second I/O and heartbeat tick");
+      assert.ok((await c.inspect(f.context.runId)).some(r => r.captureId !== invalid.captureId && r.finalAcknowledged));
+    } finally { peerGate?.resolve(); await pending; await f.close(); }
+  });
+}
+
+type Issue3614Row = { context: PositiveOwedCandidateContext; record?: RecoveryRecord };
+async function issue3614Queue(priorityCount = 1, normalCount = 40, cap = 4) {
+  const f = await fixture(true);
+  const seed = await issue3561Invalidated(f);
+  const normal: Issue3614Row[] = Array.from({ length: normalCount }, (_, i) => ({ context: { ...f.context, runId: `cold3614-${String(i).padStart(3, "0")}` } }));
+  const priority: Issue3614Row[] = [];
+  for (let i = 0; i < priorityCount; i++) {
+    const context = { ...f.context, runId: `11111111-1111-4111-8111-${String(i + 1).padStart(12, "0")}` };
+    await fs.mkdir(path.join(f.root, "journal", context.runId));
+    const record = await issue3561Sibling(f, seed, { runId: context.runId, coverageContext: context,
+      originalRoots: seed.originalRoots!.map(root => ({ ...root, contexts: root.contexts.map(ctx => ({ ...ctx, runId: context.runId })) })) });
+    priority.push({ context, record });
+  }
+  const rows = [...normal, ...priority];
+  const holds = f.client.listRecoveryHolds.bind(f.client);
+  let inMaterialize = false;
+  let passCalls: string[] = [];
+  const batches: string[][] = [], requests: number[] = [];
+  Object.assign(f.client, { listRecoveryHolds: async (run: string) => {
+    if (inMaterialize) passCalls.push(run);
+    return { ...await holds(run), holds: rows.some(r => r.record && r.context.runId === run) ? (await holds(run)).holds : [] };
+  } });
+  const mappedCandidates = (runId: string) => structuredClone(f.state.candidates).map(root => ({ ...root,
+    contexts: root.contexts.map(ctx => ({ ...ctx, runId })) }));
+  Object.assign(f.git, {
+    enumerateOwedCandidates: async (_bare: string, run: string) => mappedCandidates(run),
+    discoverOwedCandidates: async () => rows.map(r => ({ context: r.context, candidates: mappedCandidates(r.context.runId) })),
+  });
+  f.state.cloneHeads = [H2]; // actual shared ancestry returns unproven; no new captures
+  let coordinatorExecuting = (_run: string) => false, passExecuting = (_run: string) => false;
+  const c = f.make(true, () => true, undefined, undefined, { ...buildRecoveryLiveTiming("stub", f.log, { UZI_E2E_RECOVERY_FAST_REDRIVE: "1" }),
+    liveMaxPerPass: cap, isExecuting: run => coordinatorExecuting(run) });
+  const materialize = c.materializeBootInventory.bind(c);
+  Object.assign(c, { materializeBootInventory: async (...args: Parameters<typeof materialize>) => {
+    inMaterialize = true; passCalls = [];
+    try { return await materialize(...args); }
+    finally {
+      const queue = (c as any).bootOwed as Array<{ context: PositiveOwedCandidateContext }>;
+      batches.push(queue.slice(-Math.min(cap, queue.length)).map(e => e.context.runId));
+      requests.push(new Set(passCalls).size);
+      inMaterialize = false;
+    }
+  } });
+  const visit = async () => {
+    const priorBatches = batches.length;
+    f.state.now += 5000;
+    await c.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: run => passExecuting(run) });
+    const ids = ((c as any).bootOwed as Array<{ context: PositiveOwedCandidateContext }>).map(e => canonicalJson(e.context));
+    assert.deepEqual([...ids].sort(), rows.map(r => canonicalJson(r.context)).sort(), "selection must preserve queue membership and multiplicity for preferred-context derivation");
+    if (batches.length === priorBatches) return [];
+    assert.ok(requests.at(-1)! <= cap, "materialization request opportunities stay within the context cap");
+    assert.equal(new Set(batches.at(-1)).size, batches.at(-1)!.length, "selected context appears once per pass");
+    return batches.at(-1)!;
+  };
+  return { f, c, rows, normal, priority, batches, requests, visit, inMaterialization: () => inMaterialize,
+    executing: (which: "coordinator" | "pass", predicate: (run: string) => boolean) => {
+      if (which === "coordinator") coordinatorExecuting = predicate; else passExecuting = predicate;
+    } };
+}
+
+it("#3614 priority and FIFO opportunities remain bounded with five refusing targets", async () => {
+  const q = await issue3614Queue(5, 40);
+  try {
+    const seen = new Map<string, number>();
+    for (let pass = 1; pass <= 15; pass++) {
+      for (const run of await q.visit()) if (!seen.has(run)) seen.set(run, pass);
+      if (pass === 5) for (const row of q.priority) assert.ok((seen.get(row.context.runId) ?? Infinity) <= 5, "continuously priority-eligible target is visited within P completed passes");
+    }
+    for (const row of q.normal) assert.ok((seen.get(row.context.runId) ?? Infinity) <= 15, "FIFO survivor progresses within ceil(N/(cap-1)) passes");
+    assert.equal(q.f.state.produced, 1); assert.equal(q.f.state.uploads, 1);
+  } finally { await q.f.close(); }
+});
+
+for (const excluded of ["none", "successor", "quota successor", "saved FINAL", "FINAL ACK", "receipt", "producer", "canonical context", "coordinator execution", "pass execution", "unreadable sibling"] as const) {
+  it(`#3614 priority ordering qualification: ${excluded}`, async () => {
+    const q = await issue3614Queue();
+    try {
+      const hot = q.priority[0]!, record = hot.record!;
+      if (excluded === "successor" || excluded === "quota successor") {
+        // Keep R2 stalled before a new coverage decision; a real invalidation of
+        // R2 would legitimately make the whole generation replaceable again.
+        q.f.state.sourceRefused = true;
+        await issue3561Sibling(q.f, record, { reason: excluded === "quota successor" ? "storage_quota_exceeded" : undefined,
+          state: excluded === "quota successor" ? "needs_action" : "pinned" });
+        q.f.state.candidates.push({ sha: H2, pinRef: "refs/owed/later", contexts: [hot.context] });
+      }
+      if (excluded === "saved FINAL") await patchAuthenticated(q.f, record, { finalRequest: { disposition: {
+        kind: "archive", capture_id: record.serverCaptureId!, source_sha: record.sourceSha, coverage_digest: record.coverageDigest! } } });
+      if (excluded === "FINAL ACK") await patchAuthenticated(q.f, record, { finalAcknowledged: true,
+        finalRequest: { disposition: { kind: "archive", capture_id: record.serverCaptureId!,
+          source_sha: record.sourceSha, coverage_digest: record.coverageDigest! } } });
+      if (excluded === "receipt") {
+        // Receipt alone must exclude priority, without relying on an ACK flag.
+        const receipt = JSON.parse(await fs.readFile(new URL("../../fixtures/completed-publication/state-ack.json", import.meta.url), "utf8")).ack.completed_publication_receipt;
+        await patchAuthenticated(q.f, record, { completionReceipt: { ...receipt, run_id: record.runId,
+          generation: record.generation!, branch: record.branch!, final_head: H, observed_branch_head: H } });
+      }
+      if (excluded === "producer") {
+        const producer = await issue3561Sibling(q.f, record, { captureId: "maintenance-v1-00000000-0000-4000-8000-000000003614" });
+        await fs.unlink(issue3561File(q.f, record)); hot.record = producer;
+      }
+      if (excluded === "canonical context") await patchAuthenticated(q.f, record, {
+        branch: "other3614", coverageContext: { ...hot.context, branch: "other3614" },
+      });
+      if (excluded === "coordinator execution" || excluded === "pass execution") q.executing(excluded === "coordinator execution" ? "coordinator" : "pass", run => run === hot.context.runId);
+      if (excluded === "unreadable sibling") {
+        const sibling = await issue3561Sibling(q.f, record, { reason: undefined });
+        const file = issue3561File(q.f, sibling), raw = JSON.parse(await fs.readFile(file, "utf8"));
+        await fs.writeFile(file, JSON.stringify({ ...raw, mac: "0".repeat(64) }));
+      }
+      const validated = (await q.f.coordinator.inspect(hot.context.runId)).find(r => r.captureId === hot.record!.captureId);
+      assert.ok(validated, "the ordering control itself must pass the authenticated shape reader");
+      if (excluded === "FINAL ACK") assert.equal(validated.finalAcknowledged, true);
+      if (excluded === "saved FINAL" || excluded === "FINAL ACK") assert.ok(validated.finalRequest);
+      if (excluded === "receipt") assert.ok(validated.completionReceipt);
+      const run = () => q.visit();
+      const batch = excluded === "producer"
+        ? await (q.c as any).producerPermit.run({ captureIds: new Set([hot.record!.captureId]), live: () => true }, run)
+        : await run();
+      assert.equal(batch[0], excluded === "none" ? hot.context.runId : q.normal[0]!.context.runId,
+        "only a complete ordinary invalidated generation receives the priority opportunity");
+      if (excluded === "successor" || excluded === "quota successor") {
+        for (let i = 0; i < 2; i++) await q.visit();
+        assert.ok(q.batches.every(b => !b.includes(hot.context.runId)), "old invalidation cannot keep boosting a generation after R2 exists");
+      }
+    } finally { await q.f.close(); }
+  });
+}
+
+it("#3614 cap one and appended survivors keep normal FIFO order", async () => {
+  const q = await issue3614Queue(1, 4, 1);
+  try {
+    const first = (await q.visit())[0]; assert.equal(first, q.normal[0]!.context.runId);
+    const removed = q.rows.splice(1, 1)[0]!;
+    const added = { context: { ...q.f.context, runId: "new3614" } };
+    q.rows.push(added);
+    const seen: string[] = [];
+    for (let i = 0; i < q.rows.length; i++) seen.push(...await q.visit());
+    assert.ok(!seen.includes(removed.context.runId));
+    assert.ok(seen.indexOf(q.normal[2]!.context.runId) < seen.indexOf(added.context.runId), "new arrival cannot overtake a retained survivor");
+    assert.equal(new Set(seen).size, q.rows.length);
+  } finally { await q.f.close(); }
+});
+
+it("#3614 ordinary contexts without an invalidated target retain cap-four FIFO", async () => {
+  const q = await issue3614Queue(1, 12);
+  try {
+    await patchAuthenticated(q.f, q.priority[0]!.record!, { reason: undefined });
+    q.f.state.sourceRefused = true;
+    for (let pass = 0; pass < 3; pass++) assert.deepEqual(await q.visit(), q.normal.slice(pass * 4, pass * 4 + 4).map(r => r.context.runId));
+  } finally { await q.f.close(); }
+});
+
+for (const blocked of ["credentials", "feature", "discovery", "boot", "cap one", "throwing hint"] as const) {
+  it(`#3614 hint read guard and FIFO fallback: ${blocked}`, async () => {
+    const q = await issue3614Queue(1, 8, blocked === "cap one" ? 1 : 4);
+    try {
+      await q.c.snapshotOwedInventory(); // blocked passes must retain an existing queue
+      let reads = 0;
+      const warnings: string[] = [], warn = q.f.log.warn;
+      q.f.log.warn = (message, fields) => { warnings.push(message); warn.call(q.f.log, message, fields); };
+      const c = q.c as any, read = c.newReconstructionRecords.bind(c);
+      c.newReconstructionRecords = async (...args: any[]) => {
+        if (!q.inMaterialization()) {
+          reads++;
+          if (blocked === "throwing hint") throw new Error("hint I/O unavailable");
+        }
+        return read(...args);
+      };
+      if (blocked === "credentials") c.credentialBlockedAt = q.f.state.now + 1_000_000;
+      if (blocked === "feature") q.f.state.feature = false;
+      if (blocked === "discovery") delete (q.f.git as any).discoverOwedCandidates;
+      if (blocked === "boot") {
+        await q.c.snapshotOwedInventory();
+        await q.c.resumePending(undefined, await q.c.snapshotBootRecords(), true);
+      } else await q.visit();
+      assert.equal(reads, blocked === "throwing hint" ? 1 : 0, "only a guarded materializing live pass may sample hints");
+      if (blocked === "throwing hint") {
+        assert.equal(warnings.filter(m => m === "recovery: inventory priority hint unavailable; FIFO").length, 1, "one observable fallback warning per pass");
+        assert.deepEqual(q.batches[0], q.normal.slice(0, 4).map(r => r.context.runId), "hint failure still materializes the plain FIFO batch");
+        assert.equal(c.nextPassAt, q.f.state.now + 1000, "hint failure alone does not grow production retry delay");
+      }
+    } finally { await q.f.close(); }
+  });
+}
+
+it("#3614 hint reuses one complete view across contexts of a run", async () => {
+  const q = await issue3614Queue(1, 6);
+  try {
+    q.rows.push({ context: { ...q.priority[0]!.context, branch: "other3614" } });
+    const c = q.c as any, read = c.newReconstructionRecords.bind(c);
+    const counts = new Map<string, number>();
+    c.newReconstructionRecords = async (...args: any[]) => {
+      if (!q.inMaterialization()) counts.set(args[0], (counts.get(args[0]) ?? 0) + 1);
+      return read(...args);
+    };
+    await q.visit();
+    assert.equal(counts.size, 7);
+    assert.ok([...counts.values()].every(n => n === 1), "duplicate discovered contexts reuse a run's complete hint view");
+  } finally { await q.f.close(); }
+});
+
+for (const change of ["successor", "saved FINAL", "execution"] as const) {
+  it(`#3614 fresh materialization rechecks a stale priority hint: ${change}`, async () => {
+    const q = await issue3614Queue(1, 8);
+    try {
+      const hot = q.priority[0]!, old = hot.record!;
+      const materialize = q.c.materializeBootInventory.bind(q.c);
+      let injected = false;
+      Object.assign(q.c, { materializeBootInventory: async (...args: Parameters<typeof materialize>) => {
+        assert.equal(injected, false); injected = true;
+        // The hint was sampled, but ordinary state changes before the entry's
+        // existing checked reader. No source/effect guard is replaced here.
+        if (change === "successor") await issue3561Sibling(q.f, old, { reason: "inventory_quiescence_breach" });
+        if (change === "saved FINAL") await patchAuthenticated(q.f, old, { finalRequest: { disposition: {
+          kind: "archive", capture_id: old.serverCaptureId!, source_sha: old.sourceSha, coverage_digest: old.coverageDigest! } } });
+        if (change === "execution") q.executing("pass", run => run === hot.context.runId);
+        return materialize(...args);
+      } });
+      const before = q.f.aggregates.length;
+      const selected = await q.visit();
+      assert.equal(injected, true);
+      assert.equal(selected[0], hot.context.runId, "a stale sampled hint may waste its one scheduling opportunity");
+      assert.deepEqual(selected.slice(1), q.normal.slice(0, 3).map(r => r.context.runId), "a stale recheck leaves exactly cap-1 FIFO contexts to progress");
+      assert.equal(q.f.aggregates.length, before, "fresh entry state must stop priority-only coverage construction");
+      assert.equal(q.f.state.produced, 1); assert.equal(q.f.state.uploads, 1);
+    } finally { await q.f.close(); }
+  });
+}
+
+it("#3614 two continuously refusing priority contexts alternate", async () => {
+  const q = await issue3614Queue(2, 20);
+  try {
+    assert.equal((await q.visit())[0], q.priority[0]!.context.runId);
+    assert.equal((await q.visit())[0], q.priority[1]!.context.runId);
+  } finally { await q.f.close(); }
+});
+
+for (const reason of ["budget", "abort"] as const) {
+  it(`#3614 revoked hint ${reason} ends the pass before materialization`, async () => {
+    const q = await issue3614Queue(1, 8);
+    const controller = new AbortController();
+    let mono = 0;
+    const budget = new MaintenanceBudget(1000, () => mono);
+    try {
+      let reads = 0;
+      const warnings: string[] = [], warn = q.f.log.warn;
+      q.f.log.warn = (message, fields) => { warnings.push(message); warn.call(q.f.log, message, fields); };
+      const c = q.c as any, read = c.newReconstructionRecords.bind(c);
+      c.newReconstructionRecords = async (...args: any[]) => {
+        reads++;
+        if (reason === "budget") { mono = 1000; throw new Error("hint read failed after budget expiry"); }
+        const records = await read(...args);
+        controller.abort(new Error("hint owner stopped"));
+        return records;
+      };
+      if (reason === "budget") await assert.rejects(MaintenanceBudget.run(budget, () => q.visit()), /maintenance deadline exhausted/);
+      else await q.c.resumeLive({ authenticatedAtMs: q.f.state.now, isExecuting: () => false, signal: controller.signal });
+      assert.equal(reads, 1, "revocation stops scanning further candidate runs");
+      assert.equal(q.batches.length, 0, "a revoked hint cannot fall back into a materialization batch");
+      assert.ok(!warnings.includes("recovery: inventory priority hint unavailable; FIFO"), "revocation is not an I/O fallback");
+    } finally { budget.dispose(); await q.f.close(); }
+  });
+}

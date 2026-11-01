@@ -6,7 +6,7 @@ audience: user
 
 # Recovering from a transient interruption
 
-`recovery_wait` also includes owner-only [worker recovery exhaustion](#worker-recovery-exhausted), which has no timer or automatic resume. The transient-interruption retries below do not describe that hold.
+`recovery_wait` also includes owner-only [worker recovery exhaustion](#worker-recovery-exhausted), which has no timer or automatic resume. [Codex idle stalls](#codex-idle-stalls) and retained-source exhaustion can also become owner-held. The transient-interruption retries below do not describe those holds.
 
 Uzi retries in place and, if the trouble persists, parks the run in
 `recovery_wait` on these transient interruptions:
@@ -34,7 +34,8 @@ recovery checkpoint before parking the run in `recovery_wait`.
 
 This recovery is automatic and requires no per-run setting. A missing plan
 after a turn that actually did work, missing turn-count metadata, a real
-timeout, and cancellation are not classified as a transient recovery.
+wall timeout, and cancellation are not classified as a transient recovery.
+Measured Codex idle timeouts generally use the [idle-stall policy](#codex-idle-stalls) below; qualifying zero-output silence after a provider-reported retry uses [provider-outage recovery](#provider-outage-streaks) instead.
 
 A **permanent** provider error — for example 401, 403, or 400 (bad
 credentials or a bad request) — is not a transient interruption. The run
@@ -69,13 +70,14 @@ an unverified capture attempt.
 
 For these empty-turn and provider recoveries, after verified capture, the server parks the run on a capped exponential
 backoff and returns it to `queued` when that delay passes. Empty-turn and
-resumed-gate recovery have no lifetime cap or manual resume step. Typed provider
-parks use the elapsed streak bound below.
+resumed-gate recovery have no lifetime cap or manual resume step. Negotiated
+Codex idle stalls use the separate park cap below; typed provider parks use the
+elapsed streak bound below.
 
 An ordinary unwired resume can recover from the verified local checkpoint
-with same-path session continuity, provided its key has never entered
-retained-source recovery. Docker-wired resumes and retained-source recovery
-use a fresh attempt path and model session. Publishing a checkpoint to the
+with same-path session continuity when the saved session is resolvable and its
+key has never entered retained-source recovery. Docker-wired resumes and
+retained-source recovery use a fresh attempt path and model session. Publishing a checkpoint to the
 forge is best-effort:
 a different worker can recover only what was successfully published.
 Losing the original worker's storage before publication can therefore
@@ -96,6 +98,78 @@ its work entirely, the existing plan-review safeguard still applies.
 This fix does not reconstruct plan text missing from older runs. A legacy
 auto-approved run whose stored plan is empty can still need a new planning
 turn; an approval flag alone is not an implementation-ready plan.
+
+## Codex idle stalls
+
+Except for the provider-retry case below, a compatible worker reports measured Codex idle timeouts as `recovery_wait` /
+`codex_idle_stall`, for both no model output (`zero_evidence`) and output that
+stalled (`productive`). This covers lead initial planning, automatic plan
+revisions and implementation. Human plan-revision productive idle still fails;
+zero-evidence revision silence uses its existing in-flight revision driver.
+Child turns, Claude and `idleOperation` keep their existing behavior. Cancel,
+pause, spent wall, vault-lock, completion-hold and first-trip precedence remain.
+
+Zero-output silence after a qualifying, current-turn provider rate limit or
+transport retry goes directly to provider recovery, without another retry on
+the interrupted root. The notice says "silence after a provider-reported rate limit or transport retry":
+the retry report does not prove what caused the later silence. These recoveries use the [provider-outage streak and owner
+hold](#provider-outage-streaks), rather than the idle park count below. A
+permanent transport status does not qualify. Retry context is cleared by model
+activity and at the next turn; final non-retrying errors retain precedence.
+Human plan revisions still use their revision driver, with verified disposal
+and a fenced fresh epoch before another turn, rather than an ordinary recovery
+park.
+
+By default, **three automatic parks** get finite retry times; the fourth stays
+**held for the owner** with a NULL retry. `RUN_CODEX_IDLE_STALL_MAX_PARKS=0`
+holds on the first park. The delay still uses lifetime recovery backoff plus
+jitter. Positive completed `provider_progress_turns` on an idle park restarts
+the idle count at 1; otherwise it increments with saturation. Current stalled
+output is not a completed turn. This is a park-observed streak, not an exact
+count of unsuccessful turns: progress in another flight that ends without an
+idle park may be unseen, so the hold can arrive earlier. Reclaim, checkpointing
+and credential parks leave the idle count unchanged.
+
+1. With a finite retry, including one already due, wait for automatic recovery,
+   choose **Resume** (`uzi run resume <id>`) to queue it early, or **Cancel**.
+2. With a NULL retry, choose **Resume** when ready or **Cancel** to end it.
+   Omitted timing means unknown, not held. Default CLI wait and log follow stop
+   for the held form and continue through finite or unknown retries; explicit
+   `--until` keeps its chosen status set.
+3. Resume of either form clears the retry and idle count, queues a fresh wall
+   window and revokes the Codex capability. It preserves lifetime backoff,
+   provider streak, session, affinity, worker recovery episode and requeue
+   baseline. Automatic promotion also resets the wall, so the default allowance
+   can buy three extra full wall windows. A timed park can be promoted by
+   set-token; a held one returns a named 409 requiring Resume first.
+
+Accepted parks still require persistence, executor cleanup, a successful WIP
+commit when dirty, fetch-back and verified ref coverage. Typing requires
+`recovery_cause_codex_idle_stall_v1` and a positive, stampable generation before
+capture; acceptance requires the exact returned status and cause. A full worker
+ACK without a retry timestamp confirms held, whereas an omitted public DTO
+field means unknown timing. These non-provider idle-stall errors have
+`providerOrigin: false` and do not charge provider-outage accounting.
+For those stalls, without feature support, zero-evidence idle keeps legacy untyped recovery and
+productive idle keeps terminal failure. After negotiation, HTTP 400 or feature
+loss does not trigger an untyped downgrade; the worker keeps the source.
+
+Same-session recovery requires a resolvable ordinary unwired non-Docker path.
+Retained-source recovery and Docker attempts use a fresh path/thread; rejected
+thread resume keeps the `resume_lineage_break` warning and fresh-thread fallback.
+Interrupted-turn notes, reconciliation and snapshots do not guarantee
+exactly-once effects or prevent duplicate work.
+
+An execution hold adds no custody retention rule. Ordinary settlement and
+exact-generation ACK guards still apply; uncaptured, guarded, unresolved and
+507-refused sources remain protected, and open holds still count toward admission.
+The cap limits further generation minting for one run; it does not relieve storage
+quota or admission pressure (#2969/#2544). Held runs block worker image rollout.
+Deploy the API to all replicas before workers; mixed API versions and application
+rollback while holds exist are unsupported because an old token promoter can
+bypass the hold. See [configuration and destructive schema Down risks](configuration.md#codex-idle-stall-deployment-and-schema-rollback)
+and the [#3509 decision](../adr/1197-transient-recovery-park.md#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks).
+No live rollout is claimed.
 
 ## Provider outage streaks
 
@@ -118,14 +192,15 @@ at that park with count 1. These are completed, error-free model turns in
 the current flight, including planning, implementation and review; claiming
 the run or becoming `running` does not count as progress. Progress is not
 limited to provider parks: a flight that completed turns and then parks for
-another reason, an ordinary (untyped or `empty_turn`) or a disk
+another reason, an ordinary (untyped or `empty_turn`), typed idle-stall or disk
 (`data_volume_full`) recovery park, reports them as `provider_progress_turns`,
 and the API clears an open streak in the same statement that applies that
 park. Missing or zero evidence leaves the streak untouched, and the report
 must carry a positive `claim_generation`; the generation, status and release
 fences reject stale or replayed evidence, so it cannot reset a streak twice.
-Owner Resume,
+Provider-outage owner Resume,
 early credential-driven promotion and credential switching clear the streak.
+Idle-stall owner Resume instead preserves the provider streak.
 Automatic and vault-unlock promotion preserve it.
 
 For a **provider unavailable** hold:
@@ -155,10 +230,11 @@ refusal triggers one untyped resend and disables the cached feature;
 ordinary validation errors do not. Recognizing `paused` alone does not
 make rollback safe: older APIs lack the provider hold's late-failure guards.
 
-`provider_progress_turns` is gated separately by the negotiated
-`provider_progress_on_recovery_park_v1` feature. A worker sends it only after
-seeing that feature, only with a positive claim generation, and only on an
-ordinary or disk recovery park. If the API refuses it as an unknown field
+On ordinary and disk parks, `provider_progress_turns` is gated separately by
+`provider_progress_on_recovery_park_v1` and a positive claim generation.
+Typed idle-stall parks instead require this field, including zero, under
+`recovery_cause_codex_idle_stall_v1` alone and do not downgrade. The fallback
+below applies to ordinary and disk parks. If the API refuses it as an unknown field
 (a positively identified strict-decoder refusal after a rollback), the worker
 drops the cached feature and re-sends the same park once without the field,
 keeping the fence; a refusal of that retry propagates, and there is no third
@@ -175,13 +251,109 @@ deadline from the first reservation**. Reservation happens before work and
 survives crash, reclaim and successor handoff. Retry delays use the existing
 exponential backoff capped at 16 times its base. Capture, publication,
 adoption or reclaim does not reset the budget; a trusted, successfully
-settled real model turn does.
+settled real model turn does. An owner Resume of a
+`worker_requeue_exhausted` hold or the retained-recovery retry described below
+can renew it on a fresh claim with a higher recovery episode. Adoption failure
+has a separate owner-only retry, described below.
 
-A permanent blocker or exhausted budget ends the run **failed**, keeping
-local work and custody. It does not park for automatic reclaim or offer
-Resume. Actual quiescence failure uses `worker_residue_blocked`; a missing
-source, invalid recovery clock, preservation or adoption failure, missing
-needed prerequisites, or an oversized fallback is not a quiescence failure.
+### Retained recovery exhausted
+
+A durably confirmed `budget_exhausted` retained source can park at
+`recovery_wait` with cause `retained_recovery_exhausted`, keeping local source
+and custody while releasing its execution slot. It does not require a new
+capture when the exhausted budget prevents one.
+
+By default, **three automatic parks** retry after roughly **1m, 2m and 4m**,
+plus jitter. This cause has its own `retained_park_count`, separate from the
+lifetime recovery-wait count and worker-death requeue allowance.
+`RUN_RETAINED_RECOVERY_MAX_PARKS` sets the cap; **0 holds immediately**.
+The fourth exhaustion at defaults stays held for the owner, without a timer
+or another counted park. Resume does not reset that cap.
+
+A fresh claim with a higher derived recovery episode charges one of three
+reservations in a new five-minute window and must prove quiescence again.
+A new claim alone, the same generation or the same episode cannot renew it.
+Timer promotion gives a fresh run wall window, up to three at the default cap.
+Manual Resume preserves the remaining wall budget instead; it can require an
+owner extension first.
+
+1. For a timed retry, wait, choose **Resume** to queue it early, or **Cancel**
+   to end the run.
+2. For an owner-held retry, choose **Resume** (`uzi run resume <id>`) when ready,
+   or **Cancel** (`uzi run cancel <id>`). Both actions use existing owner checks.
+3. Read `uzi run recovery <id>` before relying on an archive. Both timed and
+   held parks keep source custody; an available earlier archive may omit latest
+   local work. Losing the original storage can still lose that work. Another
+   worker may resume from a published checkpoint after worker loss or affinity
+   expiry without the original local recovery journal.
+
+Finite retry timestamps, including due ones, mean timed recovery. A NULL retry
+means an owner hold with no countdown; omitted timing means unknown. Default
+CLI wait and log follow stop for the owner-held form, and follow reports a
+transition from timed to held even within the same status and cause. Explicit
+`--until` keeps its chosen status set. Token or credential changes do not
+promote this cause. Both forms can keep storage occupied and block worker
+image rolls. See [Configuration](configuration.md) and the
+[ADR-1197 #3495 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-26-3495-bounded-retained-recovery-parks).
+
+The worker needs API feature support and exact durable journal confirmation.
+Without that support or proof, exhaustion keeps the terminal fallback with
+custody retained. Uncertain park responses instead stop nonterminal while
+bounded reconciliation checks the outcome. Deploy the API fully before
+upgrading workers; mixed API replicas and API rollback are unsupported.
+
+### Retained recovery adoption failed
+
+`recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
+refused adoption. Local work and custody are preserved. This is an owner hold
+with **no automatic retry**, regardless of any displayed retry timestamp.
+
+1. Read `uzi run recovery <id>` and export an available archive before deciding;
+   an earlier archive may omit the latest local work.
+2. Choose `uzi run resume <id>` to request another bounded attempt, or
+   `uzi run cancel <id>` to end the run. Resume does not guarantee success.
+3. If adoption fails again, the run holds again. Without a fresh owner Resume,
+   redispatch reholds without another capture or model turn.
+
+A valid legacy budget-exhaustion renewal on an upgraded worker records its raw
+owner baseline before recovery work. If adoption then fails, the next owner
+Resume can authorize a new verified attempt. An already-blocked adoption journal
+without that baseline cannot gain execution authority from Resume alone; retain
+and export/recover its work instead.
+
+Resume preserves remaining run wall time and may require an extension. Timers,
+token changes and credential changes do not release this hold. Default CLI wait,
+log follow and the watcher stop for the owner decision; explicit `--until` keeps
+its status set. Retained sources can block image rolls and occupy storage; each
+fresh claim opens another counted custody hold and repeated failures can leave
+retained successor paths. Keep the original worker storage: a peer after worker
+loss or affinity expiry may use a published checkpoint behind the retained work.
+
+A positively identified temporary local resource error during the read-only
+renewal check stops the claim without consuming its owner grant or creating a
+new owner hold. The existing bounded claim-recovery policy may retry it.
+Unverified or invalid authorization remains fail-closed; unknown errors do not
+receive this retry treatment.
+
+Owner authorization remains bound to the recorded repository path, device and
+inode. A changed storage identity refuses execution; Resume cannot override that
+check. With the source journal still valid, the run re-holds instead of failing
+and keeps its local work and custody. Export/recover the retained work rather than
+expecting Resume alone to rebind changed storage. Reholding does
+not rebind the owner record or consume the pending execution grant.
+
+This path requires API feature support, exact persisted `adoption_failed`
+evidence, current ownership and proven quiescence. Missing support or unconfirmed
+persistence fails closed with custody kept. An uncertain park response uses
+bounded reconciliation and a nonterminal stop; it does not confirm the hold.
+Deploy the API fully before workers; API rollback remains unsupported. See the
+[ADR-1197 #3527 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry).
+
+Other permanent blockers end the run **failed**, keeping local work and
+custody, without automatic reclaim or failed-run Resume. The adoption retry
+does not clear missing source, invalid clock, preservation failure, missing
+needed prerequisites, oversized fallback or decoded-history blockers.
+Actual quiescence failure uses `worker_residue_blocked`.
 Transient capture, forge or disk failures consume the same reserved budget.
 These bounds do not change the healthy provider/empty-turn park budgets or
 the owner-only worker-recovery-exhaustion hold below.
@@ -246,24 +418,80 @@ a genuine timeout or cancellation.
 A `recovery_wait` park can also come from a different cause: the forge
 (GitHub, GitLab, Forgejo) was unreachable when the worker tried to clone or
 fetch your repo — a DNS blip, a dropped connection, or a transient 5xx.
-On this healthy path, retained-source discovery found no local source,
-so there is no checkpoint to capture; the run just parks and retries.
-If retained source exists, recovery uses the acquired-claim bound above
-instead of this no-local-source forge park.
+Local protected-source admission remains unchanged: discovered retained
+source uses the acquired-claim recovery bound above. A forge park can also
+follow a legacy warm fetch; it does not prove that no local source exists.
+Existing source and custody protections remain in force, without promising
+a new checkpoint or an available recovery archive.
 
-The run's badge and feed say **waiting for the forge, retry at HH:MM (N of
-MAX)**, naming the next retry time and how many of this run's lifetime
-forge parks it has used. It auto-resumes on the same capped backoff as an
-empty-turn park (`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`) —
-no action needed while `N` stays under `MAX`.
+### Worker-origin cooldown and safe placement
 
-Unlike an empty-turn park, this one **does** have a lifetime cap:
-`RUN_FORGE_UNREACHABLE_MAX_PARKS` (default 6). If the forge is still
-unreachable past that many parks, the run fails instead of parking again,
-so a genuinely dead forge does not hold the run open forever. A permanent
-forge error (401/403/404 — bad credentials or a deleted repo) fails the run
-immediately instead of parking, since retrying would not help. Cancelling
-the run at any point during these retries ends it `cancelled`, as usual.
+An **online** worker is heartbeating to uzi; it may still be unable to reach
+the forge directly. An applied exhausted clone/fetch retry group updates a
+cooldown for that authenticated owner, worker and canonical actual Git
+origin. Repositories sharing that origin share the cooldown on that worker;
+another worker or origin has its own admission decision.
+
+Before the cooldown is due, that worker cannot claim the affected origin.
+When due, one ordinary claim reserves a half-open attempt. Time passing does
+not prove recovery. Human/model waits keep the reservation in the same
+active flight. Negotiated direct clone/fetch success telemetry or an exact
+admitted guarded worker-finalize completion for issue, MR rework or
+self-improvement can clear it. Other stopped outcomes release the
+reservation while leaving reachability unverified. Legacy workers without
+direct success reporting serialize the origin during the active flight;
+a stopped flight does not keep a perpetual reservation.
+
+A sibling can bypass ordinary affinity immediately only with complete
+immutable guarded positive FINAL/source dispositions for generations 1..G
+and no open hold in any generation. Missing or nonguarded history,
+multiple/conflicting sources and local-only work remain protected.
+This placement rule grants no custody release or source deletion.
+See [ADR-1392](../adr/1392-forge-unreachable-preclone-park.md)
+for the evidence boundary.
+
+### Timed retry or owner hold
+
+`RUN_FORGE_UNREACHABLE_MAX_PARKS` (default 6) allows up to that many timed
+forge parks over the run's lifetime. Each follows the capped backoff from
+`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`. After the allowance
+is consumed, the **next exhausted clone/fetch retry group** holds the run
+in `recovery_wait`, with cause `forge_unreachable` and
+`recovery_retry_not_before = NULL`. This is an owner hold, without terminal
+failure or a judge run. `forge_park_count` remains the consumed timed
+allowance; the hold does not increment it, though `recovery_wait_count`
+still increments. `0` deliberately permits unlimited timed forge parks.
+
+Explicit owner **Resume** queues one ordinary bounded attempt. It preserves
+the counts, custody, forge cooldown and unrelated grants; it does not renew
+the timed allowance. Resume preserves remaining wall budget and banks the
+hold time after execution has started. If the existing wall budget is
+exhausted, an extension may be needed before Resume succeeds. Another
+exhausted clone/fetch group returns the run to the owner hold. Queuing does
+not promise execution: cooldown, worker cordon, a custody limit of one,
+already-saturated custody or worker capacity can still block admission.
+
+This NULL-retry hold requires compatible serving APIs. On those APIs, the
+timer, token changes, `set-token` and generic recovery promoters cannot
+release it; use explicit Resume. An older API's `set-token` promoter can
+still queue a NULL-retry hold, causing an extra attempt that can end in the
+legacy cap-failure outcome. Upgrade the serving APIs together; this does
+not require a new worker ACK protocol.
+
+An older worker may still say “retry after backoff” without a retry stamp
+even when the current server has owner-held the run. For timed parks,
+existing badge/feed wording names the next retry time and
+the lifetime forge park count; it must not be taken as proof that a
+NULL-retry hold will resume automatically.
+
+A permanent forge error (401/403/404 — bad credentials or a deleted repo)
+still fails the run immediately instead of parking. Cancel ends the run
+`cancelled`, as usual. Archive export is available when an archive exists;
+a forge park alone does not create one. The original incident remains
+recorded in issue #3585; first delivery is partial and non-closing.
+Publication-only recovery (#1324) is separate follow-up after the first
+merge; this clone/fetch policy does not provide publication recovery or
+add probes, run states or credentials.
 
 ## Codex account unavailable
 
@@ -290,8 +518,10 @@ board each name one of four states (a state this client does not recognise
 reads **Codex account unavailable**):
 
 - **Codex account is reconciling** — the account is repairing its login on
-  its own. No action is needed; the run resumes automatically once it
-  clears.
+  its own after an uncertain renewal or while verifying protected login
+  material. Let recovery finish; unlock your vault or enable the login if
+  needed. The run resumes automatically if recovery succeeds, or asks you
+  to log in again if it cannot recover.
 - **Re-log in Codex credential \<label\> to continue** — the account has no way back on
   its own. Log in again in Settings, on the **same** credential — the same
   alias, the same ChatGPT account. Logging in with a different account does
@@ -304,8 +534,10 @@ reads **Codex account unavailable**):
   worker that holds its source, including when the hold began at a running
   checkpoint; normal worker-affinity limits still apply.
 
-A successful same-credential re-login re-admits the run: the activity feed
-records the re-admission, naming the credential and what changed.
+Automatic account recovery or a successful same-credential re-login re-admits
+the run: the activity feed records the re-admission, naming the credential
+and what changed. You can replace the login on that same credential while
+recovery is still in progress; uzi verifies it before using it.
 
 ### No expiry, no timer
 
@@ -344,7 +576,7 @@ cancelled and re-created.
 
 ## Vault locked
 
-A `recovery_wait` park can also come from your own vault: a Codex
+A `recovery_wait` park can also come from your own protected vault: a Codex
 subscription or api\_key credential refresh or release reached a locked
 owner vault. The api only answers this after the request was authorized and
 authority still held on a recheck, so it is a typed refusal, not a generic
@@ -356,9 +588,9 @@ credential, then makes a verified capture of the work done so far,
 publishing it credential-free when it can. It keeps custody of your source
 and does not open the merge request while the vault stays locked.
 
-An explicit successful vault unlock (`POST /api/vault/unlock`) makes a
-synchronous, best-effort attempt to queue that owner's already parked
-`recovery_wait` runs with cause `vault_locked`, regardless of their retry
+A successful explicit vault unlock (`POST /api/vault/unlock`) or eligible
+foreground browser restore makes a synchronous, best-effort attempt to queue
+that owner's already parked `recovery_wait` runs with cause `vault_locked`, regardless of their retry
 time or count. Other owners and causes are untouched. This queues the work
 promptly; a worker still starts it through the normal claim path, so unlock
 does not promise an instant resume.
@@ -367,8 +599,12 @@ The scheduled retry remains the fallback: the same capped backoff as an
 empty-turn park (`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`),
 with no lifetime cap. A database failure leaves unlock successful (204) and
 preserves the Codex usage refresh poke; a park reported after the unlock's
-queue update also waits for the timer. Login, startup and passphrase
-creation do not trigger this early promotion.
+queue update also waits for the timer. Successful protected password login,
+passphrase enrollment and explicit enable/disable also use this promotion
+path. Seed startup does not. Browser restore needs a live HTTPS grant,
+valid session and incoming JWT-bound CSRF header; hidden/passive requests
+and WebSockets do not restore. See
+[Browser re-unlock](vault-threat-model.md#browser-re-unlock).
 
 If the vault locks again between the unlocked-cache check and the queue
 update, the run can be queued while locked, just as on the timer path.
@@ -377,8 +613,15 @@ start** until an unlocked claim succeeds. After that, it resumes where it
 left off — the resume costs at least one model turn before finalize opens
 the merge request.
 
-A vault lock while sealing a refreshed login also keeps the login protected
-for recovery. Updated workers survive a lost refresh reply: they reconcile
+Off users have no vault-unlock dependency. A successful explicit enable or
+disable also best-effort promotes existing vault parks after commit; see
+[Vault choice](./anthropic-token.md#vault-choice).
+
+A protected vault lock while sealing a refreshed login retains the successful
+provider result in the recovery slot under owner/kind-bound server-key
+sealing (`master_aad`). Current mode/epoch fences preserve that same result
+across conversion races and background persistence retries without another
+provider exchange. Updated workers survive a lost refresh reply: they reconcile
 the same operation once, then retain the work, session and custody if the
 outcome remains unknown. A confirmed vault-lock reply uses the vault park;
 an unknown outcome uses an ordinary recovery wait without claiming that the
@@ -390,8 +633,10 @@ the source and retry visibly with bounded backoff instead of failing after
 the ordinary blocked-capture limit. Verified capture is still required to
 park. Cancellation, shutdown and loss of the claim retain precedence; other
 recovery causes keep their existing limit. After unlock, the recovery sweep
-promotes the protected login before the run can resume. The original refresh
-token is never exchanged again.
+promotes the protected login before the run can resume. Recovering this
+protected login does not exchange the original refresh token again. After a
+separate uncertain renewal failure, uzi may make one automatic recovery attempt;
+if that cannot recover the account, follow the request to log in again.
 
 Deploy the API before upgrading the affected workers. Older workers keep
 their existing first-request vault-lock reply, including pending retention,
@@ -570,6 +815,14 @@ survives on the worker.
    survives; held time is banked only if its clock already started, and old
    approval/input waits are banked at park. Cancel uses the usual confirmation.
 
+Each owner Resume also renews an exhausted or partly used retained-source
+recovery budget (up to 3 more iterations, at most once per Resume), on the
+run's next fresh claim. The retained-recovery parks above also grant bounded
+renewals; ordinary server requeue, the
+`data_volume_full` park retry, the memory-pressure Resume and a new claim alone
+never renew it. See [Bounded retained-source recovery](#bounded-retained-source-recovery)
+and the [ADR-1197 #3495 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-26-3495-bounded-retained-recovery-parks).
+
 Historical evidence persists until owner Resume or Cancel. Capture expiry
 neither fails nor promotes the hold; there is no automatic reclassification
 or background absence finalizer. Timer, credential, vault, account, extend,
@@ -619,6 +872,10 @@ historical-evidence rules above remain in force.
   hold has no timer and resumes when the account does.
   `worker_requeue_exhausted` is an owner-only exhaustion hold: explicit
   Resume starts a new episode; Cancel ends the run. It has no automatic retry.
+  `retained_recovery_exhausted` has bounded timed retries followed by an owner
+  hold; see [Retained recovery exhausted](#retained-recovery-exhausted).
+  `retained_recovery_adoption_failed` instead requires owner Resume or Cancel,
+  with no automatic retry; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an

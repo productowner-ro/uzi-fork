@@ -27,17 +27,21 @@ case "$*" in
   "run get "*" --json")
     jq -n --arg h "$(pollfile health)" --arg w "$(cat "$WORK/worker_id")" --arg since "$(cat "$WORK/since" 2>/dev/null || true)" \
       --arg c "$(cat "$WORK/cause" 2>/dev/null || true)" \
+      --arg rn "$(cat "$WORK/retry" 2>/dev/null || true)" \
       --arg hr "$(cat "$WORK/hold" 2>/dev/null || true)" \
-      '{status:"running",hold_reason:(if $hr=="" then null else $hr end),recovery_wait_cause:(if $c=="" then null else $c end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)}'
+      --arg mh "$(cat "$WORK/memory" 2>/dev/null || echo OMIT)" \
+      --arg dp "$(pollfile parks 2>/dev/null || true)" \
+      '{status:"running",hold_reason:(if $hr=="" then null else $hr end),recovery_wait_cause:(if $c=="" then null else $c end),recovery_retry_not_before:(if $rn=="" then null elif $rn=="EMPTY" then "" elif $rn=="FALSE" then false else $rn end),disk_park_count:(if $dp=="" then null else ($dp|tonumber) end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)} | (if $rn=="OMIT" then del(.recovery_retry_not_before) else . end) | if $mh=="OMIT" then . else .memory_hold=($mh|fromjson) end'
     mv "$WORK/poll.next" "$WORK/poll" ;;
   "worker list --json") cat "$WORK/workers" ;;
+  "run logs "*" --json") [ -f "$WORK/logs" ] || exit 1; cat "$WORK/logs" ;;
   *) echo "unexpected uzi call: $*" >&2; exit 1 ;;
 esac
 STUB
 chmod +x "$WORK/bin/uzi"
 
 # scenario NAME STATUSES HEALTHS WORKER_ID WORKERS_JSON
-reset() { rm -f "$WORK/since" "$WORK/cause" "$WORK/hold"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
+reset() { rm -f "$WORK/since" "$WORK/cause" "$WORK/retry" "$WORK/hold" "$WORK/logs" "$WORK/memory"; : > "$WORK/parks"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
 run() { PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,failed,cancelled 0 "${1:-6}" 2>/dev/null; }
 fresh=$(date -u +%Y-%m-%dT%H:%M:%S.123456Z)
 old=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)
@@ -159,6 +163,68 @@ rc=0; out=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,failed,cancelled
 [ "$rc" -eq 0 ] || fail "explicit recovery_wait stop set: want exit 0, got $rc: $out"
 case "$out" in *"STOP=recovery_wait:worker_requeue_exhausted"*"owner decision"*) ;; *) fail "explicit stop set lost the cause-specific stop: $out";; esac
 
+# 12d. an owner-held retained_recovery_exhausted park (NULL retry stamp, #3495) always stops too
+reset recovery_wait ok "" '[]'
+echo retained_recovery_exhausted > "$WORK/cause"
+rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+[ "$rc" -eq 0 ] || fail "held retained park: want exit 0, got $rc: $out"
+case "$out" in *"STOP=recovery_wait:retained_recovery_exhausted"*"owner decision"*"RESULT=stop:recovery_wait") ;; *) fail "held retained stop missing: $out";; esac
+
+# 12e. a stamped retained_recovery_exhausted park is an automatic retry: keep polling to ELAPSED
+reset recovery_wait ok "" '[]'
+echo retained_recovery_exhausted > "$WORK/cause"
+echo 2026-10-27T03:00:00Z > "$WORK/retry"
+rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+[ "$rc" -eq 3 ] || fail "timed retained park should expire: $rc: $out"
+case "$out" in *STOP=*) fail "timed retained park stopped: $out";; esac
+
+# 12f. only an explicit null stamp is a hold: an omitted, empty or false stamp keeps polling
+for v in OMIT EMPTY FALSE; do
+  reset recovery_wait ok "" '[]'
+  echo retained_recovery_exhausted > "$WORK/cause"
+  echo "$v" > "$WORK/retry"
+  rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+  [ "$rc" -eq 3 ] || fail "retained park with $v stamp should expire: $rc: $out"
+  case "$out" in *STOP=*) fail "retained park with $v stamp stopped: $out";; esac
+done
+
+# Adoption refusal always stops once, including inconsistent or absent retry timing.
+for v in NULL 2099-01-02T03:04:05Z OMIT FALSE; do
+  reset recovery_wait stalled "" '[]'
+  echo retained_recovery_adoption_failed > "$WORK/cause"
+  [ "$v" = NULL ] || echo "$v" > "$WORK/retry"
+  rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+  [ "$rc" -eq 0 ] || fail "adoption $v: want exit 0, got $rc: $out"
+  case "$out" in *"STOP=recovery_wait:retained_recovery_adoption_failed"*"owner decision"*"integrity check refused adoption"*"local work and custody preserved"*"no automatic retry"*"RESULT=stop:recovery_wait") ;; *) fail "adoption guidance missing: $out";; esac
+  [ "$(cat "$WORK/poll")" -eq 1 ] || fail "adoption hold polled again"
+done
+
+# Every memory-pressure park requires an owner decision, regardless of remaining
+# interventions or DTO shape, attention checks, or whether recovery_wait is in the stop set.
+for memory in '{"used":3,"max":3,"remaining":0}' '{"used":2,"max":3,"remaining":1}' OMIT null false '"bad"' '[]' '{}' \
+  '{"remaining":null}' '{"remaining":"1"}' '{"remaining":true}' '{"remaining":-1}' '{"remaining":0.5}'; do
+  reset recovery_wait ok "" '[]'
+  echo worker_memory_pressure > "$WORK/cause"
+  printf '%s\n' "$memory" > "$WORK/memory"
+  rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+  [ "$rc" -eq 0 ] || fail "owner-held memory park ($memory): want exit 0, got $rc: $out"
+  case "$out" in *"STOP=recovery_wait:worker_memory_pressure"*"back up"*"owner"*"resume or cancel"*"RESULT=stop:recovery_wait") ;; *) fail "memory owner guidance missing ($memory): $out";; esac
+done
+
+# Transition detection and explicit stop sets retain the cause-specific guidance.
+reset "$(printf 'running\nrecovery_wait')" ok "" '[]'
+echo worker_memory_pressure > "$WORK/cause"
+echo '{"used":3,"max":3,"remaining":0}' > "$WORK/memory"
+rc=0; out=$(run) || rc=$?
+[ "$rc" -eq 0 ] || fail "memory park after running: want exit 0, got $rc: $out"
+case "$out" in *"status=recovery_wait"*"STOP=recovery_wait:worker_memory_pressure"*) ;; *) fail "memory transition missing: $out";; esac
+reset recovery_wait ok "" '[]'
+echo worker_memory_pressure > "$WORK/cause"
+echo '{"remaining":0}' > "$WORK/memory"
+rc=0; out=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,recovery_wait 0 2) || rc=$?
+[ "$rc" -eq 0 ] || fail "explicit memory stop: want exit 0, got $rc: $out"
+case "$out" in *"STOP=recovery_wait:worker_memory_pressure"*"resume or cancel"*) ;; *) fail "explicit memory stop lost guidance: $out";; esac
+
 # 13. any other recovery_wait cause keeps its existing behaviour: keep polling to ELAPSED
 reset recovery_wait ok "" '[]'
 echo provider_outage > "$WORK/cause"
@@ -180,5 +246,59 @@ reset paused ok "" '[]'
 rc=0; out=$(PATH="$WORK/bin:$PATH" WATCH_ATTENTION_POLLS=0 bash "$SCRIPT" rid "" 0 3) || rc=$?
 [ "$rc" -eq 0 ] || fail "default stop set paused: want exit 0, got $rc: $out"
 case "$out" in *"hold_reason=unknown"*"RESULT=stop:paused") ;; *) fail "default paused stop missing: $out";; esac
+
+# 15. a persistent data_volume_full park (a counted disk park) -> exit 4, with the park count in the
+#     evidence and the park episode in REARM: an unattended loop of disk parks must not pass silently.
+reset recovery_wait ok "" '[]'
+echo data_volume_full > "$WORK/cause"; echo 2 > "$WORK/parks"
+rc=0; out=$(run) || rc=$?
+[ "$rc" -eq 4 ] || fail "disk park: want exit 4, got $rc: $out"
+case "$out" in *STOP=needs_attention*"recovery_wait_cause=data_volume_full disk_park_count=2"*) ;; *) fail "disk park evidence missing: $out";; esac
+case "$out" in *"REARM=WATCH_ATTENTION_ACK=data_volume_full@park2 "*) ;; *) fail "disk park episode missing from REARM: $out";; esac
+
+# 15b. the acked park keeps polling to ELAPSED
+reset recovery_wait ok "" '[]'
+echo data_volume_full > "$WORK/cause"; echo 2 > "$WORK/parks"
+rc=0; out=$(PATH="$WORK/bin:$PATH" WATCH_ATTENTION_ACK=data_volume_full@park2 bash "$SCRIPT" rid completed,failed,cancelled 0 6 2>/dev/null) || rc=$?
+[ "$rc" -eq 3 ] || fail "acked disk park should expire: $rc: $out"
+
+# 15c. a NEW park after the acked one alerts again
+reset recovery_wait ok "" '[]'
+echo data_volume_full > "$WORK/cause"; printf '2\n3\n' > "$WORK/parks"
+rc=0; out=$(PATH="$WORK/bin:$PATH" WATCH_ATTENTION_ACK=data_volume_full@park2 bash "$SCRIPT" rid completed,failed,cancelled 0 6 2>/dev/null) || rc=$?
+[ "$rc" -eq 4 ] || fail "new disk park: want exit 4, got $rc: $out"
+case "$out" in *"disk_park_count=3"*) ;; *) fail "new park evidence missing: $out";; esac
+
+# 16. min-question-seq: only a newest question positively equal to the answered seq keeps
+#     polling; a newer, missing, unreadable or lower seq stops; attention checks still run.
+qrun() { PATH="$WORK/bin:$PATH" WATCH_ATTENTION_POLLS="${QPOLLS:-0}" bash "$SCRIPT" rid "" 0 4 "" "$1" 2>/dev/null; }
+qstop() { # qstop DESC LOGS-or-"-" -> must stop at awaiting_input with exit 0
+  reset awaiting_input ok "" '[]'
+  [ "$2" = - ] || printf '%s' "$2" > "$WORK/logs"
+  rc=0; out=$(qrun 5) || rc=$?
+  [ "$rc" -eq 0 ] || fail "$1: want exit 0, got $rc: $out"
+  case "$out" in *"STOP=awaiting_input"*"RESULT=stop:awaiting_input") ;; *) fail "$1: stop missing: $out";; esac
+}
+reset "$(printf 'awaiting_input\nrunning')" ok "" '[]'
+printf '%s\n' '{"seq":5,"kind":"question"}' '{"seq":9,"kind":"text"}' > "$WORK/logs"
+rc=0; out=$(qrun 5) || rc=$?
+[ "$rc" -eq 3 ] || fail "answered question: want exit 3, got $rc: $out"
+case "$out" in *STOP=*) fail "answered question stopped the watch: $out";; esac
+qstop "newer question" "$(printf '%s\n' '{"seq":5,"kind":"question"}' '{"seq":12,"kind":"question"}')"
+case "$out" in *"newest question seq=12, answered=5"*) ;; *) fail "newer question evidence missing: $out";; esac
+qstop "unreadable logs" -
+qstop "empty logs" ""
+qstop "text-only logs" '{"seq":9,"kind":"text"}'
+qstop "question without seq" '{"kind":"question"}'
+qstop "regressed question seq" '{"seq":3,"kind":"question"}'
+qstop "answered plus seq-less question" "$(printf '%s\n' '{"seq":5,"kind":"question"}' '{"kind":"question"}')"
+qstop "answered plus string seq" "$(printf '%s\n' '{"seq":5,"kind":"question"}' '{"seq":"12","kind":"question"}')"
+qstop "answered plus fractional seq" "$(printf '%s\n' '{"seq":5,"kind":"question"}' '{"seq":4.5,"kind":"question"}')"
+reset awaiting_input stalled "" '[]'
+printf '%s\n' '{"seq":5,"kind":"question"}' > "$WORK/logs"
+rc=0; out=$(QPOLLS=3 qrun 5) || rc=$?
+[ "$rc" -eq 4 ] || fail "answered question + stalled health: want exit 4, got $rc: $out"
+case "$out" in *STOP=needs_attention*) ;; *) fail "attention skipped on answered question: $out";; esac
+case "$out" in *"REARM="*" '' 5"*) ;; *) fail "REARM lost min-question-seq: $out";; esac
 
 echo "PASS: watch-run attention stop"

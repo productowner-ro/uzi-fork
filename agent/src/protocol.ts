@@ -12,9 +12,17 @@ import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 // Type-only (erased at runtime): the sanitized-fields class lives beside the decoders that mint it.
 import type { SanitizedPrDescriptionFields } from "./client.js";
 import type { SemanticGateAck } from "./semantic-gate-wire.js";
+import type { HarnessEffort } from "./harness.js";
 
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
+
+/** Compile-time two-way tie between the SDK's EffortLevel and HARNESS_EFFORTS: this line fails
+ *  to typecheck when either side drifts. */
+const effortSetsAligned: [EffortLevel] extends [HarnessEffort]
+  ? [HarnessEffort] extends [EffortLevel] ? true : never
+  : never = true;
+void effortSetsAligned;
 
 /** Fresh, worker-only authority for one refresh candidate. */
 export interface PublicationContextRequest {
@@ -590,6 +598,36 @@ export interface OutboxHeartbeatEntry {
  *  a re-adopted run to. A judge/review attempt is always `running`. */
 export type ActiveSnapshotPhase = "running" | "awaiting_approval" | "awaiting_input" | "awaiting_followup";
 
+export interface CodexOperationSource {
+  gate_revision: number;
+  presentation_id: string;
+  revision_input_id: number;
+}
+
+export interface CodexOperationIdentity {
+  operation_id: string;
+  kind: "root" | "child" | "advice" | "checker";
+  source?: CodexOperationSource;
+}
+
+export interface CodexOperationRequest extends CodexOperationIdentity {
+  claim_generation: number;
+}
+
+export type CodexOperationDecision = {
+  decision: "admit";
+  operation_id: string;
+  claim_generation: number;
+} | {
+  decision: "wait";
+  operation_id: string;
+  claim_generation: number;
+  class: "rate_limit" | "overload";
+  episode_id: string;
+  server_now: string;
+  eligible_at: string;
+};
+
 /** One entry in an {@link ActiveSnapshot} (PRD #1390 M2a): a run-lane attempt (or a
  *  judge/review attempt) this worker is currently executing, named by its run id, the
  *  `claim_generation` it was claimed at, and its current `phase`. A #1390-only worker sets
@@ -597,6 +635,8 @@ export type ActiveSnapshotPhase = "running" | "awaiting_approval" | "awaiting_in
  *  terminal outcome is journaled and pending replay (the api then keeps that run unclaimable and
  *  its generation unbumped while the lease holds). */
 export interface ActiveSnapshotEntry {
+  /** Display metadata only; does not change phase, custody, or activity. */
+  account_cooldown?: CodexOperationIdentity;
   run_id: string;
   claim_generation: number;
   phase: ActiveSnapshotPhase;
@@ -922,6 +962,34 @@ export interface ClaimSecrets {
   codex?: ClaimCodexSecrets;
 }
 
+/** PRD #3244: provenance tokens of a lead agent's requested model / effort. Closed sets, pinned to
+ *  `vocabulary.model_sources` / `effort_sources` in fixtures/lead-config/contract.json (the Go
+ *  `leadcfg` package is the server twin). */
+export type LeadModelSource =
+  | "run_override" | "schedule_pin" | "user_planning_default" | "user_default" | "template" | "builtin";
+export type LeadEffortSource =
+  | "run_override" | "user_planning_default" | "user_default" | "template" | "builtin";
+
+/** PRD #3244: the body of POST /api/worker/runs/{id}/lead-config (api/internal/apitypes
+ *  LeadConfigReportRequest). The server schema is closed (unknown fields are a 400) and the four
+ *  observed fields are always sent, null until observed. */
+export interface LeadConfigReportBody {
+  claim_generation: number;
+  phase: "plan" | "implement";
+  phase_entry: number;
+  seq: number;
+  truncated: boolean;
+  requested_model: string | null;
+  requested_model_source: LeadModelSource;
+  requested_effort: string | null;
+  requested_effort_mode: "explicit" | "runtime_default";
+  requested_effort_source: LeadEffortSource;
+  observed_model: string | null;
+  observed_model_evidence: string | null;
+  observed_effort: string | null;
+  observed_effort_evidence: string | null;
+}
+
 /** Per-run caps the server may push down (PRD §Configuration). Advisory in M2.
  *  Field names + units match M1's claim.go: timeouts are in *seconds*; any
  *  future ms consumer converts at the use site. */
@@ -964,14 +1032,20 @@ export interface ClaimConfig {
   /** The run owner's per-user default reasoning effort (PRD #617). When present it
    *  is applied to the SDK's top-level `Options.effort` for the main thread and
    *  inherited by the implement-turn/subagent options via the baseOptions spread. The
-   *  API now populates this for every issue/chat claim — the owner's explicit choice,
+   *  API populates this on issue/chat claims with the owner's explicit choice,
    *  or the uzi default `medium` for an owner who never chose (issue #1157); it is
-   *  absent only from an un-upgraded API, in which case the worker omits the key and
+   *  absent for a Runtime default preference (#3247) and from an un-upgraded API, in which case the worker omits the key and
    *  the SDK applies its own fallback (the worker adds no default of its own). Typed as
    *  the SDK's own EffortLevel so the worker tracks the SDK's closed set (mirror of the
    *  Go `agenttmpl.EffortLevels` and the web EffortSelect list — no shared source, keep
    *  in lockstep). */
   default_effort?: EffortLevel;
+  /** PRD #3244: where `default_model` came from. Present only when `default_model` shipped on a
+   *  lead-lane claim; closed set pinned to fixtures/lead-config/contract.json. */
+  default_model_source?: LeadModelSource;
+  /** PRD #3244: where `default_effort` (or its absence) came from. Always present on a lead-lane
+   *  claim of an upgraded API, which makes it the worker's lead-config reporting activation signal. */
+  default_effort_source?: LeadEffortSource;
   /** The run owner's AI-attribution opt-out (issue #916), read live per claim. When
    *  false, the worker suppresses the Agent SDK's Co-Authored-By: Claude commit trailer
    *  for this run. Always sent by an upgraded server (NOT null); absent on an older
@@ -1314,7 +1388,7 @@ export interface ClaimPlanCrossCheck {
   semantic_candidate?: ReturnType<typeof import("./semantic-plan.js").parseSemanticCandidate>;
   /** Independent provenance from the captured server snapshot; absent on legacy claims. */
   model_source?: "pin" | "worker default";
-  effort_source?: "pin" | "worker default";
+  effort_source?: "pin" | "worker default" | "cross-check default";
   stage: "plan";
   lead_run_id: string;
   round: number;
@@ -1330,6 +1404,9 @@ export interface ClaimPlanCrossCheck {
 }
 
 export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" | "planning_diff"> {
+  coverage_supported?: boolean;
+  /** Computed locally from Git, never trusted from a server claim. */
+  code_inventory?: import("./code-cross-check-coverage.js").CodeInventory;
   stage: "code";
   head_commit: string;
   /** Fresh default tip bound independently of repository-instructions consent; absent on legacy claims. */
@@ -1409,7 +1486,15 @@ export interface ClaimMemoryState {
   memory_policy?: MemoryPolicy | null;
 }
 
+export interface ForgeOriginReservation {
+  incarnation: string;
+  version: number;
+  observation_version: number;
+}
+
 export interface ClaimResponse extends ClaimMemoryState {
+  /** Optional negotiated telemetry token; grants no execution or custody authority. */
+  forge_origin_reservation?: ForgeOriginReservation;
   /** Server row only; no production enrollment writer in M2. */
   semantic_planning?: import("./semantic-plan.js").SemanticPlanning;
   /** Guarded prompt repair inputs; metadata is untrusted. */
@@ -1461,8 +1546,12 @@ export interface ClaimResponse extends ClaimMemoryState {
   /** SDK session to resume (M3); null/absent for a fresh run. */
   session_id?: string | null;
   /** Resume: the tip THIS run last published to its checkpoint ref (owner-anchor).
-   *  Adoption of refs/uzi-checkpoints/<branch> requires the remote tip to equal this. */
+   *  Adoption of refs/uzi-checkpoints/<checkpoint-key> requires the remote tip to equal this. */
   checkpoint_tip?: string | null;
+  /** Server-authorized immutable v1 coordinates; validated before any checkpoint use. */
+  checkpoint_coordinates?: unknown;
+  /** Explicit false proves no outstanding task write; omitted or malformed is unknown. */
+  checkpoint_write_unresolved?: boolean;
   /** issue #3194: the source a flight of THIS run published after its `--require-base` guard
    *  accepted (set-only server-side). A continuation may adopt exactly this content. */
   checkpoint_attested_source?: string | null;
@@ -1473,6 +1562,10 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  reserve/release name it so a capture/release binds to the exact hold this claim opened.
    *  Optional so a pre-#1296 payload without it still decodes. */
   claim_generation?: number;
+  /** Server recovery allowance; malformed values are ignored at the claim boundary. */
+  worker_recovery_episode?: number;
+  /** Raw owner resume grant; malformed or absent grants confer no adoption renewal. */
+  worker_recovery_owner_episode?: number;
   /** Structured PRD #3 templates — the lead plus any subagents — consumed
    *  programmatically by M3 (mapped to SDK AgentDefinitions). M2 ignores them. */
   agents: AgentTemplate[];
@@ -1889,6 +1982,9 @@ export interface TaskReviewRequest {
 export interface ChatClaimResponse extends ClaimMemoryState {
   run_id: string;
   claim_generation?: number;
+  worker_recovery_episode?: number;
+  /** Raw owner resume grant; malformed or absent grants confer no adoption renewal. */
+  worker_recovery_owner_episode?: number;
   kind: "chat";
   /** Conversation display title (server-derived; may be empty). */
   title: string;
@@ -1922,8 +2018,8 @@ export interface ChatClaimConfig {
   /** The owner's per-user default model (PRD #17); omitted when unset. */
   default_model?: string;
   /** The owner's per-user default reasoning effort (PRD #617); the API populates it
-   *  with the owner's choice or the uzi default `medium` (issue #1157), and it is
-   *  optional only for an un-upgraded API. */
+   *  with the owner's choice or the uzi default `medium` (issue #1157); it is
+   *  absent for a Runtime default preference (#3247) and from an un-upgraded API. */
   default_effort?: EffortLevel;
 }
 
@@ -2509,7 +2605,7 @@ export function seedAgentSelection(persisted?: AgentSelection | null): AgentSele
  * publish of a checkpoint pack. The REQUEST has no JSON type: the packfile is the raw
  * `application/octet-stream` body and the checkpoint tip OID travels in the
  * `X-Uzi-Checkpoint-Tip: <40-hex-lowercase-sha>` header. On success `published` is true
- * and `ref` names the landed `refs/uzi-checkpoints/<branch>`; a best-effort skip sets
+ * and `ref` names the landed `refs/uzi-checkpoints/<checkpoint-key>`; a best-effort skip sets
  * `published` false and carries `skipped`. Any non-2xx is ignored by the worker — a
  * publish failure never fails the run.
  */
@@ -2543,6 +2639,13 @@ export interface PublishResponse {
 export type PublishResult =
   | { ok: true; body: PublishResponse }
   | { ok: false; httpStatus: number };
+
+export const CAPABILITY_INFERENCE_EVIDENCE_FEATURE = "capability_inference_evidence_v1";
+
+export type CapabilityInferenceEvidence = Partial<Record<"docker" | "jvm", {
+  triggers: { path: string; reason: "docker_marker" | "jvm_manifest" | "testcontainers_reference" | "docker_command" }[];
+  truncated: boolean;
+}>>;
 
 export interface StateRequest {
   /** Memory-pressure park fence, bound to the current registration. */
@@ -2700,6 +2803,8 @@ export interface StateRequest {
    *  reports as `milestones` (candidate on awaiting_approval, frozen on the autopilot
    *  running report). */
   required_capabilities?: string[];
+  /** Display-only raw detector samples. Absent preserves old observations; {} is a known empty scan. */
+  capability_inference_evidence?: CapabilityInferenceEvidence;
   /** Provisionable toolchain names the run needs (e.g. go, node, python, rust, jvm).
    *  Additive + optional, OMITTED ENTIRELY when empty, same discipline as above. */
   required_tools?: string[];
@@ -2803,14 +2908,21 @@ export interface StateRequest {
    *  "data_volume_full" (a write to the worker's data volume stayed
    *  disk-full after a reclaim and one retry, or the claim preflight found the volume full; gated
    *  on `recovery_cause_data_volume_full`, an api without it gets the untyped park; the api 400s
-   *  this cause without `claim_generation`, so it is never sent for a chat claim). The api
-   *  validates it against its own enum
-   *  (forge_unreachable|empty_turn|provider_outage|vault_locked|codex_account_unavailable|data_volume_full) before any SQL
-   *  and a legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
+   *  this cause without `claim_generation`, so it is never sent for a chat claim).
+   *  Retained recovery uses "retained_recovery_exhausted" for confirmed budget exhaustion
+   *  (feature `recovery_cause_retained_recovery_exhausted`, timed or owner-held) and
+   *  "retained_recovery_adoption_failed" for a confirmed persisted adoption refusal
+   *  (feature `recovery_cause_retained_recovery_adoption_failed`, owner Resume or Cancel only,
+   *  no automatic retry). Both require a positive claim generation and exact fenced ACK;
+   *  feature absence keeps the retained terminal fallback. The api validates its cause enum
+   *  before SQL, and a legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
    *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park
    *  stay byte-identical on the wire; an api that predates the field 400s a report carrying it,
    *  which the worker's capability-aware fallback avoids by only sending it when the api
    *  advertised `recovery_park_cause` at register (D7). */
+  /** Codex measured idle parks use codex_idle_stall only with
+   * recovery_cause_codex_idle_stall_v1 and a positive, stampable generation. This
+   * contract never downgrades after negotiation; both idle kinds carry progress. */
   recovery_cause?: string;
   /** PRD #1733: with `recovery_cause: "provider_outage"` only (the api 400s it on any other report),
    *  the count of successful model turns completed since this flight started, so the api
@@ -2820,7 +2932,9 @@ export interface StateRequest {
   /** Successful model turns since this flight started, durably consumed by the api to clear
    *  the old provider-outage streak on a nonprovider recovery_wait park (cause absent,
    *  empty_turn or data_volume_full). Nonnegative int32; requires a positive claim_generation
-   *  and provider_progress_on_recovery_park_v1. Credential deferrals never send this evidence. */
+   *  and provider_progress_on_recovery_park_v1. A negotiated codex_idle_stall park
+   *  requires it, including zero, under recovery_cause_codex_idle_stall_v1 alone.
+   *  Credential deferrals never send this evidence. */
   provider_progress_turns?: number;
   /** PRD #1809 D6: qualifies a `recovery_cause: "data_volume_full"` park. `true` parks WITHOUT
    *  counting toward the api's lifetime cap (UZI_RUN_DISK_PARK_MAX), for M4's soft cache-cap park;
@@ -2909,6 +3023,8 @@ export type CompletedPublicationReason =
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  /** Cause read from the same RunDTO as status; required to confirm a typed idle park. */
+  recoveryCause?: string;
   /** Local acceptance proof from the memory park RPC, never a serialized API receipt.
    *  Only this binding authorizes marking a memory park; status/applied alone do not. */
   readonly memoryParkAccepted?: Readonly<{
@@ -3023,8 +3139,8 @@ export interface StateAck {
   /** PRD #1392 M2 (D10): the retry-not-before stamp the api returns on a `recovery_wait` ack —
    *  a field ON the RunDTO (`run.recovery_retry_not_before`), NOT top-level — so the pre-clone
    *  forge-park feed event can quote when the run resumes. An RFC3339 string as the api marshals
-   *  it; absent (older server, no stamp, unparseable body) ⇒ the feed event says "after backoff". */
-  recoveryRetryNotBefore?: string;
+   *  it; NULL means automatic forge retries exhausted; waiting for owner Resume or Cancel; absent retains historical backoff copy. */
+  recoveryRetryNotBefore?: string | null;
   /** PRD #1247 M5b: the worker-facing held-state credential-switch signal, read TOP-LEVEL off the
    *  /state ack body (beside `run`, on both the 200 ack and the ordinary not-applied 409). Present
    *  when a switch is pending for the claim the worker still holds; the `generation` is the one the
@@ -3121,9 +3237,8 @@ export interface RunOwnershipResponse {
   /** PRD #1392 M2 (D10): the run's `recovery_retry_not_before` stamp, added to the ownership
    *  probe so a forge park reconciled through the probe (a transport failure lost the report
    *  ack) can still quote when it resumes. An RFC3339 string when the run is parked with a
-   *  stamp; absent otherwise (an older api, or a non-parked run) ⇒ the feed event falls back
-   *  to "retry after backoff". */
-  recovery_retry_not_before?: string;
+   *  stamp; NULL means automatic forge retries exhausted; waiting for owner Resume or Cancel. An absent stamp retains historical backoff copy. */
+  recovery_retry_not_before?: string | null;
 }
 
 /** PRD #1391 Run B M3 (D3): one missing seq range in a run's message trace, as the message-gaps
@@ -3399,7 +3514,7 @@ export interface RecoverySettleRequest {
  *  resumed run is still LIVE (issue #1751 M2, mirrors api/internal/apitypes/recovery.go):
  *  POST /runs/{id}/recovery-holds/{holdID}/settle-live. published_sha is the successor
  *  generation's PUBLISHED tip (a confirmed checkpoint publish, or the finalize branch push);
- *  target names what the api proves it against: `checkpoint` (refs/uzi-checkpoints/<branch>) or
+ *  target names what the api proves it against: `checkpoint` (refs/uzi-checkpoints/<checkpoint-key>) or
  *  `branch` (runs.branch). Candidate SHAs only (40-char lowercase hex); no worker verdict field.
  *  The answer is the same {@link RecoverySettleResponse}. */
 export interface RecoveryLiveSettleRequest {

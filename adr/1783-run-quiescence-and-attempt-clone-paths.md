@@ -311,9 +311,15 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   active capture retains its revision and full supervised-child settlement, and
   exact completed evidence survives disposal. Healthy queue expiry still fails
   closed; no deadline is extended. (AI-synced 2026-10-18)
-  The capture context mints neither a credentialed nor a
+  A's credential-free capture context mints neither a credentialed nor a
   completion permit; absence of that permit does not mean absence of a held
-  capture boundary. [ADR-1106](1106-codex-harness.md#process-root-ownership)
+  capture boundary. B's authenticated context instead carries the existing permit
+  under private exact-flight/executor/safety identity and callback lifetime checks;
+  a structural lookalike or an error field grants no authority (AI-synced 2026-10-23).
+  Subsequent C consumes an exact revocable disposal witness for release-dependent
+  terminal checks; it neither reuses A/B callback authority after unwind nor
+  reacquires either safety queue (AI-synced 2026-10-24).
+  [ADR-1106](1106-codex-harness.md#process-root-ownership)
   records the canonical empty helper/askpass launch policy and separate
   credential-presence check for the trusted worker identity `worker_pat`.
   Codex JS dependency installation and Devbox install/shellenv retain their normal
@@ -437,18 +443,105 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   fresh successor creation from the durable bare pin is outside capture. It reads
   predecessor lstat metadata, not old clone bytes; ordinary seeding trust is unchanged.
 
-  The healthy credentialed wall park, completion hold and recovery/credential-switch
-  captures still have the pre-publish status/WIP/fetch-back gap; wrapping publish
-  alone does not close it. That is slice B, **unshipped** in A. Terminal paths
-  already have executor disposal; the remaining gap is snapshot coverage before
-  writer-exclusion proof, not a blanket absence of disposal. Strengthened terminal
-  process proof is slice C, **unshipped**. `CodexExecutor` has no `killAgentTree`
-  implementation, so the direct optional call is not Codex process proof.
-  Neither the held capture nor a process scan proves Docker writer exclusion;
-  accepted-but-invisible daemon creates (#1860) and Claude residuals remain.
+  **Slice B contract, Refs #2852 (AI-synced 2026-10-23):** B is implemented in
+  this delivery. Healthy Codex wall park, completion hold and ordinary recovery,
+  including recovery with `terminalDisk`, keep registered-root process exclusion from before
+  the first source operation through WIP commit, import/fetch-back, readback,
+  bridge, ownership checks, publication and source-dependent settlement. Scoped
+  Git spawners join full child cleanup. New acquisitions order sink gate, safety,
+  then bare lock; already-held finalize preserves its original order and deadline.
+  The private authenticated capability is bound to the exact flight, executor and
+  safety facade and expires with its callback. Before capture-dependent requests,
+  the existing safety facade settles owned children while keeping the permit held;
+  recovery's ACK-conditioned source settlement stays inside that same callback.
+  Saved local verification reused after unwind requires a matching joined-cleanup
+  witness for the actual facade and permit. An independent poison invalidates it,
+  including empty or capped diagnostic writes; later expiry cannot erase that fact.
+  Only the facade's known deadline paths with affirmative full-root cleanup preserve
+  local evidence through expiry. These observations grant no launch, credential or
+  terminal-retirement authority and never reopen admission.
+  Both finalize hold branches use a
+  private one-shot continuation after the parent boundary joins; error names,
+  causes and actionError fields cannot issue it. Continuation replays neither
+  publication nor an ACK.
+
+  One episode starts before public wall/hold sink-gate waiting: 180 s total,
+  with 120 s for healthy capture reserving 60 s for fallback. Parent deadlines cap
+  both phases; retries and disposition use remaining time, never a renewed deadline.
+  Owned cleanup may finish later but stays joined; expiry authorizes no further
+  sensitive work and abandons no owned work. Before verified local capture, primary
+  poison, boundary refusal or expiry can take A's observed_empty fallback only
+  after the primary scope joins, with no refresh, PAT or overlay. Wall/hold fallback
+  is local-only; recovery may use its existing join-token publication. An already
+  verified local result survives optional publication failure without recapture.
+  Cancellation, claim fencing and shutdown revocation grant no fallback. Ordinary
+  Codex completion capture therefore stops and retains after runner.shutdown;
+  the typed #3109 graceful-shutdown checkpoint path remains separate and unchanged.
+
+  Both direct and retained Codex credential-switch entries retain/refuse before
+  capture or credential work. Codex per-run overrides remain unsupported under D9
+  ([override refusal](../api/internal/workersvc/credential_override.go) and
+  [run creation](../api/internal/workersvc/service.go)); only the
+  [Claude executor](../agent/src/sdk-executor.ts) invokes the switch callback.
+  Claude behavior is unchanged. Codex recovery-park
+  cleanup skips its post-scope clone diagnostic at the original cleanup site, after
+  the original guards, preserving sourceExitDenied and retention latches. Claude
+  and stale reasons retain their prior paths; subsequent C defers release-capable
+  Codex terminal checks as specified below.
+
+  **Subsequent slice C contract, Refs #2852 (AI-synced 2026-10-24):**
+  `disposeTools` synchronously and irrevocably closes admission with
+  `tablesCleared` before yielding. Concurrent and repeated callers join one stored
+  disposal attempt; cleared tables cannot turn a failed attempt into success.
+  Entry while open or closing, pending launches or callbacks, an active capture
+  lane, unreaped roots, unmatched poison, late roots/admission faults or unclean
+  cleanup produces `incomplete`. A closed epoch or exact capture-drained epoch
+  can qualify, including the unchanged completed-capture witness after intentional
+  poison; that terminal use grants no in-run continuation.
+  The exact result object is a revocable disposal witness, bound to registry,
+  poison revision, root count and launch/callback cursors, reaped/disposed roots
+  and successful facade cleanup. Later uncertainty or admission faults revoke it.
+  See [registry disposal](../agent/src/codex/registry.ts) and
+  [facade acceptance](../agent/src/codex/safety.ts).
+
+  Release-capable Codex handler settlement inside A/B records a deferred request;
+  it does no coverage read, process scan or normal/free safety-queue reacquisition.
+  Outer terminal cleanup consumes it after disposal of the exact executor/facade.
+  Skipped, incomplete, rejected or swapped proof retains clone, journal, inventory
+  and paired skills, with the distinct diagnostic
+  `codex terminal disposal unproven; retaining runner clone`.
+  Release-dependent coverage uses inert hardened reads after disposal, with bounded
+  nofollow inventory and marked no-transport Git inspection. The live witness is
+  rechecked across awaits, bare-lock waits and destructive dispatches, including
+  skills deletion. Existing independent preservation, custody, receipts, memory
+  settlement, cancellation, fencing, quarantine and Docker checks can still veto;
+  `sourceExitDenied` stays sticky. A supplies no structural completion permit;
+  C's exact witness is a deny-only prerequisite, not general deletion authority.
+
+  Current-process completion sources record the exact flight/executor/facade and
+  source identity in memory before awaiting durable bind, including partial or
+  failed binds. A `knownCodex` source with missing, non-disposed, changed or
+  swapped proof retains before the first inventory read and never falls back to
+  legacy inspection. Registered same-executor/facade HEAD/root advancement remains
+  allowed; conflicting provenance cannot replace an older binding. Bindings are
+  forgotten after confirmed completion-source cleanup, with no matching pending
+  binder. KnownClaude is unchanged. Owner decision 2026-10-24 narrows R1857-02(e):
+  persisted/unknown-provenance sources retain today's behavior for both harnesses.
+  No prior-process topology proof or durable format change is supplied.
+  **Superseded 2026-10-27 (#3404):** persisted completion sources are now retained
+  unless the durable authority proves them; see the
+  [2026-10-27 amendment](#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement).
+
+  `CodexExecutor` has no killAgentTree implementation; that optional call is not
+  Codex proof. C strengthens registered-process exclusion, not daemon or sibling
+  exclusion. Accepted-but-invisible Docker creates (#1860), unregistered writers
+  and Claude terminal residuals remain.
 
   A accounts for **R1857-01 and the credential-free half of R1857-05**, using
-  shared R1857-07/08 controls. It does not complete #2852 or claim B/C coverage.
+  shared R1857-07/08 controls. B covers R1857-03/-04, the credentialed half of
+  R1857-05, R1857-06 by Codex unreachability plus worker refusal, and its R1857-07/08
+  controls. C implements the registered-process portion of R1857-02 within the
+  owner-narrowed provenance boundary; A/B/C do not complete #2852.
   Per-attempt cgroups (#1862) remain unshipped, not an available proof. #1858
   still forbids automatic retention reclaim. Preservation authority is not
   deletion authority: #2746's custody SETTLE and physical CLEANUP stay separate.
@@ -493,10 +586,12 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
 
 Process proof remains limited to the boundary that actually runs: the Linux
 reaper where enabled, the existing credentialed Codex supervisor boundary, or
-A's callback-held credential-free GitCache capture (contract above).
-The held capture covers its action and supervised children; it does not close
-B's healthy credentialed pre-publish gaps or strengthen C's terminal release
-proof. Claude/stub process handling is unchanged. This says nothing about a Docker
+A's callback-held credential-free GitCache capture or B's whole-region healthy
+Codex capture (contracts above). B closes the healthy pre-publish process gap
+through source-dependent settlement. Subsequent C defers Codex release-dependent
+coverage until exact executor/facade disposal and revalidates its revocable witness
+through retirement (AI-synced 2026-10-24). Claude/stub process handling is unchanged.
+This says nothing about a Docker
 container — the Docker teardown that runs alongside it is best-effort cleanup,
 not proof, so a container that still binds the clone path can, in principle,
 outlive the checks that gate on process quiescence alone. Attempt-unique clone
@@ -571,8 +666,9 @@ ssh-agent an unrelated tool started, not necessarily this run's own — is a
 covers. Canonical reseed and predecessor/orphan capture run `seed`/`capture`
 mode, which scans regardless of executor. Claude and stub `own` mode sites
 also scan. Codex `own` mode sites skip the process scan and use their own
-supervisor boundary at credentialed sinks; the separate Codex gap remains as
-described in the Invariants section. Under the revised decision below, only
+supervisor boundary at credentialed sinks and C's exact disposal witness at
+release-dependent terminal sinks; the remaining provenance and writer limits are
+described in the Invariants section (AI-synced 2026-10-24). Under the revised decision below, only
 concurrent-claim and single-uid cases can still lock out these scanning sites
 solely because of an unattributed unreadable process. The fresh-attempt seed
 exception remains because seeding a fresh path moves or frees nothing.
@@ -766,10 +862,10 @@ The original follow-ups are recorded below with their later disposition where kn
   #1860 separately owns daemon mediation. The unchanged `beforeFree` /
   `freeCanonicalClonePath` and quarantine flow still has a **process-proof /
   daemon pending-create residual**: a create already accepted by the daemon can
-  complete after the process proof and clean listings. #2852's terminal/Docker
-  writer-exclusion remainder is not fixed. Currently unwired status is not durable
-  proof that a path was never exposed to a daemon.
-- **Follow-up 4 — #2852 remains partial under the slice A contract (AI-synced 2026-10-18).** A holds owner
+  complete after the process proof and clean listings. C's registered-process
+  strengthening does not fix #2852's Docker/unregistered-writer remainder.
+  Currently unwired status is not durable proof of no prior daemon exposure.
+- **Follow-up 4 — #2852 remains partial after slices A/B/C (AI-synced 2026-10-24).** A holds owner
   pause and credential-free recovery, memory-pressure and retained-source capture
   through supervised-child settlement, including the narrow lane of an intentionally
   poisoned, successfully settled registry. It restores neither normal admission
@@ -780,17 +876,32 @@ The original follow-ups are recorded below with their later disposition where kn
   later execution depends on existing budget/hold policy and uses a fresh attempt
   path/model session for retained-source recovery. This is not a blanket gate-revision
   error conversion. Vault lock on recreation takes credential deferral (AI-synced 2026-10-22).
-  Slice B's healthy wall/hold/recovery/switch pre-publish closure and slice C's strengthened terminal
-  proof remain unshipped. Existing credentialed permits remain required at their
-  sinks; A's capture context is separate and supplies no structural completion permit.
+  B now holds healthy Codex wall/hold/ordinary-recovery capture through source-dependent
+  settlement, with joined A fallback under the original episode deadline; Codex switch
+  entries retain/refuse early. Subsequent C strengthens registered-process terminal
+  release: coverage follows exact executor/facade disposal under a revocable witness;
+  skipped/incomplete/swapped proof retains the source and paired skills.
+  Existing credentialed permits remain required at their sinks; B carries the permit
+  under private callback identity/lifetime checks, while A supplies no structural
+  completion permit. The invariant above records fallback and finalize-continuation limits.
   Owned summary/setup/auth cleanup remains joined after authority or delivery expiry,
   with independent cleanup faults refusing capture and credential continuation.
-  Existing terminal executor disposal does
-  not close the gap between snapshot coverage and writer-exclusion proof. A provides no daemon mediation,
-  per-attempt cgroup proof or safe automatic retention reclaim. Refs #2852.
+  Owner decision 2026-10-24 narrows R1857-02(e) to positively bound current-process
+  Codex completion sources. At that date the residual was **persisted completion
+  sources without reliable provenance**: both harnesses kept today's behavior
+  there, with no prior-process topology proof or durable format change.
+  **Superseded 2026-10-27 (#3404):** the
+  [2026-10-27 amendment](#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement)
+  closes that provenance residual and leaves the rest of this paragraph's
+  residuals open. KnownClaude stays unchanged; knownCodex cannot fall
+  back to legacy inspection when its exact proof fails. C supplies no daemon
+  mediation, unregistered/sibling-writer exclusion, Claude terminal proof,
+  per-attempt cgroup proof or safe automatic retention reclaim.
+  Refusal/capacity rates remain unknown and retained bytes can grow. Retention and
+  capacity pressure confer no deletion authority. Refs #2852.
 - **Follow-up 5 — a per-attempt cgroup v2 boundary.** Proper per-run process
   ownership would resolve the remaining concurrent-claim and single-uid
-  lockout. This direction is parked in #1862.
+  lockout. This direction was closed as not planned in #1862 (2026-09-28).
 
 **Accepted risks:**
 
@@ -832,11 +943,26 @@ durable source-bound budget of 3 total iterations (blocked and nonblocked
 together), with a five-minute deadline from the first reservation and the
 existing exponential retry cap of 16 times its base. Reservations survive
 crash, reclaim and successor handoff; reset requires a trusted, successfully
-settled real model turn. External restarts require a genuinely fenced
+settled real model turn, or an explicit owner Resume of a
+`worker_requeue_exhausted` hold renews it (up to 3 more iterations; see the
+[ADR-1197 #3330 amendment](1197-transient-recovery-park.md#amendment-2026-10-25-3330-an-owner-resume-renews-the-retained-source-budget)). External restarts require a genuinely fenced
 successor, not reuse of a discovered ready successor as execution authority.
 
-A permanent blocker or exhaustion ends `failed` with `keepCustody`, no
-automatic reclaim and no failed-run Resume. In this retained-recovery path,
+This original terminal policy is narrowed by the #3495 amendment in
+[ADR-1197](1197-transient-recovery-park.md): a confirmed persisted
+`budget_exhausted` blocker can enter bounded timed retries, then an owner-held
+park, when the API advertises support. Owner Resume of either retained park
+can also renew the budget on a fresh claim; automatic grants contribute to
+the derived claim episode. The later #3527 amendment adds an owner-held
+`retained_recovery_adoption_failed` park for exact persisted adoption refusal,
+with current ownership and quiescence proved. A fresh raw owner grant and
+fresh owned claim renew one charged window; no grant reholds without capture
+or model execution. Repeated adoption failure reholds. Other blockers and the
+documented compatibility fallback still end `failed` with `keepCustody`, with
+no failed-run Resume. The #3031 model-free preservation producer gains no
+renewal authority. See the
+[ADR-1197 #3527 amendment](1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry).
+In this retained-recovery path,
 `worker_residue_blocked` denotes actual quiescence failure; archive size,
 prerequisite, source, clock, preservation and adoption blockers have their
 own accurate reasons. Healthy provider/empty-turn parks and the owner
@@ -1020,10 +1146,372 @@ grow with inventory; no cap skips safety checks.
 Normal cleanup, `beforeFree` / `freeCanonicalClonePath`, quarantine, capture and
 operator discard contracts remain unchanged. The process-proof / daemon
 pending-create residual remains; #1860 is separate daemon mediation, and #2852's
-terminal/Docker writer-exclusion remainder is not fixed. This delivers no proxy,
+Docker and unregistered-writer remainder is not fixed by C's registered-process
+strengthening. This delivers no proxy,
 marker, ledger, API, schema, configuration flag or new infrastructure.
 
 Attributed attempts and paired skills may use the existing guarded
 [retained-source discard](../docs/run-recovery.md#retained-sources-with-no-open-hold-worker-local-inspect-and-discard).
 Shared residue and orphaned skills have no supported generic reclaim route.
 Server custody discard alone is not local writer-exclusion proof.
+
+## Amendment 2026-10-27 — #3404: durable completion-source authority, executor lifetime seal and restart retirement
+
+Refs #3404. This amendment resolves one residual only: the **registered-process
+provenance residual** that the 2026-10-24 owner decision left open for persisted
+completion sources (the persisted half of R1857-02(e)). It does not complete #2852.
+
+### Owner decisions, 2026-10-26
+
+1. **Unknown-retain for both historical harnesses.** A completion source that
+   cannot present authenticated, durable provenance is retained until a guarded
+   operator discard, whichever harness produced it. Classification guesses,
+   process scans, receipts, saved outcomes, a restart or the absence of an
+   executor never become proof.
+2. **The rollback fence is accepted.** A completing bare journal that carries the
+   new fence (below) is rejected by an older worker's strict journal parser, so
+   an older worker refuses to attach, recover or discard it. Operators accept
+   this as the cost of a fence an older worker cannot silently clear.
+
+### Supersession
+
+The 2026-10-24 rule, "persisted/unknown-provenance sources keep today's behavior
+for both harnesses" (recorded in Follow-up 4 and the C contract above, and in
+`specs/human.md` Feature #1783), is **superseded** by this amendment. Those
+passages stay as the history of the 2026-10-24 boundary; the current rule is:
+
+- A persisted completion source is released after a restart only when the
+  durable authority below proves it. Legacy, unauthenticated, mixed, partial,
+  corrupt, unproven and crashed-`active` sources are retained, with their
+  associated metadata and artifacts, until guarded operator discard.
+- There is no TTL, cap or disk-pressure reclamation, and no new generic override.
+  Retained bytes are unbounded and recurring; capacity cost and occurrence rates
+  are unknown.
+
+### What was built
+
+- **Worker lifetime lock W** (`agent/src/authority-lock.ts`). Acquired in
+  `main.ts` before `ensureRunnerTmpdir`, with util-linux `flock` on a permanent,
+  private lock file under `<dataDir>/.uzi-authority`, held for the process
+  lifetime with no release. A second compatible worker on the same data
+  directory, a missing util-linux `flock`, a data volume that is not local
+  ext4/XFS, untrusted lock metadata or an unavailable procfs descriptor path
+  (the lock file is created through a held directory descriptor) refuses
+  startup. The pod-epoch shared lock is unrelated to W.
+- **Authority transaction lock A** (same directory). A per-transaction exclusive
+  lock with a bounded wait on a second permanent file, serialized in process by a
+  keyed mutex. Nested callers borrow the opaque active transaction; calling with a
+  lifetime beneath a held A is refused rather than left to deadlock.
+- **Lock order** `P -> W -> A -> C -> S -> J -> B -> O` (pod ownership, worker
+  lifetime, authority transaction, capture cycle, source reservation, journal,
+  bare, outbox), plus one edge outside the chain: the per-hold lock H
+  (`PredecessorSettler.withHoldLock`) is outer to A, so the order there is
+  `H -> A -> C -> S -> J -> B`. Registry and seal joins precede A, and a caller
+  never holds C, S, J or B when it asks for A.
+- **Authenticated storage and source slots** (`agent/src/completion-authority.ts`).
+  An enrollment record binds a storage UUID, the layout and the canonical data
+  root. The MAC key is derived, domain-separated, from the worker join token.
+  Each source path has one slot keyed by its normalized location digest, in state
+  `active`, `claude_ready`, `sealed`, `ineligible`, `retiring` or `retired`, and
+  256 head shards record the latest slot sequence per key so a restored old slot
+  file is refused rather than trusted. Bounded pending footprints (bare mutation
+  or destructive operation, `running` or `settled_failed` with exact residue) ride
+  the epoch under A.
+- **Source-use epoch invalidation before effects.** Before the worker uses a
+  source path (real Git attach, seed, normalize, replace or discard, pre-start
+  predecessor capture, executor launch, binding replacement) it durably installs
+  a fresh random epoch in an `active` slot. A successor process cannot advance an
+  active foreign epoch; only the exact live owner, after its required settlement,
+  or the guarded operator discard can. The dispatch inventory is
+  `agent/src/git-authority-hooks.ts` (`admitSourceUse`, `beginBareMutation`,
+  `assertBareClear`, `beginDestructive`), implemented by
+  `agent/src/authority-runtime.ts`. A call whose footprint the inventory cannot
+  establish is refused rather than turned into a store-wide blocker.
+- **Irreversible executor lifetime seal** (`agent/src/codex/executor-lifetime.ts`).
+  A Codex executor's admission fence is monotonic (open, sealing, sealed). A
+  failed or unproven seal stays in `sealing` and is never re-sealable. It joins
+  the actual producer, observer and cleanup promises, not the enclosing run
+  promise, and is never awaited under a safety, journal or bare lock. Codex
+  eligibility requires `sealed`. A fresh known-Claude source uses the explicit
+  `claude_ready` classification, which is not an executor lease and carries no
+  Codex seal; Claude process and quiescence checks are unchanged.
+- **Versioned source and fence** (`agent/src/completion-source.ts`).
+  `CompletionSourceV2` extends the V1 attempt provenance with storage identity,
+  harness and worker/executor/registry/facade incarnations and the epoch. A
+  certificate is an HMAC over the canonical source-core digest, minted only by the
+  authority store for the exact live lease. The journal fence is exactly
+  `{version:1, sourceUseEpoch, sourceCoreDigest}`.
+- **Fence in the bare journal** (`agent/src/git.ts`). Written as the last key of
+  the completing recovery journal, made durable and read back. A different fence,
+  a protected descriptor, a stopped marker or a clear that would drop the fence
+  refuses (an orphan reclaim, for one, may not clear a fenced journal).
+
+### Publication write ordering
+
+Triggered by `endFlightSourceUse` in `agent/src/runner.ts` after the flight's
+worker-owned source-capable tails were positively joined. It never fails the run
+and never retries model work. A flight that cannot publish ends the path
+`ineligible`.
+
+1. (Codex) seal the executor lifetime, outside every lock.
+2. Under one outer A: re-verify the epoch, owner and live HEAD and roots against
+   the bound core, and certify the core.
+3. Under J then B (inside A): install the fence, sync the Git config and the bare
+   directory, read it back.
+4. Rewrite the N cohort records (MAC, write, file sync, rename), sync the run
+   directory once, read back, and re-enumerate the physical run directory (a
+   malformed, unknown or unattributable entry refuses; an entry that disappeared
+   is a failed proof).
+5. Publish the slot transition (`sealed` or `claude_ready`) **last**, with the
+   authenticated cohort manifest, syncing the slot file and directory and the head
+   shard file and directory.
+
+Any failure leaves the slot unpublished, so certified records never confer
+eligibility on their own. Durability is awaited asynchronously; no `fsyncSync`
+and no fsync on ordinary command, root or callback admission. Cost: **N + 7**
+barriers for a cohort of N (N record syncs and one run-directory sync, two for the
+fence, four for the slot and head shard), asserted by
+`agent/test/completion-publication.test.ts`.
+
+### Restart retirement
+
+`forgetCompletedGeneration` (`agent/src/recovery.ts`) takes the authority first,
+before any source inspection or source-dependent preflight, under the outer A:
+
+- the slot is published (or retiring), the physical run directory's generation
+  members equal the slot's cohort, every member carries the identical certified
+  V2 source, and the completing bare journal carries exactly the source's fence;
+  known Codex additionally needs `sealed` and the exact certificate;
+- unknown, legacy, mixed, corrupt or unattributable records retain without
+  reaching inventory;
+- the in-memory binding of a running process remains a veto, never the authority;
+  the existing receipt, custody, quarantine, live-execution, Docker, cancellation,
+  identity and content safeguards still apply.
+
+Destruction is a **retiring** transaction. Before the first deletion the slot
+enters `retiring` with an authenticated manifest in deletion order (clone, fence,
+paired skills when present, bundles, records, the receipt-bearing record last)
+and the prior publication digest. Progress is recorded from confirmed absence of
+the leading prefix. After a joined partial failure the retiring record alone
+authorizes a residue retry, which refuses additions, changes and unexplained
+absence and never reopens source use. The **retired tombstone** is written only
+after confirmed exact cleanup, a synced deletion of the records and no pending
+binder, and is never garbage collected; fresh use of the path issues a new epoch.
+Retirement writes the slot a fixed number of times regardless of cohort size; in
+`agent/test/completion-retirement.test.ts` (cohort of 3 with a paired skills
+directory) that is eight slot writes (32 barriers) plus one run-directory sync,
+not counting the Git config writes of the fence clear.
+
+### Operator discard
+
+The existing guarded retained-source discard is the only takeover: it installs a
+fresh `retiring` epoch whose manifest is the footprint the discard already
+authorizes, whatever state the slot held (a crashed worker's `active` epoch, an
+`ineligible` slot with settled residue), and refuses only on a `running` pending
+record. No generic force-clear exists.
+
+### Continuing arrivals and costs
+
+- Sources produced before this change, or by a worker that crashed before
+  publication, keep arriving as unknown and are retained; nothing migrates them
+  into proof.
+- An unresolved bare mutator (a pending `update-ref -d`, a detached destructive
+  `rm` after owner death) blocks that repository's seeds and the exact footprint
+  indefinitely. No process scan, PID absence or empty lock holder clears it.
+- A slot left `active` by a crash blocks reuse of its path until discard.
+- Issue #3638 (see the [ADR-2396 amendment](2396-worker-memory-guard.md#amendment-2026-10-30-cooperative-memory-source-settlement-issue-3638))
+  leaves this crashed-active boundary unchanged. A memory-parked flight's
+  teardown ends its source use cooperatively, and only on positive evidence (a
+  park witness and a confirmed durable `ineligible` end); anything less keeps the
+  slot active as above. A crash after the park ACK and before teardown still
+  leaves the slot active.
+- Changing the worker join token on a reused data volume makes the stored state
+  fail authentication; the worker retains rather than trusts it. No rotation
+  path ships.
+- Restoring a head shard together with the slots of the keys being read,
+  including a volume snapshot restore, is not detected across a restart.
+
+### Not shipped and residuals that remain
+
+- Docker accepted-but-invisible creates (#1860) and unregistered or sibling
+  writers are unchanged: `sourceTailsJoined` does not include Docker teardown
+  state, and no process scan or Docker listing confers authority.
+- Claude terminal proof is not claimed; `claude_ready` rests on the existing
+  Claude quiescence checks and closed worker-owned admission.
+- Per-attempt cgroups (#1862), automatic reclaim (#1858), and the custody
+  reclaim and SETTLE/CLEANUP separation (#2746) are unchanged.
+- No hosted or multi-worker acceptance of the crash behaviour is claimed here;
+  hosted acceptance remains a separate human step.
+
+## Amendment 2026-10-30 — #3645: coordinated terminal-owner handoff
+
+Refs #3645. Builds on the #3404 amendment above and is serial with #3638 (landed)
+and the open #3639 and #3644. It changes how a successor claimant meets a
+terminal owner's fenced source. It does not change the fence, the certificate
+or the authority store.
+
+### The problem
+
+A terminal owner whose completing bare journal carried the #3404 completion-source
+fence left an orphan that the successor's reclaim could not clear. The reclaim
+called the uncertified `retireRunnerClone`, `refuseFenceDrop` refused the fence
+drop at `journal_validation`, and the successor failed instead of being seeded.
+The refusal is correct: an uncertified path must not clear a fence. What was
+missing is a route that retires the source through the certified chain.
+
+### Routing
+
+- `RunRunner.reclaimTerminalOrphan` reads the exact owner journal before any
+  effect (`GitCache.readOrphanJournalFence`, one bare-lock read that uses the
+  strict journal reader and reports `changed`, `unfenced` or `fenced`). A worker
+  without authority reports `unfenced` and keeps its baseline behaviour.
+- For a fenced journal it calls `RecoveryCoordinator.retireCompletedSourceForHandoff`,
+  which drives the existing certified chain: `forgetCompletedGeneration`, then
+  `verifyDurableRetirement`, then `withCompletionSourceBoundary`, then
+  `retireRunnerClone` with `expectedFence`. The owner's receipt only selects the
+  generation; it is never a certificate. Every certificate, cohort, epoch, source,
+  fence, artifact and pending-operation check is redone, and nothing is synthesized.
+- `refuseFenceDrop` stays at every call site, including the two the orphan path
+  reaches (`retireRunnerClone`, `releaseAttemptInPlace`). The #3404 sentence "an orphan
+  reclaim, for one, may not clear a fenced journal" stays true: the handoff
+  retires through the certified chain, it does not clear a fence from the
+  orphan path.
+
+### Lock order
+
+The handoff is entered holding none of A, C, J or B. It takes A (bounded by the
+claimant's `authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)` and ended by its
+lifecycle signal), then J for selection only (released), then C in `skip` mode so
+it never waits behind a coordinator pass, then J again, then B inside the
+boundary. The claimant can still queue for A behind a coordinator cycle that holds
+it. That wait is bounded by the wait above (the lesser of 300 seconds and the
+remaining maintenance budget) and, on timeout, is a retained stop. There is no
+new sleep, timeout or generic retry.
+
+The timeout is the typed `AuthorityLockBusy`, a subclass of `AuthorityRefusal`
+with the unchanged message `authority lock timeout`, thrown at the two timeout
+sites in `agent/src/authority-lock.ts`. Every existing `AuthorityRefusal` handler
+still matches it. Only a timeout while acquiring A is `authority_busy`; every
+other refusal and every abort propagates unchanged, except a failed journal read
+during selection, which is `uncertain`.
+
+### Outcomes and the claimant disposition
+
+The coordinator answers with a typed `CompletedRetirement`, or `not_completion`
+when no record of the owner carries the fence.
+
+| Outcome | Claimant disposition |
+|---|---|
+| `retired` | Re-admit through ordinary admission. |
+| `pending` (including `authority_busy`, `preflight`, `cycle_busy`, `action_failed`) | Retained stop: `RetainedRecoveryStop`, no terminal report, nonterminal, bounded by `RUN_MAX_REQUEUES`. |
+| `uncertain` | Retained stop. |
+| `invalid` (retire mode) | The unchanged outward refusal. |
+| `unsupported` (retire mode) | The unchanged outward refusal. |
+| `not_completion` (retire mode) | The unchanged outward refusal. |
+
+After every non-`retired` outcome the journal is re-read. `changed` re-admits (the
+pair was retired or replaced under the call). A re-read that throws keeps the
+outcome's own disposition. Re-admission is bounded: at most 2 per claim, and the
+third is a retained stop.
+
+A seed that meets a slot still `retiring` (typed refusal kind `retiring`) is a
+not-ready retirement and a retained stop. This applies to a fresh claim as well as
+after a re-admission: a retirement interrupted before the claim arrived leaves the
+same slot. It fails safe, because a retained stop is nonterminal and bounded by the
+requeue cap; the diagnostic names no owner or path when none is known. The untyped
+operator-discard refusal is raised only inside the discard itself, so a seed never
+sees it. A `retiring` slot with no blocking pending record is a retained stop. A
+retiring slot whose pending record is still running, or whose destructive record
+settled failed (as an interrupted operator discard can leave it) raises the untyped "source has an
+unresolved pending footprint" refusal at seed first, which stays terminal; it is
+outside this change and recorded as a residual.
+
+An error thrown while the entry prepares the retirement once A is held (an I/O
+error on a bundle or skills `lstat`, the completion-check cleanup, the redundancy
+claims) is `uncertain`/`preparation_error`, never a raw throw that would reach a
+failure reason. Any AuthorityRefusal, lifecycle aborts and a spent maintenance
+budget still propagate, and the background sweep is unchanged. In classify mode a
+coordinator that is disabled or has no authority scope answers
+`uncertain`/`classify_unavailable` (a retained stop), not `not_completion`: it
+cannot rule out a fenced journal. Retire mode keeps `not_completion`.
+
+### A fenced journal that has retained sources
+
+The certified chain does not retire a journal that carries an episode or retained
+sources. Authority decides the disposition, in classify-only mode. Classify-only
+selects by fence, looks the authority slot up by clone path, verifies, enters no
+boundary and deletes nothing; its only side effect is the settlement drain every
+outer A acquisition already runs.
+
+- Only a classify `not_completion` (no record carries the fence and no authority
+  slot covers the path) reaches the unchanged baseline `detachTerminalRetained`,
+  and that detach is bound to the classified fence: a fence that appeared or
+  changed meanwhile is never detached on the earlier answer.
+- Every other outcome is a retained stop and is never detached, so the journal,
+  fence and bytes stay reachable.
+- No protected-descriptor extension was added.
+
+### Quiescence exclusion
+
+The completion boundary's quiescence request counts other claims in flight. While
+the handoff runs, the pre-seed claimant's own run is excluded from
+`otherClaimInFlight` only while it is the exact current pre-seed flight: its
+execution tail is the recorded tail (a queued duplicate that replaced it is not
+excluded), it has no claim fence, is not cancelled, is not shutting down, and has
+no worktree, clone or attempt. The predicate is rechecked after each awaited
+quiesce; if it no longer holds the boundary retains. This is parity with
+`quiesceRun`, which excludes the flight's own run. Every other execution tail,
+live attempt and the owner's own tail still count; default boundary calls are
+unchanged.
+
+### Exhaustion
+
+A retained stop leaves the claimant's own `ClaimRun` custody hold open and fabricates
+no evidence. `ReadWorkerExhaustionEvidence` reads it as `custody_uncertain`, so at
+the requeue cap (including 0) the run parks `recovery_wait` with cause
+`worker_requeue_exhausted` for an owner Resume or Cancel. Every claimant that can
+reach this path has the hold: profile-bound runs are routed to the isolated runner
+and never reach `RunRunner`, the other kinds have their own runners, and current
+images advertise the recovery capabilities the hold requires. Every claim opens its
+own hold and the stop leaves it open, so at the default cap of 3 this stop loop accrues
+at most 1 + `RUN_MAX_REQUEUES` (4) open holds per exhaustion episode, below the default `custody_hold_limit` of 8; those holds
+share the owner's admission count with the owner's other runs, so several
+exhausted runs can hold the owner's new claims queued until those holds are discarded or
+released; Resume and Cancel leave them open. The `stopOnHeldSource` stop accrues holds the same way. `TestClaimantHandoffExhaustionLiveDB` proves one open
+hold per claim, all holds open at the cap (0 and 3), a cancel leaving them open and the ownership change; the
+Resume and admission statements rest on the code (`ResumeWorkerRecoveryEpisode`, `fn_custody_admission_count`).
+
+### Diagnostics
+
+The orphan events gain a closed-set `retirement_subreason`, taken from
+`OrphanRetirementSubreason` in `agent/src/git.ts`: `fenced_source`, `pair_changed`,
+`completion_pending`, `completion_preflight_retained`, `completion_unverified`,
+`completion_uncertain`, `completion_unsupported`, `authority_busy`,
+`published_source_retained` and `unknown`. Anything outside the set is written as
+`unknown`, and no error text, path or provider output is included. Outward errors
+are unchanged. See [Reading orphan-reclaim diagnostics](../docs/run-recovery.md#reading-orphan-reclaim-diagnostics).
+
+### Rejected alternatives
+
+These came from the preserved earlier attempt (`bc3c7750`).
+
+- A 10 second wait on the owner's execution tail. A live owner tail is `pending`
+  and a retained stop, with no wait.
+- A boolean result whose `false` fell back to the uncertified reclaim and its
+  terminal refusal. The typed outcome replaces it.
+- A waiting capture cycle under A.
+- A reseed that bypassed #3638's held-source mapping. The loop keeps
+  `reseedAfterReclaim` and its `SourceUseHeldRefusal` mapping.
+
+### Known residuals
+
+- A same-process Codex owner without a live disposal witness, a permanently
+  refusing preflight, or a valid episode-bearing fenced source stays retained
+  until requeue exhaustion, then owner-held.
+- Profile-bound runs never reach this path.
+- Human and live acceptance on the exact PR head (E2E phases 32 and 71, and the
+  combined lane after #3644) is not claimed here.
+
+### Related issues
+
+Out of scope: #3638 and #3639 (memory-park settlement) and #3644 (same-run restart).

@@ -91,6 +91,7 @@ import (
 // added here — that is this guard's standing weakness, and it is why the render tests
 // remain the primary defence rather than this.
 var d7UntrustedFields = []string{
+	"Origin", "HalfOpenRunID", // Forge cooldown text; Detail is also guarded below.
 	// Session answer drafts and delivery outcomes (tui_answer.go).
 	"answerText",
 	"answerNotice",
@@ -231,6 +232,8 @@ var d7UntrustedFields = []string{
 	"upgradeDetail", "upgradeTarget", "blockingContainer", "blockingReason",
 	"outboxBlockedText", "outboxBlockedRunText", "quarantineText", "tokenLabel", "hostedSize", "capabilityText",
 	"workerOwner", "pressureText", "attnShort", "attnDetail",
+	"ManualCordonedByLabel", "ManualCordonReason", "ManualCordonedBy",
+	"manualActorLabel", "manualActorID", "manualReason",
 	"runWorkerName",
 	// Issue #2705: the run's health_reason on the crew rail's waiting line (railWaitingLine),
 	// drawn through renderer.Plain; the hostile-value case is in TestTUIViewsStripControlBytesFromUntrustedText.
@@ -260,6 +263,7 @@ var d7Sanitizers = map[string]bool{
 	"capCell":       true,
 	"Markdown":      true,
 	"Plain":         true,
+	"WorkerName":    true,
 }
 
 func TestD7UntrustedFieldsNeverReachAWriterUnsanitized(t *testing.T) {

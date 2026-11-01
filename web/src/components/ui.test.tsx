@@ -392,3 +392,53 @@ describe("CountPill", () => {
     expect(screen.getByLabelText("5 unread").textContent).toBe("5");
   });
 });
+
+
+it.each([
+  ["2099-01-01T00:00:00Z", "retained recovery retrying"],
+  ["2020-01-01T00:00:00Z", "retained recovery retrying"],
+  [null, "retained recovery needs decision"],
+  [undefined, "retained recovery timing unknown"],
+  ["invalid", "retained recovery timing unknown"],
+] as const)("StatusPill preserves retained recovery timing %s", (stamp, label) => {
+  const { container } = render(<StatusPill status="recovery_wait" recovery_wait_cause="retained_recovery_exhausted" recovery_retry_not_before={stamp} />);
+  expect(container.textContent).toBe(label);
+  expect(container.querySelector(".text-warn")).toBeTruthy();
+});
+it.each([null, undefined, "invalid", "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z"])("StatusPill renders adoption integrity hold regardless of timing %s", (stamp) => {
+  const { container } = render(<StatusPill status="recovery_wait" recovery_wait_cause="retained_recovery_adoption_failed" recovery_retry_not_before={stamp} />);
+  expect(container.textContent).toBe("retained recovery integrity hold");
+  expect(container.querySelector(".text-warn")).toBeTruthy();
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+});
+
+it.each([
+  [null, "Codex idle stall needs decision"],
+  ["2099-01-01T00:00:00Z", "Codex idle stall retrying"],
+  ["2000-01-01T00:00:00Z", "Codex idle stall retrying"],
+  [undefined, "Codex idle stall timing unknown"],
+  ["invalid", "Codex idle stall timing unknown"],
+] as const)("StatusPill preserves Codex idle stall timing %s", (stamp, label) => {
+  const { container } = render(<StatusPill status="recovery_wait" recovery_wait_cause="codex_idle_stall" recovery_retry_not_before={stamp} />);
+  expect(container.textContent).toBe(label);
+  expect(container.querySelector(".text-warn")).toBeTruthy();
+});
+it("StatusPill keeps a narrow projection's recovery cause unknown", () => {
+  const { container } = render(<StatusPill status="recovery_wait" />);
+  expect(container.textContent).toBe("recovery wait");
+});
+
+it.each(["queued", "paused", "completed", "failed", "awaiting_input", "recovery_wait"])("stale cooldown health leaves %s status pill unchanged", status => {
+  const { container, rerender } = render(<StatusPill status={status} health="ok" />);
+  const healthy = container.innerHTML;
+  rerender(<StatusPill status={status} health="waiting_account_cooldown" />);
+  expect(container.innerHTML).toBe(healthy);
+});
+
+it.each(["claimed", "running", "planning", "awaiting_approval", "revising", "completion_checking", "completion_reworking"])("account cooldown health presents %s as waiting without a pulse or stale percentage", status => {
+  const { container } = render(<StatusPill status={status} health="waiting_account_cooldown" progress={{ state: "percent", pct: 70, milestone_done: 2, milestone_total: 3, active_milestone_id: "m3", phase: "implement" }} />);
+  expect(container.textContent).toBe("waiting");
+  expect(container.querySelector(".text-info")).not.toBeNull();
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+  expect(container.querySelector('[role="progressbar"]')).toBeNull();
+});

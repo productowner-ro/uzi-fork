@@ -7,6 +7,7 @@ import { TokenPicker } from "../../components/TokenPicker";
 import { HarnessPicker } from "../../components/HarnessPicker";
 import {
   canOpenRunView,
+  isAccountCooldownWaiting,
   effectiveRunStatus,
   needsHumanAttention,
   retryHint,
@@ -24,6 +25,7 @@ import { mergeRequestUrl } from "../../lib/forgeUrls";
 import { ExternalLinkIcon } from "../../components/icons";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { useDemoMode } from "../../lib/demoMode";
+import { useMaintenance } from "../../lib/useMaintenance";
 import { maskName, maskUsername } from "../../lib/demoMask";
 
 // Highlighted renders `text`, wrapping every case-insensitive occurrence of `query` in
@@ -220,7 +222,9 @@ export function IssueCard({
   // on the card root. Inert on every other theme (only Shadow styles the attributes);
   // computed once here so both attributes read one derivation.
   const shadow = shadowSignal(run);
-  const badge = run ? runBadge(run, Date.now()) : null;
+  // PRD #3454: a maintenance-held card's tooltip carries the admin's reason.
+  const maintenanceReason = useMaintenance().status?.reason;
+  const badge = run ? runBadge(run, Date.now(), maintenanceReason) : null;
   // Uniform per-card duration token (issue #256 M4, Decision 4): a faint mono span
   // beside the badge carrying `running 1h 30m` / `queued 4m` / `ran 42m`. A terminal card
   // shows `ran …` from first start to finish (issue #2004); "" only for an older api whose
@@ -237,7 +241,7 @@ export function IssueCard({
   // loud attention ring. Such a run keeps status === "awaiting_approval" server-side, but
   // effectiveRunStatus returns "revising" for it, so needsHumanAttention reads false. Its
   // badge (runBadge → effectiveRunStatus) already reads "revising" in the calm info tone.
-  const loud = needsHumanAttention(effectiveRunStatus(run ?? { status: "" }));
+  const loud = !(run && isAccountCooldownWaiting(run)) && needsHumanAttention(effectiveRunStatus(run ?? { status: "" }));
   // The MR/PR link (PRD #65 D8): prefer the forge-supplied URL the worker persisted
   // (the forge's own canonical URL), guarded through isHttpsUrl by preferForgeUrl
   // before it becomes an anchor. A null (rows created before it landed) falls back to a
@@ -431,7 +435,7 @@ export function IssueCard({
             <MrChip mrIid={badge.mrIid} mrState={badge.mrState} href={mrHref} forgeType={card.forge_type} />
           ) : (
             <span className={badge.pulse ? "animate-pulse" : ""}>
-              <Badge tone={badge.tone} title={badge.title}>
+              <Badge tone={badge.tone} title={badge.title} wrap={badge.wrap}>
                 {badge.label}
               </Badge>
             </span>

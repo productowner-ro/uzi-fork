@@ -32,6 +32,8 @@ vi.mock("../lib/api", async (importActual) => {
       updateCheckAgentSource: vi.fn(),
       getReleaseCheck: vi.fn(),
       checkReleaseNow: vi.fn(),
+      getAdminMaintenance: vi.fn(),
+      setMaintenance: vi.fn(),
     },
   };
 });
@@ -208,6 +210,12 @@ beforeEach(() => {
   mockApi.getReleaseCheck.mockResolvedValue({ release_check: releaseCheck() });
   mockApi.checkReleaseNow.mockResolvedValue({ release_check: releaseCheck() });
   mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
+  // PRD #3454: the Maintenance card self-loads; off with a clear readout.
+  const none = { count: 0, items: [] };
+  mockApi.getAdminMaintenance.mockResolvedValue({
+    state: { active: false, since: null, reason: null, by_label: null },
+    readout: { as_of: "2026-10-25T12:00:00Z", clear: true, active: none, held: none, custody: none, queued: none, idle_bound_workers: none },
+  });
   // Old caller-scoped fetch control: no cross-user repositories are returned here.
   mockApi.listRepos.mockResolvedValue({ repos: [] });
   mockApi.adminListDockerAllowlistRepos.mockResolvedValue({
@@ -256,7 +264,7 @@ describe("agent-source Health navigation", () => {
     const check = doc.checks.find((c) => c.id === "agentsource.update")!;
     check.severity = "warn";
     check.action = "Untrusted action https://example.com/#arbitrary";
-    doc.counts = { ok: 21, warn: 1, danger: 0, unknown: 0, na: 0 };
+    doc.counts = { ok: 22, warn: 1, danger: 0, unknown: 0, na: 0 };
     mockApi.getAdminHealth.mockResolvedValue(doc);
     let resolveSettings!: (value: ReturnType<typeof response>) => void;
     mockApi.getSettings.mockReturnValue(new Promise((resolve) => { resolveSettings = resolve; }));
@@ -300,13 +308,13 @@ describe("AdminSettings — vault migration (PRD #32)", () => {
     mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
     renderPage();
     await screen.findByLabelText("uzi label");
-    expect(screen.queryByText(/pre-vault encryption/i)).toBeNull();
+    expect(screen.queryByText(/belonging to protected users/i)).toBeNull();
   });
 
   it("shows the migration notice with the count when secrets are still master-sealed", async () => {
     mockApi.vaultMigration.mockResolvedValue({ master_sealed: 3 });
     renderPage();
-    await waitFor(() => expect(screen.getByText(/pre-vault encryption/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/belonging to protected users/i)).toBeTruthy());
     expect(screen.getByText(/3 stored secrets/i)).toBeTruthy();
   });
 });
@@ -1786,5 +1794,80 @@ describe("AdminSettings hosted worker quota (#2960)", () => {
     expect((quota as HTMLInputElement).value).toBe("3");
     expect(screen.getByRole("button", { name: "Save hosted worker quota" })).toHaveProperty("disabled", true);
     expect(screen.getByRole("link", { name: "Hosted worker quota" }).getAttribute("href")).toBe("#hosted-worker-quota");
+  });
+});
+
+
+describe("vault policy", () => {
+  it("shows the policy, count and threat model even without migration", async () => {
+    mockApi.getSettings.mockResolvedValue({ ...response(), unprotected_users: 4, settings: { ...response().settings, vault_policy: "optional" } });
+    renderPage();
+    const select = await screen.findByRole("combobox", { name: "Vault policy" });
+    await waitFor(() => expect((select as HTMLSelectElement).value).toBe("optional"));
+    expect(screen.getByText("Unprotected users: 4")).toBeTruthy();
+    expect(screen.getByText(/TL;DR: Password encryption/).textContent).toContain("database together with the server key");
+    expect(screen.getByRole("link", { name: "Learn more" }).getAttribute("href")).toBe("/docs/vault-threat-model");
+    expect(screen.getByText(/Optional lets each user turn protection on or off; new users start with protection off/)).toBeTruthy();
+    mockApi.updateSettings.mockResolvedValue({ ...response(), unprotected_users: 4, settings: { ...response().settings, vault_policy: "required" } });
+    fireEvent.change(select, { target: { value: "required" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save vault policy" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ vault_policy: "required" })));
+  });
+});
+
+describe("browser grant lifetime", () => {
+  it("keeps confirmed lifetime when an older sibling-card save returns later", async () => {
+    let finishHealth!: (value: ReturnType<typeof response>) => void;
+    mockApi.updateSettings.mockImplementation(patch => {
+      if ("health_stall_seconds" in patch) return new Promise(resolve => { finishHealth = resolve; });
+      if ("vault_reunlock_days" in patch) return Promise.resolve(response({ vault_reunlock_days: "30" }));
+      throw new Error("unexpected settings patch");
+    });
+    renderPage();
+    const lifetime = await screen.findByLabelText("Browser grant lifetime (days)") as HTMLInputElement;
+    await waitFor(() => expect(lifetime.disabled).toBe(false));
+    fireEvent.change(screen.getByLabelText("Stalled after (seconds of silence)"), { target: { value: "901" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save run health" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ health_stall_seconds: "901" }));
+    fireEvent.change(lifetime, { target: { value: "30" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save browser grant lifetime" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ vault_reunlock_days: "30" }));
+    await waitFor(() => expect(lifetime.disabled).toBe(false));
+    await act(async () => { finishHealth(response({ health_stall_seconds: "901", vault_reunlock_days: "7" })); });
+    expect(lifetime.value).toBe("30");
+    fireEvent.change(lifetime, { target: { value: "7" } });
+    expect(screen.getByRole("button", { name: "Save browser grant lifetime" })).toHaveProperty("disabled", false);
+  });
+  it.each(["1", "30"])("saves canonical %s days and defaults to 7", async days => {
+    mockApi.updateSettings.mockResolvedValueOnce(response({ vault_reunlock_days: days }));
+    render(<MemoryRouter><AdminSettings /></MemoryRouter>);
+    const input = await screen.findByLabelText("Browser grant lifetime (days)") as HTMLInputElement;
+    await waitFor(() => expect(input.disabled).toBe(false));
+    expect(input.value).toBe("7");
+    fireEvent.change(input, { target: { value: days } });
+    fireEvent.click(screen.getByRole("button", { name: "Save browser grant lifetime" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ vault_reunlock_days: days }));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save browser grant lifetime" }) as HTMLButtonElement).disabled).toBe(true));
+    expect(screen.getByText(/existing grants keep their original expiry/)).toBeTruthy();
+  });
+  it.each(["0", "31", "1.5", "01", " 7"])("rejects noncanonical %s", async days => {
+    render(<MemoryRouter><AdminSettings /></MemoryRouter>);
+    const input = await screen.findByLabelText("Browser grant lifetime (days)") as HTMLInputElement;
+    await waitFor(() => expect(input.disabled).toBe(false));
+    fireEvent.change(input, { target: { value: days } });
+    expect((screen.getByRole("button", { name: "Save browser grant lifetime" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("Enter a canonical integer from 1 to 30.")).toBeTruthy();
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+  });
+  it("retains the saved lifetime when saving fails", async () => {
+    mockApi.updateSettings.mockRejectedValueOnce(new ApiError(500, "lifetime failed"));
+    render(<MemoryRouter><AdminSettings /></MemoryRouter>);
+    const input = await screen.findByLabelText("Browser grant lifetime (days)") as HTMLInputElement;
+    await waitFor(() => expect(input.disabled).toBe(false));
+    fireEvent.change(input, { target: { value: "30" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save browser grant lifetime" }));
+    expect(await screen.findByText("lifetime failed")).toBeTruthy();
+    fireEvent.change(input, { target: { value: "7" } });
+    expect((screen.getByRole("button", { name: "Save browser grant lifetime" }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

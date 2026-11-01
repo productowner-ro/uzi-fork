@@ -35,9 +35,27 @@ function renderCard() {
 }
 
 describe("HealthOverviewCard", () => {
+  it("links a waiting run without dumping its full ID into the alert text", async () => {
+    const doc = ownerOnlyDoc();
+    const queue = doc.checks.find((c) => c.id === "queue.waiting")!;
+    queue.evidence = [Object.assign(
+      { label: "Waiting run", value: "Owner: Alex Example (22930000); waited 48m. This background run is no longer deprioritized, but has not yet been picked up." },
+      { run_id: ownerOnlyWaitingRunId, owner_id: ownerOnlyWaitingOwnerId },
+    )];
+    mockApi.getAdminHealth.mockResolvedValue(doc);
+    renderCard();
+    const card = await screen.findByRole("alert", { name: "System health" });
+    const item = within(card).getAllByRole("listitem").find((el) => el.textContent?.includes(queue.summary))!;
+    const link = within(item).getByRole("link", { name: "Run 22930000" });
+    expect(link.getAttribute("href")).toBe(`/runs/${ownerOnlyWaitingRunId}`);
+    expect(link.getAttribute("title")).toBe(`Run ${ownerOnlyWaitingRunId}`);
+    expect(within(item).getByTitle(`Owner ${ownerOnlyWaitingOwnerId}`).textContent).toBe(queue.evidence[0].value);
+    expect(item.textContent).not.toContain(ownerOnlyWaitingRunId);
+  });
+
   it("shows both Codex pricing reasons and operator docs as a nonblocking warning", async () => {
     const doc = healthySilentDoc();
-    expect(doc.checks).toHaveLength(22);
+    expect(doc.checks).toHaveLength(23);
     const pricing = doc.checks.find((c) => c.id === "pricing.codex")!;
     pricing.severity = "warn";
     pricing.summary = "2 Codex models lack usable pricing";
@@ -46,7 +64,7 @@ describe("HealthOverviewCard", () => {
       { label: "gpt-5.6-sol", value: "2 runs, promotional price expired" },
     ];
     doc.status = "warn";
-    doc.counts = { ok: 21, warn: 1, danger: 0, unknown: 0, na: 0 };
+    doc.counts = { ok: 22, warn: 1, danger: 0, unknown: 0, na: 0 };
     mockApi.getAdminHealth.mockResolvedValue(doc);
     renderCard();
     const card = await screen.findByRole("status", { name: "System health" });
@@ -64,7 +82,7 @@ describe("HealthOverviewCard", () => {
     mockApi.getAdminHealth.mockResolvedValue(doc);
     renderCard();
     const card = await screen.findByRole("alert", { name: "System health" });
-    expect(within(card).getByText("System health: 3 checks need attention; no instance-wide blocker detected")).toBeTruthy();
+    expect(within(card).getByText("System health: 4 checks need attention; no instance-wide blocker detected")).toBeTruthy();
     expect(within(card).getByText(doc.checks.find((c) => c.id === "fleet.capacity")!.summary)).toBeTruthy();
     const items = within(card).getAllByRole("listitem");
     expect(items).toHaveLength(3);
@@ -81,11 +99,11 @@ describe("HealthOverviewCard", () => {
   });
 
   it("collapses to one quiet line when every check passes", async () => {
-    mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc()); // 22 checks, all ok
+    mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc()); // 23 checks, all ok
     renderCard();
     // A healthy card is a status region (not an alert), scoped by its label.
     const card = await screen.findByRole("status", { name: "System health" });
-    expect(within(card).getByText("System health: all 22 checks passing")).toBeTruthy();
+    expect(within(card).getByText("System health: all 23 checks passing")).toBeTruthy();
     // No verdict/attention items in the quiet form.
     expect(within(card).queryByText(/uzi cannot run work/)).toBeNull();
     expect(within(card).getByRole("link", { name: "Open health" })).toBeTruthy();

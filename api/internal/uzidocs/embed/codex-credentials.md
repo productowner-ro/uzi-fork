@@ -16,6 +16,13 @@ and its worker model. You still need an [Anthropic
 token](./anthropic-token.md) for a Claude run; the two harnesses' credentials
 are independent, so having one doesn't unlock the other.
 
+## Credential protection
+
+OpenAI API keys and Codex logins share your Anthropic credentials' protection
+choice in **Settings → Protect my credentials with my password (vault)**.
+See [Vault choice](./anthropic-token.md#vault-choice) for On/Off, SSO passphrases,
+restart unlocks and conversion limits. Off accounts do not need vault unlocks.
+
 ## What the field accepts
 
 The **Codex login** field wants a flat JSON object, not a raw token:
@@ -151,7 +158,7 @@ Each stored Codex credential shows one of four statuses:
 | Status | Meaning |
 |---|---|
 | `staging` | Saved and encrypted; the provider identity has not been verified yet. While Codex usage polling is on (the default), uzi verifies it automatically in the background on a read-only, non-rotating identity check, moving it to `linked` once that succeeds, or `failed` once it proves bad; a transient failure (a timeout, a 5xx) leaves it `staging` to retry. With polling turned off (`UZI_CODEX_USAGE_POLL_INTERVAL=0`, see [Codex account limits](rate-limits.md#codex-account-limits)) nothing verifies it, and it stays `staging`. |
-| `linked` | The provider identity has been verified. |
+| `linked` | The provider identity has been verified. Saved aliases of the same account share its temporary [account admission wait](rate-limits.md#temporary-account-admission-waits), including after refresh or re-import; linking does not promise immediate admission. |
 | `failed` | Verification failed. Use **Replace value** with a *new* [login dedicated to uzi](#1-sign-in-with-a-login-dedicated-to-uzi), never a re-paste of the old one. |
 | `static` | An OpenAI API key, not a Codex login; provider-account linking doesn't apply to a key. |
 
@@ -166,9 +173,12 @@ replacement or disablement may be superseded by the newer credential state.
 
 For a Codex login in `staging` or `failed`, Test runs identity reconciliation;
 that check can move the link state to `linked` or `failed`. If the verified
-account is quarantined or needs re-login, reconciliation installs this stored
-login on it, as the background check does for a new login. For a `linked`
-login, Test reads the account's usage once and does not refresh or rotate the
+account is quarantined or needs re-login, reconciliation can install a newly
+verified replacement on it, as the background check does for a new login.
+You can replace the value while automatic recovery is still in progress.
+To resume held runs, supply the same ChatGPT account and workspace: uzi verifies
+the replacement's identity, but a replacement for a different account cannot
+resume those runs. For a `linked` login, Test reads the account's usage once and does not refresh or rotate the
 login. It is a current check, not a promise that a later run can start.
 
 For an OpenAI API key, Test requests `GET /v1/models`. An `ok` result means
@@ -191,6 +201,13 @@ choosing which additional accounts show in the sidebar and TUI.
 behind it, so Codex limits shows a short "subscription windows do not
 apply" note next to it instead.
 
+uzi tries automatic recovery after an uncertain renewal failure. A waiting run
+may show **Codex account is reconciling** while that happens; let it recover,
+and unlock your vault or enable the login if needed. If recovery cannot finish,
+follow the re-login request on the run or credential card. The run's action is
+separate from its usage meter: an uncertain exchange can leave the meter stale.
+See [Codex account unavailable](run-recovery-wait.md#codex-account-unavailable).
+
 A linked account's meter can land in a state that needs your attention:
 
 - **No reading yet** — just linked, or waiting on the first poll; a reading
@@ -206,7 +223,7 @@ A linked account's meter can land in a state that needs your attention:
   Codex usage polling is turned off, the state reads **Polling off**
   instead (`polling_disabled (login rejected by provider)` in the CLI), and
   the rejection hint still shows.
-- **Vault locked** — uzi can't open the login to poll it until you unlock
+- **Vault locked** — your protected vault is locked, so uzi can't open the login to poll it until you unlock
   your vault again. The last known reading stays on screen, greyed and
   marked stale, rather than disappearing.
 

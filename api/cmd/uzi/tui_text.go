@@ -26,6 +26,33 @@ func clampVisual(s string, n int) string {
 	return ansi.Truncate(s, n, "…")
 }
 
+// middleCell shortens sanitized text by terminal columns. Prefer preserving the
+// last hyphen-delimited segment while reserving a distinguishing head; otherwise
+// divide the space around the ellipsis.
+func middleCell(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	w := visualWidth(s)
+	if w <= width {
+		return s
+	}
+	tail := (width - 1) / 2
+	if i := strings.LastIndex(s, "-"); i >= 0 && i < len(s)-1 {
+		if suffix := visualWidth(s[i:]); suffix <= width-1 {
+			tail = max(tail, suffix)
+		}
+	}
+	tail = min(tail, width-1-min(4, (width-1)/2))
+	right := ansi.TruncateLeft(s, w-tail, "")
+	// TruncateLeft retains a grapheme crossing the cut boundary. Drop that
+	// grapheme if it would exceed the tail budget and trigger a later clamp.
+	for cut := w - tail + 1; visualWidth(right) > tail; cut++ {
+		right = ansi.TruncateLeft(s, cut, "")
+	}
+	return ansi.Truncate(s, width-1-tail, "") + "…" + right
+}
+
 // padVisual pads to n columns ignoring ANSI escapes, which lipgloss has already added
 // by this point — counting them as width would shove every row right.
 func padVisual(s string, n int) string {
@@ -105,15 +132,8 @@ func padCell(s string, n int) string {
 // queue-WAIT age dressed up as run-elapsed time (and a just-created run into a literal "0s"),
 // conflating two different clocks. A run with no start stamp yet (queued) shows nothing.
 func runDuration(run apitypes.RunDTO, now time.Time) string {
-	var start time.Time
-	switch {
-	case run.FirstStartedAt != nil && !run.FirstStartedAt.IsZero():
-		start = *run.FirstStartedAt
-	case run.StartedAt != nil && !run.StartedAt.IsZero():
-		start = *run.StartedAt
-	case run.ClaimedAt != nil && !run.ClaimedAt.IsZero():
-		start = *run.ClaimedAt
-	default:
+	start, ok := runStart(run)
+	if !ok {
 		return "" // not started yet: no work-elapsed time to show
 	}
 	end := now
@@ -121,6 +141,40 @@ func runDuration(run apitypes.RunDTO, now time.Time) string {
 		end = *run.FinishedAt
 	}
 	return shortDuration(end.Sub(start))
+}
+
+// runStart is the start runDuration measures from: FirstStartedAt, else StartedAt, else
+// ClaimedAt (see runDuration). ok is false when the run has no start stamp at all.
+func runStart(run apitypes.RunDTO) (time.Time, bool) {
+	switch {
+	case run.FirstStartedAt != nil && !run.FirstStartedAt.IsZero():
+		return *run.FirstStartedAt, true
+	case run.StartedAt != nil && !run.StartedAt.IsZero():
+		return *run.StartedAt, true
+	case run.ClaimedAt != nil && !run.ClaimedAt.IsZero():
+		return *run.ClaimedAt, true
+	}
+	return time.Time{}, false
+}
+
+// boardDurText is a DONE board row's run length: wall time from runStart to FinishedAt,
+// including approval, parked and paused time (it is not active-time accounting). Blank when
+// the run never started or has no finish stamp: a terminal row without FinishedAt must not
+// show a still-growing clock as its final length. Bounded to boardDurWidth: shortDuration up
+// to "99d23h", whole days from 100d, whole years from 1000d (time.Duration tops out near 292y).
+func boardDurText(run apitypes.RunDTO) string {
+	start, ok := runStart(run)
+	if !ok || run.FinishedAt == nil || run.FinishedAt.IsZero() {
+		return ""
+	}
+	d := run.FinishedAt.Sub(start)
+	switch days := int(d.Hours()) / 24; {
+	case days >= 1000:
+		return itoa(days/365) + "y"
+	case days >= 100:
+		return itoa(days) + "d"
+	}
+	return shortDuration(d)
 }
 
 // shortDuration formats an elapsed duration compactly for the header: "45s", "12m", "3h4m",

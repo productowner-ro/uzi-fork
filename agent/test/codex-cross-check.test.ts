@@ -1,9 +1,13 @@
+import { rangeScanBytes } from "../src/codex/broker.js";
+import type { CodexOperationRequest, CodexOperationDecision } from "../src/protocol.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough, Writable } from "node:stream";
 import { createHash } from "node:crypto";
-import { CodexCrossCheck, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief, crossCheckBrief, crossCheckPrompt, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
+import { CodexCrossCheck, CrossCheckMalformedError, validateVerdict, validateCodeFindings, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief, crossCheckBrief, crossCheckPrompt, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
 import type { CodexRootHandle, CodexLaunchSpec, CodexEffectLaunchSpec } from "../src/codex/launcher.js";
+import { wireFileopHelper, type FileopHelperHandle } from "../src/codex/fileop-client.js";
+import type { FileopRequest, FileopResponse } from "../src/codex/broker.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
 import type { Logger } from "../src/log.js";
@@ -12,6 +16,31 @@ import { CheckActivityRecorder } from "../src/cross-check-activity.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 
 const verdict = JSON.stringify({ verdict: "approve", summary: "Anchors checked", items: [] });
+
+const diagnosticFinding = { file: "anchor.ts", severity: "warning", summary: "Finding", rationale: "Read anchor" };
+for (const [name, text, subreason] of [
+ ["invalid_json", "{broken", "invalid_json"],
+ ["verdict_schema", JSON.stringify({ verdict: "maybe", summary: "x", items: [] }), "verdict_schema"],
+ ["finding_schema", JSON.stringify({ verdict: "revise", summary: "x", items: [{ ...diagnosticFinding, severity: "bad" }] }), "finding_schema"],
+ ["findings_cap per-item", JSON.stringify({ verdict: "revise", summary: "x", items: [{ ...diagnosticFinding, rationale: "é".repeat(1025) }] }), "findings_cap"],
+ ["findings_cap aggregate", JSON.stringify({ verdict: "revise", summary: "x", items: Array.from({ length: 20 }, () => ({ ...diagnosticFinding, rationale: "é".repeat(850) })) }), "findings_cap"],
+] as const) {
+ it("malformed diagnostic validateVerdict " + name, () => {
+  assert.throws(() => validateVerdict(text), (err: unknown) => {
+   assert.ok(err instanceof CrossCheckMalformedError);
+   assert.equal(err.subreason, subreason);
+   return true;
+  });
+ });
+}
+
+it("malformed diagnostic validateCodeFindings code_findings", () => {
+ assert.throws(() => validateCodeFindings("{broken"), (err: unknown) => {
+  assert.ok(err instanceof CrossCheckMalformedError);
+  assert.equal(err.subreason, "code_findings");
+  return true;
+ });
+});
 const claim = (subscription = false): ClaimResponse => ({
  kind: "cross_check", run_id: "check", issue_iid: null, issue_title: "Issue",
  repo: { id: "repo", full_name: "owner/repo", url: "https://example.test/owner/repo", clone_url: "https://example.test/owner/repo.git", default_branch: "main" },
@@ -31,7 +60,49 @@ type Emit = (frame: unknown) => void;
 
 // Both injected roots speak the real NDJSON contracts. The fileop stand-in exposes
 // only its dictionary root. This proves functional wiring, not kernel isolation.
+it("admission observer binds checker dispatch and sees terminal HTTP429 independently of checker failure", async t => {
+ const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
+ const sent: import("../src/codex/admission-signal.js").AdmissionSignal[] = [];
+ const reporter = new CodexAdmissionReporter(9, () => true, async b => { sent.push(b); return 204; });
+ let attemptId: string | undefined;
+ const begin = reporter.begin.bind(reporter);
+ t.mock.method(reporter, "begin", (thread: string) => {
+  const attempt = begin(thread); attemptId = attempt.id; return attempt;
+ });
+ const r = rig({ subscription: true, admissionReporter: reporter,
+  beforeResponse(frame) {
+   if (frame.method === "turn/start") assert.match(attemptId!, /^[0-9a-f-]{36}$/);
+  },
+  notes(emit) {
+   emit({ method: "error", params: { threadId: "foreign", turnId: "turn", willRetry: true,
+    error: { codexErrorInfo: "serverOverloaded" } } });
+   emit({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "failed",
+    error: { codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 429 } } } } } });
+  },
+ });
+ try {
+  await assert.rejects(r.run(), /model error/); // existing foreign error behavior stays intact
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(sent.length, 0);
+ } finally { reporter.seal(true); }
+ const terminalOnly = new CodexAdmissionReporter(9, () => true, async b => { sent.push(b); return 204; });
+ const r2 = rig({ subscription: true, admissionReporter: terminalOnly,
+  notes(emit) {
+   emit({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "failed",
+    error: { codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 429 } } } } } });
+  },
+ });
+ try {
+  await assert.rejects(r2.run(), /terminal turn/);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(sent.map(b => b.class), ["rate_limit"]);
+  assert.equal(sent[0]!.claim_generation, 9);
+ } finally { terminalOnly.seal(true); }
+});
+
 function rig(options: {
+ operationRead?: (r: CodexOperationRequest, signal?: AbortSignal) => Promise<CodexOperationDecision>;
+ admissionReporter?: import("../src/codex/admission-signal.js").CodexAdmissionReporter;
  round?: number;
  notes?: (emit: Emit) => void;
  beforeResponse?: (frame: Frame, emit: Emit) => void;
@@ -52,6 +123,8 @@ function rig(options: {
  refresh?: boolean;
  activity?: CheckActivityRecorder;
  fileopReply?: (op: { op: string; path: string }) => Record<string, unknown> | undefined;
+ onFileopRequest?: (op: FileopRequest & { id: number }, emit: Emit) => boolean;
+ wireFileop?: CrossCheckModelDeps["wireFileop"];
 } = {}) {
  const requests: Frame[] = [];
  const ops: string[] = [];
@@ -112,8 +185,9 @@ function rig(options: {
   options.afterResponse?.(frame, emit);
  });
  const fileop = roots("fileop", (frame, emit) => {
-  const op = frame as unknown as { id: number; op: string; path: string };
+  const op = frame as unknown as FileopRequest & { id: number };
   ops.push(op.op);
+  if (options.onFileopRequest?.(op, emit)) return;
   if (op.op === "stat" && options.holdStat) return;
   const custom = options.fileopReply?.(op);
   if (custom) { emit({ id: op.id, ...custom }); return; }
@@ -121,12 +195,18 @@ function rig(options: {
    data: Buffer.from("export const anchor = true;").toString("base64"), size: Buffer.byteLength("export const anchor = true;") });
  });
  const deps: CrossCheckModelDeps = {
+  wireFileop: options.wireFileop,
   prepareHome: async () => {},
   launchFileop: async (spec) => { specs.push(spec); return fileop; },
   launchProvider: async (spec) => { specs.push(spec); return provider; },
  };
  let releases = 0;
- const client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> = {
+ const client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> & Partial<Pick<WorkerClient, "codexAdmissionReporter" | "hasFeature" | "codexOperationNegotiation" | "checkCodexOperationAdmission" | "retainCodexOperationFlight">> = {
+  codexAdmissionReporter: () => options.admissionReporter,
+  hasFeature: () => !!options.operationRead,
+  codexOperationNegotiation: options.operationRead ? 1 : 0,
+  checkCodexOperationAdmission: (_id, request, signal) => options.operationRead!(request, signal),
+  retainCodexOperationFlight: () => () => {},
   releaseCodex: async () => { releases++; return options.subscription
    ? { auth_mode: "subscription", access_token: "released-token", generation: 7, chatgpt_account_id: "account", chatgpt_plan_type: null }
    : { auth_mode: "api_key", access_token: "released-token" }; },
@@ -187,12 +267,12 @@ it("code checker uses the confined provider and file broker and returns only fin
  assert.match(input, /<code_context_[a-f0-9]{32}>/);
 });
 
-// PRD #2170. The goldens are the sha256 of the pre-change brief and nonce-stripped DATA prompt for
-// codeClaim() (computed from the tree before owner guidance and repository instructions existed).
+// PRD #3167 M3a: shared code brief and nonce-stripped milestones DATA prompt goldens.
+// These are separate from the byte-frozen pre-M2 replay corpus pins.
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const stripNonces = (text: string) => text.replace(/_[a-f0-9]{32}>/g, "_NONCE>");
-const GOLDEN_CODE_PROMPT = "40aa10669f27861a6f35882e8c95b82b67979a37b738cb53c01506ff1eda0f03";
-const GOLDEN_CODEX_CODE_BRIEF = "29e410c44476fb6e2560fd03c2d990de24cee2193e6df6c250085cb1b39252a5";
+const GOLDEN_CODE_PROMPT = "35fd960289a82fde40b0d12e24533b5130a8db60687b4023ddb14b07d5c080a9";
+const GOLDEN_CODEX_CODE_BRIEF = "67ea80eefc42d66f40db3774f6845f6ad9d2d5bd143bc1d28b9cc3fb3a2c85be";
 
 async function codeRequests(c: ClaimResponse) {
  const r = rig({ claim: c, notes: (emit) => r.terminal(emit, '{"findings":[]}') });
@@ -203,13 +283,24 @@ async function codeRequests(c: ClaimResponse) {
  };
 }
 
-it("code checker with empty guidance and instructions off is byte-identical to the previous brief and DATA prompt", async () => {
+it("code checker with empty guidance and instructions off is pinned to the revised brief and DATA prompt", async () => {
  const { brief, prompt } = await codeRequests(codeClaim());
  assert.equal(sha256(brief), GOLDEN_CODEX_CODE_BRIEF);
  assert.equal(sha256(stripNonces(prompt)), GOLDEN_CODE_PROMPT);
  const off = codeClaim();
  Object.assign(off.cross_check!, { repo_instructions_enabled: false, custom_guidance_applied: false });
  assert.equal(sha256(stripNonces((await codeRequests(off)).prompt)), GOLDEN_CODE_PROMPT);
+});
+
+it("Codex code run carries populated approved milestones only in DATA", async () => {
+ const c = codeClaim();
+ const milestones = [{ id: "m1", title: "FROZEN-CRITERION" }];
+ Object.assign(c.cross_check!, { milestones });
+ const { brief, prompt } = await codeRequests(c);
+ assert.doesNotMatch(brief, /FROZEN-CRITERION/);
+ const match = /^<approved_milestones_([a-f0-9]{32})>\n([^\n]+)\n<\/approved_milestones_\1>$/m.exec(prompt);
+ assert.ok(match);
+ assert.deepEqual(JSON.parse(match[2]!), milestones);
 });
 
 it("code checker puts owner guidance in the trusted brief, nonce-delimited, and never in the DATA prompt", async () => {
@@ -360,6 +451,12 @@ for (const effort of ["", "minimal", "XHIGH", " xhigh", "xhigh ", "unknown"]) {
   assert.equal(r.releases, 0); assert.equal(r.specs.length, 0); assert.equal(r.requests.length, 0);
  });
 }
+it("refuses a pinned claim whose default_effort is absent (dropped at decode)", async () => {
+ const c = pinnedClaim(); delete c.config!.default_effort;
+ const r = rig({ claim: c });
+ await assert.rejects(r.run(), CrossCheckCheckerUnavailableError);
+ assert.equal(r.releases, 0); assert.equal(r.specs.length, 0); assert.equal(r.requests.length, 0);
+});
 for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
  it("passes pinned effort unchanged: " + effort, async () => {
   const c = pinnedClaim(); c.config!.default_effort = effort;
@@ -567,6 +664,59 @@ for (const method of ["item/agentMessage/delta", "item/completed", "turn/complet
  });
 }
 
+const diagnosticDelta = (params: Record<string, unknown> = {}) => ({
+ method: "item/agentMessage/delta",
+ params: { threadId: "thread", turnId: "turn", itemId: "assistant", delta: verdict, ...params },
+});
+const diagnosticCompletion = (item: Record<string, unknown> = {}, params: Record<string, unknown> = {}) => ({
+ method: "item/completed",
+ params: { threadId: "thread", turnId: "turn",
+  item: { type: "agentMessage", id: "assistant", text: verdict, ...item }, ...params },
+});
+
+for (const [name, subreason, frames] of [
+ ["foreign delta thread", "foreign_item", [diagnosticDelta({ threadId: "foreign" })]],
+ ["foreign delta turn", "foreign_item", [diagnosticDelta({ turnId: "stale" })]],
+ ["foreign completion thread", "foreign_item", [diagnosticCompletion({}, { threadId: "foreign" })]],
+ ["foreign completion turn", "foreign_item", [diagnosticCompletion({}, { turnId: "stale" })]],
+ ["delta after completion before terminal", "delta_after_completion", [diagnosticCompletion(), diagnosticDelta()]],
+ ["delta missing identity", "invalid_item_identity", [diagnosticDelta({ itemId: undefined })]],
+ ["delta empty identity", "invalid_item_identity", [diagnosticDelta({ itemId: "" })]],
+ ["delta non-string identity", "invalid_item_identity", [diagnosticDelta({ itemId: 7 })]],
+ ["delta conflicting identity", "invalid_item_identity", [diagnosticDelta(), diagnosticDelta({ itemId: "other" })]],
+ ["completion missing identity", "invalid_item_identity", [diagnosticCompletion({ id: undefined })]],
+ ["completion empty identity", "invalid_item_identity", [diagnosticCompletion({ id: "" })]],
+ ["completion non-string identity", "invalid_item_identity", [diagnosticCompletion({ id: 7 })]],
+ ["completion conflicting identity", "invalid_item_identity", [diagnosticDelta(), diagnosticCompletion({ id: "other" })]],
+ ["non-string delta", "stream_cap", [diagnosticDelta({ delta: 7 })]],
+ ["oversized delta", "stream_cap", [diagnosticDelta({ delta: "é".repeat(32769) })]],
+ ["cumulative oversized delta", "stream_cap", [
+  diagnosticDelta({ delta: "é".repeat(32768) }), diagnosticDelta({ delta: "x" }),
+ ]],
+ ["invalid completion text", "completion_invalid", [diagnosticCompletion({ text: 7 })]],
+ ["missing completion text", "completion_invalid", [diagnosticCompletion({ text: undefined })]],
+ ["oversized completion", "completion_invalid", [diagnosticCompletion({ text: "é".repeat(32769) })]],
+ ["duplicate completion same item", "completion_invalid", [diagnosticCompletion(), diagnosticCompletion()]],
+ ["stream mismatch prefix", "stream_mismatch", [diagnosticDelta({ delta: "prefix " + verdict }), diagnosticCompletion()]],
+ ["stream mismatch suffix", "stream_mismatch", [diagnosticDelta({ delta: verdict + " suffix" }), diagnosticCompletion()]],
+] as const) {
+ it("malformed diagnostic stream " + name, async () => {
+  const r = rig({ notes: (emit) => {
+   for (const frame of frames) emit(frame);
+   emit({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed" } } });
+  } });
+  await assert.rejects(r.run(), (err: unknown) => {
+   assert.ok(err instanceof CrossCheckMalformedError);
+   assert.equal(err.subreason, subreason);
+   return true;
+  });
+  assert.deepEqual(r.ops, ["stat"]);
+  assert.deepEqual(r.disposed, ["provider", "fileop"]);
+  assert.equal(r.usage.at(-1)!.is_error, true);
+  assert.equal(r.secrets.size, 0);
+ });
+}
+
 it("denies effects, delegation and Skill and charges all callbacks including repeated denials", async () => {
  let count = 0;
  const r = rig({ notes: (emit) => next(emit), onToolReply: (frame, emit) => {
@@ -652,6 +802,143 @@ it("aborts a pending helper readiness call before provider launch", async () => 
  assert.equal(r.specs.length, 1);
  assert.deepEqual(r.disposed, ["fileop"]);
 });
+
+for (const mode of ["read_range", "read_tail"] as const) {
+it("REQ-crosscheck-abort: abort after helper E_OVERSIZE prevents " + mode, async () => {
+ const controller = new AbortController();
+ const events: Record<string, unknown>[] = [];
+ const recorder = new CheckActivityRecorder(p => { events.push(structuredClone(p)); }, { generation: 7 });
+ recorder.attach("/checkout", "/owned");
+ let handle: FileopHelperHandle | undefined;
+ let disposals = 0;
+ let disposalsAtAbort: number | undefined;
+ let rootsAtAbort: string[] | undefined;
+ let providerEmit: Emit | undefined;
+ const r = rig({
+  activity: recorder,
+  wireFileop(proc) {
+   handle = wireFileopHelper(proc);
+   const real = handle;
+   return { client: real.client, dispose: () => { disposals++; return real.dispose(); } };
+  },
+  notes(emit) {
+   providerEmit = emit;
+   emit({ id: 90, method: "item/tool/call", params: { threadId: "thread", turnId: "turn",
+    callId: "read", tool: "Read", arguments: { path: "large.ts", ...(mode === "read_tail" ? { tail: 2 } : { limit: 2 }) } } });
+  },
+  onFileopRequest(op, emit) {
+   if (op.op !== "read") return false;
+   emit({ id: op.id, ok: false, code: "E_OVERSIZE" });
+   // Resolve the real read, then abort in the same stack before the broker resumes.
+   controller.abort();
+   disposalsAtAbort = disposals;
+   rootsAtAbort = [...r.disposed];
+   r.terminal(providerEmit!);
+   return true;
+  },
+ });
+ const work = r.run(controller.signal);
+ const outcome = work.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
+ try {
+  assert.equal((await outcome).ok, false);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(r.ops, ["stat", "read"]);
+  assert.equal(disposalsAtAbort, 1, "abort disposes the real client before the broker resumes");
+  assert.deepEqual(rootsAtAbort, []);
+  assert.equal(r.specs.length, 2, "no replacement roots or retry");
+  assert.deepEqual(r.disposed, ["provider", "fileop"]);
+  assert.equal(r.requests.some(f => f.id === 90 && !f.method && f.result?.success === true), false);
+  assert.equal(events.some(e => e.event === "check_activity" && e.outcome === "ok"), false);
+  assert.equal(recorder.coverageEvidence().reads.has("large.ts"), false);
+  assert.equal(r.usage.at(-1)!.is_error, true);
+ } finally {
+  controller.abort();
+  await handle?.dispose();
+  await outcome;
+ }
+});
+
+for (const stop of ["abort", "root failure"] as const) {
+ it("REQ-crosscheck-abort: pending " + mode + " settles on " + stop + " and ignores a late reply", async t => {
+  const controller = new AbortController();
+  const events: Record<string, unknown>[] = [];
+  const recorder = new CheckActivityRecorder(p => { events.push(structuredClone(p)); }, { generation: 7 });
+  recorder.attach("/checkout", "/owned");
+  let handle: FileopHelperHandle | undefined;
+  let disposals = 0;
+  let rangeResult: FileopResponse | undefined;
+  let lateReply: (() => void) | undefined;
+  let providerEmit: Emit | undefined;
+  const r = rig({
+   activity: recorder,
+   wireFileop(proc) {
+    handle = wireFileopHelper(proc);
+    const real = handle;
+    const op = real.client.op.bind(real.client);
+    t.mock.method(real.client, "op", (request: FileopRequest) => {
+     const pending = op(request);
+     if (request.op === mode) void pending.then(result => { rangeResult = result; });
+     return pending;
+    });
+    return { client: real.client, dispose: () => { disposals++; return real.dispose(); } };
+   },
+   notes(emit) {
+    providerEmit = emit;
+    emit({ id: 90, method: "item/tool/call", params: { threadId: "thread", turnId: "turn",
+     callId: "read", tool: "Read", arguments: { path: "large.ts", ...(mode === "read_tail" ? { tail: 2 } : { limit: 2 }) } } });
+   },
+   onFileopRequest(op, emit) {
+    if (op.op === "read") { emit({ id: op.id, ok: false, code: "E_OVERSIZE" }); return true; }
+    if (op.op !== mode) return false;
+    lateReply = () => emit({ id: op.id, ok: true, data: Buffer.from("late excerpt\n").toString("base64"),
+     size: 13, ...(mode === "read_tail" ? { tail: 2, fromEnd: true, partialFirstLine: false } : { offset: 1, partialLastLine: false }), linesReturned: 1, truncated: false,
+     incomplete: false, scannedBytes: 13 });
+    return true;
+   },
+  });
+  const work = r.run(controller.signal);
+  const outcome = work.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
+  try {
+   // One event-loop turn drains startup and broker microtasks without a wall-clock wait.
+   await new Promise<void>(resolve => setImmediate(resolve));
+   assert.deepEqual(r.ops, ["stat", "read", mode]);
+   assert.ok(lateReply);
+   assert.equal(rangeResult, undefined);
+   assert.equal(disposals, 0);
+   assert.deepEqual(r.disposed, []);
+   if (stop === "abort") {
+    controller.abort();
+    assert.equal(disposals, 1, "abort disposes the real client before root reaping");
+    assert.deepEqual(r.disposed, []);
+   } else {
+    r.fail();
+    // Propagate whenFailed to stopAdmission before the broker continuation or root reaping.
+    await Promise.resolve();
+   }
+   assert.equal(disposals, 1);
+   assert.deepEqual(r.disposed, []);
+   // Even a correlated success arriving after disposal cannot settle the pending op successfully.
+   lateReply();
+   r.terminal(providerEmit!);
+   await new Promise<void>(resolve => setImmediate(resolve));
+   assert.deepEqual(rangeResult, { ok: false, code: "E_IO" });
+   assert.equal((await outcome).ok, false);
+   assert.deepEqual(r.disposed, ["provider", "fileop"]);
+   assert.deepEqual(r.ops, ["stat", "read", mode]);
+   assert.equal(r.specs.length, 2, "no replacement roots or retry");
+   assert.equal(r.requests.some(f => f.id === 90 && !f.method && f.result?.success === true), false);
+   assert.equal(events.some(e => e.event === "check_activity" && e.outcome === "ok"), false);
+   assert.equal(recorder.coverageEvidence().reads.has("large.ts"), false);
+   assert.equal(r.usage.at(-1)!.is_error, true);
+  } finally {
+   controller.abort();
+   await handle?.dispose();
+   await outcome;
+  }
+ });
+}
+
+}
 
 it("cleanup failure fails the check, disposes sibling and marks usage error", async () => {
  const r = rig({ failDispose: true });
@@ -843,6 +1130,63 @@ const activityReply = (op: { op: string; path: string }): Record<string, unknown
  return undefined;
 };
 
+it("activity: completed tail has no absolute lines and incomplete tail is limit", async () => {
+ const { r, events, recorder } = activityRig([
+  { tool: "Read", arguments: { path: "small-tail.ts", tail: 1 } },
+  { tool: "Read", arguments: { path: "tail.ts", tail: 1 } },
+  { tool: "Read", arguments: { path: "budget-tail.ts", tail: 2 } },
+ ], op => {
+  if (op.op === "stat") return undefined;
+  if (op.path === "small-tail.ts") return { ok: true, data: Buffer.from("a\nlast\n").toString("base64"), size: 7 };
+  if (op.op === "read") return { ok: false, code: "E_OVERSIZE" };
+  if (op.op !== "read_tail") return undefined;
+  const incomplete = op.path === "budget-tail.ts";
+  return { ok: true, data: Buffer.from("last\n").toString("base64"), size: rangeScanBytes + 1,
+   tail: incomplete ? 2 : 1, fromEnd: true, linesReturned: 1, partialFirstLine: false, truncated: true,
+   incomplete, scannedBytes: incomplete ? rangeScanBytes : 32768, ...(incomplete ? { reason: "scan_budget" } : {}) };
+ });
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events.filter(e => e.event === "check_activity"), [
+  { event: "check_activity", op: "read", outcome: "ok", path: "small-tail.ts" },
+  { event: "check_activity", op: "read", outcome: "ok", path: "tail.ts" },
+  { event: "check_activity", op: "read", outcome: "limit", path: "budget-tail.ts" },
+ ]);
+ assert.equal(recorder.coverageEvidence().reads.has("budget-tail.ts"), false);
+});
+
+it("activity: scan exhaustion records limit without a successful read, EOF stays ok, binary stays error", async () => {
+ const { r, events, recorder } = activityRig([
+  { tool: "Read", arguments: { path: "budget.ts", limit: 2 } },
+  { tool: "Read", arguments: { path: "empty-budget.ts", limit: 2 } },
+  { tool: "Read", arguments: { path: "partial-budget.ts", limit: 2 } },
+  { tool: "Read", arguments: { path: "empty.ts", limit: 2 } },
+  { tool: "Read", arguments: { path: "binary.ts", limit: 2 } },
+ ], op => {
+  if (op.op === "read") return { ok: false, code: "E_OVERSIZE" };
+  if (op.op !== "read_range") return undefined;
+  if (op.path === "binary.ts") return { ok: false, code: "E_NOT_TEXT" };
+  const incomplete = op.path !== "empty.ts";
+  const partial = op.path === "partial-budget.ts";
+  const data = op.path === "budget.ts" ? bodyOf(1) : partial ? Buffer.from("part").toString("base64") : "";
+  return { ok: true, data, size: 65 * 1024 * 1024,
+   offset: 1, linesReturned: data ? 1 : 0, partialLastLine: partial, truncated: incomplete,
+   incomplete, scannedBytes: incomplete ? 64 * 1024 * 1024 : 0, ...(incomplete ? { reason: "scan_budget" } : {}) };
+ });
+ assert.equal(await r.run(), verdict);
+ recorder.summary("codex", "plan", true);
+ assert.deepEqual(events.filter(e => e["event"] === "check_activity"), [
+  { event: "check_activity", op: "read", outcome: "limit", path: "budget.ts" },
+  { event: "check_activity", op: "read", outcome: "limit", path: "empty-budget.ts" },
+  { event: "check_activity", op: "read", outcome: "limit", path: "partial-budget.ts" },
+  { event: "check_activity", op: "read", outcome: "ok", path: "empty.ts" },
+  { event: "check_activity", op: "read", outcome: "error", path: "binary.ts" },
+ ]);
+ assert.deepEqual(events.find(e => e["event"] === "check_activity_summary")!["reads"], { ok: 1, denied: 0, oversize: 0, limit: 3, error: 1 });
+ for (const file of ["budget.ts", "empty-budget.ts", "partial-budget.ts"]) {
+  assert.equal(recorder.coverageEvidence().reads.has(file), false);
+ }
+});
+
 it("activity: a normal run marks the model started and a pre-model refusal does not", async () => {
  const done = activityRig([]);
  assert.equal(await done.r.run(), verdict);
@@ -915,11 +1259,34 @@ it("activity: an empty path falls through to file_path like the broker, for Read
  ]);
 });
 
-it("activity: a Search the broker denies with search_limit records outcome limit", async () => {
+it("activity: a Search over a truncated listing records ok with matches_truncated", async () => {
  const { r, events } = activityRig([{ tool: "Search", arguments: { query: "x", path: "src" } }],
   (op) => op.op === "list" ? { ok: true, entries: [], truncated: true } : undefined);
  assert.equal(await r.run(), verdict);
- assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "limit", path: "src" }]);
+ assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "ok", path: "src", matches: 0, matches_truncated: true }]);
+});
+
+it("activity: a ceiling-truncated Search with a match records ok with matches_truncated", async () => {
+ const body = Buffer.from("needle\n");
+ const { r, events } = activityRig([{ tool: "Search", arguments: { query: "needle", path: "src" } }], (op) => {
+  if (op.op === "list" && op.path === "src") return { ok: true, truncated: true, entries: [{ name: "f.ts", type: "file" }] };
+  if (op.path === "src/f.ts") return { ok: true, data: body.toString("base64"), size: body.length };
+  return undefined;
+ });
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "ok", path: "src", matches: 1, matches_truncated: true }]);
+});
+
+it("activity: a file-path Search (list E_NOT_DIR from the helper, then stat and read) records ok with matches", async () => {
+ const body = Buffer.from("a\nneedle\n");
+ const { r, events } = activityRig([{ tool: "Search", arguments: { query: "needle", path: "src/f.ts" } }], (op) => {
+  if (op.op === "list" && op.path === "src/f.ts") return { ok: false, code: "E_NOT_DIR" };
+  if (op.op === "stat" && op.path === "src/f.ts") return { ok: true, exists: true, type: "file", size: body.length };
+  if (op.op === "read" && op.path === "src/f.ts") return { ok: true, data: body.toString("base64"), size: body.length };
+  return undefined;
+ });
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "ok", path: "src/f.ts", matches: 1 }]);
 });
 
 it("activity: a fileop E_TIMEOUT records outcome limit", async () => {
@@ -970,4 +1337,40 @@ it("activity: a throwing recorder never fails the check", async () => {
   onToolReply: (_f, emit) => r.terminal(emit) });
  assert.equal(await r.run(), verdict);
  assert.ok(sent);
+});
+
+
+it("M3 actual checker admission holds the actual RPC, owner cancellation settles both roots", async () => {
+ const control = new AbortController();
+ let entered!: () => void;
+ const ready = new Promise<void>(resolve => { entered = resolve; });
+ const reads: CodexOperationRequest[] = [];
+ const r = rig({ subscription: true, operationRead: async (request, signal) => {
+  reads.push(request); entered();
+  await new Promise<void>((_, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+  throw new Error("unreachable");
+ } });
+ const done = r.run(control.signal);
+ const rejected = assert.rejects(done);
+ await ready;
+ assert.equal(reads[0]!.kind, "checker");
+ assert.equal(r.requests.some(frame => frame.method === "turn/start"), false);
+ control.abort(new Error("owner cancelled"));
+ await rejected;
+ assert.deepEqual(r.disposed.sort(), ["fileop", "provider"]);
+ assert.equal(r.requests.some(frame => frame.method === "turn/start"), false);
+});
+
+it("M3 actual checker gets a fresh admit immediately before its actual turn", async () => {
+ const reads: CodexOperationRequest[] = [];
+ const r = rig({ subscription: true, operationRead: async request => {
+  reads.push(request);
+  return { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+ }, beforeResponse(frame) {
+  if (frame.method === "turn/start") assert.equal(reads.length, 1);
+ } });
+ await r.run();
+ assert.equal(reads.length, 1);
+ assert.equal(reads[0]!.kind, "checker");
+ assert.equal(r.requests.filter(frame => frame.method === "turn/start").length, 1);
 });

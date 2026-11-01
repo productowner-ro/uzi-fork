@@ -15,7 +15,7 @@ import {
   type Run,
   type Worker,
 } from "../lib/api";
-import { useAuth } from "../auth/AuthContext";
+import { useAuth, useOptionalAuth } from "../auth/AuthContext";
 import { mergeRequestUrl } from "../lib/forgeUrls";
 import { errorMessage } from "../lib/apiError";
 import { changedMilestones } from "../lib/milestoneReset";
@@ -32,14 +32,30 @@ import { ExtendTimePopover } from "../components/ExtendTimePopover";
 import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { repoAgentFolder } from "../lib/repoAgentFolder";
 import { stripUnsafeChars } from "../lib/safeText";
+import { leadConfigView, leadConfigViewInput } from "../lib/leadConfig";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
+import { useMaintenance } from "../lib/useMaintenance";
+import { ForgeOriginStatus } from "../components/ForgeOriginStatus";
+import { forgeWaitMode, forgeWaitLabel } from "../lib/forgeCooldown";
 import { credentialSwitchHold } from "../lib/credentialSwitchHold";
 import {
   effectiveRunStatus,
   parkLabel,
   formatElapsed,
   healthFlagLabel,
+  isMaintenanceQueued,
+  maintenanceQueueText,
+  isReserveQueued,
+  isReserveHeldPause,
+  reserveQueueText,
+  RESERVE_RESUME_CONFIRM,
+  codexAdmissionText,
+  accountCooldownText,
+  displayHealthReason,
+  queuedBlockerPrecedesCodexAdmission,
   isStoppedRun,
   isRejectedRun,
   milestoneBadge,
@@ -91,6 +107,7 @@ import { Modal } from "../components/Modal";
 import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
 import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
+import { CapabilitySources } from "./runView/CapabilitySources";
 import { FullPlanPanel } from "./runView/FullPlanPanel";
 import { CompletionPending } from "./runView/CompletionPending";
 import { SemanticDrift } from "./runView/SemanticDrift";
@@ -188,6 +205,30 @@ function RunBudgetElapsed({ run }: { run: Run }) {
       className="cursor-help text-xs tabular-nums text-faint underline decoration-dotted decoration-faint underline-offset-2 outline-hidden focus-visible:text-fg focus-visible:outline-2 focus-visible:outline-brand focus-visible:outline-offset-2"
     >
       {formatBudgetDuration(view.usedSec)} <span className="text-faint">/ {budgetRightLabel(view)}</span>
+    </span>
+  );
+}
+
+// PRD #3244: the lead agent's configuration chip. Focusable so the sources open on focus/tap, not
+// only hover; the explicit aria-label restores the visible chip text that a bare `title` would
+// swallow from the accessible name (the RunBudgetElapsed pattern). Renders nothing for a run
+// outside the lead lane.
+function LeadConfigChip({ run }: { run: Run }) {
+  const view = leadConfigView(leadConfigViewInput(run));
+  if (!view.chip) return null;
+  // The pre-claim form is muted, as in the mockup: nothing is resolved until a worker claims it.
+  const { preClaim } = view;
+  return (
+    <span
+      tabIndex={0}
+      title={view.lines.join("\n")}
+      aria-label={`${view.chip}. ${view.lines.join(". ")}`}
+      className={cx(
+        "inline-flex cursor-help items-center whitespace-nowrap rounded-md border border-neutral-border bg-neutral-surface px-1.5 py-0.5 text-[11px] font-medium outline-hidden focus-visible:outline-2 focus-visible:outline-brand focus-visible:outline-offset-2",
+        preClaim ? "text-faint" : "text-neutral-fg",
+      )}
+    >
+      {view.chip}
     </span>
   );
 }
@@ -306,7 +347,7 @@ function checkpointSentence(run: Run, nowMs: number): string | null {
 
 // HealthFlag renders the run-health warn chip in the header (PRD #47
 // Decision 10): `⚠ <label> · stuck for Xm — <reason>`. The run view is owner/admin
-// only, so health_reason is always present here (no gating needed). It ticks the
+// only; optional health_reason is shown when available. It ticks the
 // "stuck for Xm" coarsely (30s) since a stalled run emits no messages to force a
 // re-render. The near-timeout flag ("slow", PRD #1170) instead counts DOWN to the run's
 // deadline_at (`· 1h 5m left`, or `· stopping` past it), falling back to "stuck for Xm"
@@ -320,7 +361,20 @@ function checkpointSentence(run: Run, nowMs: number): string | null {
  */
 export function HealthFlag({ run }: { run: Run }) {
   const now = useNow(30_000);
-  const show = shouldShowHealthFlag(run.health, run.status);
+  const maintenanceReason = useMaintenance().status?.reason;
+  // PRD #3454: maintenance mode holding this queued run back takes precedence over every
+  // health flag (the detector may still say waiting_worker). A calm info line, no "stuck
+  // for" clock: the wait is the admin's drain, not a fault.
+  const maintenance = isMaintenanceQueued(run);
+  // PRD #3522: the weekly usage reserve is the same kind of deliberate wait (maintenance wins;
+  // the reserve outranks Codex account admission, as in the server's health ladder).
+  const reserve = !maintenance && isReserveQueued(run);
+  const admission = codexAdmissionText(run, now);
+  const primaryAdmission = !maintenance && !reserve && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
+  const cooldown = accountCooldownText(run, now);
+  const reason = displayHealthReason(run);
+  const show = !maintenance && !reserve && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
+  const queueAdvice = !maintenance && !reserve && !primaryAdmission && !show && run.status === "queued" ? reason : null;
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
   // Near timeout ("slow", PRD #1170) counts DOWN to run.deadline_at instead of the
   // since-flagged "stuck for Xm" every other flag keeps: `· 1h 5m left`, or `· stopping`
@@ -341,30 +395,49 @@ export function HealthFlag({ run }: { run: Run }) {
   // the region re-announce on every tick, the same countdown-in-a-live-region hostility
   // the park panel's role="status" note warns about. The stuck time and reason stay in
   // the visible pill, which no screen reader is listening to.
-  const announce = show ? (healthFlagLabel(run.health) ?? "") : "";
+  const announce = maintenance
+    ? maintenanceQueueText(maintenanceReason)
+    : reserve
+      ? reserveQueueText(run.reserve_hold_reason)
+      : cooldown ?? primaryAdmission ?? (show
+        ? (healthFlagLabel(run.health) ?? "")
+        : queueAdvice ?? "");
   return (
     <>
+      {queueAdvice && <span className="text-xs text-warn">{queueAdvice}</span>}
+      {cooldown && <span className="text-xs text-info">{cooldown}</span>}
+      {primaryAdmission && (
+        <span data-queue-reason={run.queue_reason} className="text-xs text-info">{primaryAdmission}</span>
+      )}
+      {maintenance && (
+        <span
+          title={admission ?? undefined}
+          data-queue-reason="maintenance"
+          className="inline-flex items-center gap-1 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info"
+        >
+          {maintenanceQueueText(maintenanceReason)}
+        </span>
+      )}
+      {reserve && (
+        <span
+          data-queue-reason="weekly_reserve"
+          className="inline-flex items-center gap-1 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info"
+        >
+          {reserveQueueText(run.reserve_hold_reason)}
+        </span>
+      )}
       {show && (
         // A PLAIN (non-live) span: the sr-only region below owns the announcement.
         // role="status" used to sit HERE, and that was the bug the comment denied — a
         // live region mounted in the same tick as its first message is silent, because
         // assistive tech announces CHANGES to a region that already existed (#185;
         // Board.tsx S5). This pill mounts together with the flag, so it never announced.
-        // The reason is shown inline below, so no title tooltip (it would be redundant).
-        <span className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] font-medium text-warn">
+        // The reason is inline; the tooltip keeps any independently active admission detail.
+        <span title={admission ?? undefined} className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] font-medium text-warn">
           ⚠ {healthFlagLabel(run.health)}
           {stuck}
-          {/* Issue #124, TEXT channel. 96ed275a stripped this field where it reaches a `title`
-              attribute (runBadge's descriptor) and missed it here, where it renders as body
-              text — the mirror of f399ab26, which stripped upgrade_detail's TEXT and left its
-              attribute for 4a739bff. Same field, opposite channel, one commit apart.
-              (This sentence named 4a739bff until D1: that is the commit which fixed the
-              ATTRIBUTE, so the mirror read backwards in the clause whose whole point is the
-              mirror. Second time those two were transposed — see the note in
-              WorkerUpgradeBadge.test.tsx — because they are one apart, both about
-              upgrade_detail, and differ only in channel, which is the distinction being
-              taught.) */}
-          {run.health_reason && <span className="font-normal"> — {stripUnsafeChars(run.health_reason)}</span>}
+          {/* A single display cell, including server-composed manual attribution. */}
+          {reason && <span className="font-normal"> — {reason}</span>}
         </span>
       )}
       {/* ALWAYS MOUNTED, empty until a flag arrives — mirrors RunView's parkAnnounce
@@ -788,12 +861,35 @@ const MAX_GUIDANCE_BYTES = 8192;
 // on a milestone-structured run (N = pause_after_count + 1, the milestone the request waits
 // to see complete); "· after the current step" on a milestone mode request against a run
 // with no frozen list (milestone mode then parks at the next turn boundary).
-function pauseRequestedLabel(run: Run): string {
+// PRD #3522: a "reserve" request is filed by the weekly usage reserve, not the owner, and
+// names itself ("· weekly usage reserve · after M<N>"), matching the CLI's suffix.
+export function pauseRequestedLabel(run: Run): string {
   if (run.pause_mode === "now") return "Pause requested · now";
+  const source = run.pause_mode === "reserve" ? " · weekly usage reserve" : "";
   const hasMilestones = milestoneBadge(run) != null;
-  if (!hasMilestones) return "Pause requested · after the current step";
+  if (!hasMilestones) return `Pause requested${source} · after the current step`;
   const n = (run.pause_after_count ?? 0) + 1;
-  return `Pause requested · after M${n}`;
+  return `Pause requested${source} · after M${n}`;
+}
+
+// confirmReserveResume gates an owner Resume of a run the weekly usage reserve parked: the
+// resume records an override until the next weekly reset, so the owner confirms first. Any
+// other run resumes without a prompt.
+function confirmReserveResume(run: Run): boolean {
+  return !isReserveHeldPause(run) || window.confirm(RESERVE_RESUME_CONFIRM);
+}
+
+// ReserveExemptLine states the owner's override of the weekly usage reserve while it lasts.
+export function ReserveExemptLine({ run }: { run: Run }) {
+  const until = run.reserve_exempt_until ? Date.parse(run.reserve_exempt_until) : NaN;
+  // The server never clears the stamp on a finished run, so the line is for live runs only.
+  if (isTerminalRun(run.status) || !Number.isFinite(until) || until <= Date.now()) return null;
+  return (
+    <span className="text-xs text-muted" data-reserve-exempt="true">
+      Weekly usage reserve overridden until{" "}
+      {new Date(until).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+    </span>
+  );
 }
 
 // checkpointLine renders the PausedPanel's "the checkpoint is safe" sentence from the
@@ -896,6 +992,12 @@ export function PausedPanel({
           <p className="mt-1.5 text-xs text-muted">
             Nothing runs and nothing is spent while it waits.
           </p>
+          {isReserveHeldPause(run) && (
+            <p className="mt-1.5 text-xs text-muted" data-hold-reason="weekly_reserve">
+              Held by your weekly usage reserve. It resumes automatically when usage drops below the
+              threshold. Resuming now overrides the reserve until the next weekly reset.
+            </p>
+          )}
           {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
           <RunParkDiskFacts run={run} />
           {/* Worker / re-planning mechanics live behind a disclosure so the panel stays
@@ -914,7 +1016,7 @@ export function PausedPanel({
               who can, never a greyed button that 404s. */}
           {canSteer ? (
             <>
-              <Button size="sm" disabled={busy} onClick={onResume}>
+              <Button size="sm" disabled={busy} onClick={() => { if (confirmReserveResume(run)) onResume(); }}>
                 ▶ Resume
               </Button>
               {showExtend && onExtend && (
@@ -1347,10 +1449,9 @@ function codexHoldCopy(
  * recovers or the owner cancels it (cancel is the separate Stop control, not offered
  * here — same rule as LimitWaitPanel's parked state).
  *
- * PRD #1392 M5: when the typed cause is `forge_unreachable` (the forge stayed unreachable
- * at clone) the panel swaps in forge-specific copy — "Waiting for the forge", the retry
- * time from `recovery_retry_not_before`, and the park count against its cap ("N of MAX",
- * or "N of unlimited" when `forge_park_max` is 0).
+ * Forge parks distinguish an explicit NULL owner hold, a timed automatic retry (even
+ * overdue), and missing timing from an older API. Counts are historical; cooldown advice
+ * neither verifies recovery nor grants execution authority.
  *
  * PRD #1590 D6: when the cause is `codex_account_unavailable` the panel swaps in the
  * per-action Codex copy from codexHoldCopy instead, with no retry time or park count.
@@ -1378,32 +1479,51 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   onResume: () => void;
   onCancel: () => void;
 }) {
+  const adoptionFailed = run.recovery_wait_cause === "retained_recovery_adoption_failed";
+  const idleStall = run.recovery_wait_cause === "codex_idle_stall";
+  const retained = adoptionFailed || run.recovery_wait_cause === "retained_recovery_exhausted" || idleStall;
+  const decisionName = idleStall ? "Codex idle stall" : "Retained recovery";
+  const decisionHeld = adoptionFailed || run.recovery_retry_not_before === null;
+  const decisionRetrying = !adoptionFailed && typeof run.recovery_retry_not_before === "string" && Number.isFinite(Date.parse(run.recovery_retry_not_before));
+  const retryMs = typeof run.recovery_retry_not_before === "string" ? Date.parse(run.recovery_retry_not_before) : NaN;
   const memoryHeld = run.recovery_wait_cause === "worker_memory_pressure";
   const memory = run.memory_hold;
   const recovery = run.worker_recovery;
   const evidence = recovery?.evidence;
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
-      <p className="text-sm font-semibold text-warn">{memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
+      <p className="text-sm font-semibold text-warn">{adoptionFailed ? "Retained recovery integrity check failed" : retained ? decisionHeld ? `${decisionName} needs your decision`
+        : decisionRetrying ? `${decisionName} retrying` : `${decisionName} timing unknown`
+        : memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
       <p className="mt-0.5 text-xs text-muted">
-        {memoryHeld
+        {retained ? <>
+          {adoptionFailed && "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. "}
+          {decisionHeld
+            ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
+            : decisionRetrying
+              ? idleStall ? `Automatic retry is scheduled not before ${new Date(retryMs).toLocaleString()}; it may still be pending when due. Only the run owner can Resume now or Cancel.`
+                : retryMs <= Date.now() ? "Automatic retry is due; the run will retry automatically. Only the run owner can Resume now or Cancel."
+                : `The run will retry automatically after ${new Date(retryMs).toLocaleString()}. Only the run owner can Resume now or Cancel.`
+              : "Retry timing is unavailable. This does not establish an owner hold or an automatic retry date."}
+        </> : <>{memoryHeld
           ? "Memory interventions have stopped. Resume starts a fresh memory episode. Cancel ends this run."
           : "Automatic worker recovery has stopped. Only the run owner can resume or cancel this run. Resume requests one explicit attempt, even when the automatic recovery limit is zero."}
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
-        This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.
+        This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
-      <p className="mt-1.5 text-xs text-muted">
+      {idleStall && <p className="mt-1.5 text-xs text-muted">Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.</p>}
+      {!retained && <p className="mt-1.5 text-xs text-muted">
         {memoryHeld
           ? `Memory interventions: used ${memory?.used ?? "unknown"}. Maximum: ${memory?.max ?? "unknown"}. Remaining: ${memory?.remaining ?? "unknown"}.`
           : recovery
             ? `Automatic recovery limit: ${recovery.automatic_requeue_limit}. Used: ${recovery.episode_used}. Remaining: ${recovery.episode_remaining}.`
             : "Automatic recovery limit, used and remaining: unknown."}
-      </p>
-      {memoryHeld
+      </p>}
+      {!retained && (memoryHeld
         ? memory && <p className="mt-1.5 text-xs text-muted">Memory episode: {memory.episode}.</p>
         : <>{recovery && <p className="mt-1.5 text-xs text-muted">Recovery episode: {recovery.episode}.</p>}
-          <p className="mt-1.5 text-xs text-muted">Lifetime automatic requeues: {run.requeue_count}.</p></>}
-      {memoryHeld && <p className="mt-1.5 text-xs text-muted">
+          <p className="mt-1.5 text-xs text-muted">Lifetime automatic requeues: {run.requeue_count}.</p></>)}
+      {(memoryHeld || retained) && <p className="mt-1.5 text-xs text-muted">
         Retained source may remain on the assigned worker. Historical checkpoint or capture reports do not verify current availability or the latest local edits.
         Only a verified available recovery archive can restore captured work on another worker; uncaptured work is not guaranteed.
       </p>}
@@ -1473,7 +1593,7 @@ function BaseAttestationHoldPanel({ run, ownerProof = false, busy = false, onCan
     <h2 className="text-sm font-semibold text-warn">Base unverified: waiting for owner</h2>
     <p className="mt-1 text-xs text-muted">This run requires its planned base commit, but no checkpoint attests that the retained work was produced on it. The agent was not started. The work and its custody are kept.</p>
     <p className="mt-1 text-xs text-muted">Nothing resumes this run automatically, and Resume and Extend are not available for this hold.</p>
-    <p className="mt-1 text-xs text-muted">Inspect custody with <code>uzi run recovery {run.id}</code>. Recover the work with <code>uzi run export {run.id} --output &lt;path&gt;</code>, or start a successor run. Discarding held custody stays a separate explicit action.</p>
+    <p className="mt-1 text-xs text-muted">Inspect custody with <code>uzi run recovery {run.id}</code>. Only if a verified available recovery archive exists, export it with <code>uzi run export {sanitizeLabel(run.id)} --output &lt;path&gt;</code>. Local-only work stays protected on its worker; a successor does not guarantee recovery of uncaptured edits. Discarding held custody stays a separate explicit action.</p>
     {ownerProof ? <div className="mt-3 flex gap-2">
       <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
     </div> : <p className="mt-2 text-xs text-muted">Only the run owner can cancel this hold.</p>}
@@ -1491,7 +1611,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
   // sibling parks) renders nothing — PoolWaitPanel owns pool_wait, LimitWaitPanel owns
   // limit_wait, and this self-hides on both so mounting all three side by side is safe.
   if (run.status !== "recovery_wait") return null;
-  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure") {
+  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure" || (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed")) {
     return <WorkerDecisionPanel run={run} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} />;
   }
 
@@ -1500,6 +1620,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
   // the null/untyped transient-interruption park, issue #1197/#1088) keeps the generic copy.
   const providerPark = run.recovery_wait_cause === "provider_outage";
   const forgePark = run.recovery_wait_cause === "forge_unreachable";
+  const forgeMode = forgeWaitMode(run);
   // Issue #1766: a vault_locked park waits for the run owner's vault to be unlocked; it
   // explicit unlock queues it promptly, and the timer remains the fallback (#1792).
   const vaultPark = run.recovery_wait_cause === "vault_locked";
@@ -1537,7 +1658,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
             : providerPark
               ? "Waiting for the provider"
             : forgePark
-              ? "Waiting for the forge"
+              ? forgeWaitLabel(run)
               : vaultPark
                 ? "Waiting for vault unlock"
                 : diskPark
@@ -1568,12 +1689,25 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
         ) : forgePark ? (
           <>
             <p className="mt-0.5 text-xs text-muted">
-              This run paused because the forge was unreachable when it went to clone. It
-              retries on its own on a capped backoff — no action is needed. If it never
-              recovers it holds here so you can cancel it.
+              {forgeMode === "held"
+                ? "The finite automatic forge recovery allowance is exhausted. This owner hold has no scheduled retry. Only the run owner can Resume or Cancel."
+                : forgeMode === "timed"
+                  ? "The forge was unreachable. Retries automatically after the scheduled time, including when already due; a due retry may still be waiting for admission."
+                  : "The forge was unreachable. Retry timing is unavailable; this does not establish an owner hold or an automatic retry date."}
             </p>
             <p className="mt-1.5 text-xs text-muted">
-              {retryAt ? `Retry at ${retryAt} (${parkLabel}).` : `Attempt ${parkLabel}.`}
+              {retryAt ? `Retry at ${retryAt}. ` : ""}Forge parks: {parkLabel}. The count and allowance are unchanged by Resume.
+            </p>
+            {forgeMode === "held" && <>
+              <p className="mt-1.5 text-xs text-muted">Resume permits one bounded ordinary attempt; it does not promise execution or reset counts, custody or grants. Origin cooldown, manual cordon, a custody limit of 1, or saturated capacity may still block admission.</p>
+              {run.health_reason && <p className="mt-1.5 text-xs text-muted">Admission: {displayHealthReason(run)}</p>}
+              {ownerProof ? <div className="mt-3 flex flex-wrap gap-2">
+                <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+                <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>Cancel</Button>
+              </div> : <p className="mt-1.5 text-xs text-muted">Only the confirmed run owner can Resume or Cancel.</p>}
+            </>}
+            <p className="mt-1.5 text-xs text-muted">
+              Local-only work and custody remain protected. Export requires a verified available recovery archive; an old checkpoint does not prove that the latest local edits are recoverable elsewhere.
             </p>
           </>
         ) : vaultPark ? (
@@ -1593,7 +1727,9 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
           </>
         )}
         <p className="mt-1.5 text-xs text-muted">
-          {vaultPark
+          {forgePark
+            ? "A worker heartbeat or an OK health flag does not verify forge reachability. Retry eligibility is not proof of recovery."
+            : vaultPark
             ? "The run saved its work before parking; resume uses that recovery data."
             : diskPark
               ? // PRD #1809: a disk park frees space on the worker, so the generic "keeps its
@@ -1626,13 +1762,13 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
  * A separate component so useAuth runs only while this park is on screen.
  */
 function VaultLockedParkBody({ retryAt }: { retryAt: string | null }) {
-  const { vaultUnlocked } = useAuth();
+  const { vaultUnlocked, vaultMode } = useAuth();
   return (
     <>
       <p className="mt-0.5 text-xs text-muted">
         {`The run owner's vault was locked when this Codex run needed its credential. The run owner's explicit vault unlock queues this run promptly; work resumes when a worker picks it up. Scheduled retry fallback${retryAt ? ` (${retryAt})` : ""}.`}
       </p>
-      {!vaultUnlocked && (
+      {vaultMode !== "unprotected" && !vaultUnlocked && (
         <p className="mt-1.5 text-xs text-muted">
           If this is your run, unlock your vault with the banner at the top of the page.
         </p>
@@ -1735,19 +1871,23 @@ function IssueInputHistory({ run }: { run: Run }) {
 }
 
 export function RunView() {
+  const demo = useDemoMode();
   const { id = "" } = useParams();
   const currentRunIdRef = useRef(id);
   currentRunIdRef.current = id;
-  const { run, messages, connected, error, submit, refreshRun, inputs, canSteer: optimisticCanSteer, confirmedOwner, pauseOriginReady } = useRunStream(id);
+  const { run, messages, connected, error, submit, refreshRun, refreshRunPassive, inputs, canSteer: optimisticCanSteer, confirmedOwner, pauseOriginReady } = useRunStream(id);
+  const repoPath = maskRepoPath(stripUnsafeChars(run?.repo_path ?? ""), demo);
   const workerExhausted = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted";
   // All page control surfaces share this gate, including the existing top Stop.
-  // Provider holds, memory holds and worker exhaustion require confirmed ownership; other holds
+  // Provider, memory, retained recovery and worker exhaustion holds require confirmed ownership; other holds
   // retain their optimistic canSteer semantics.
   const providerHeld = run?.status === "paused" && run.hold_reason === "provider_unavailable";
   const memoryHeld = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
   // Issue #3181: the token-switch holds are owner decisions too (Resume / Cancel).
   const switchHeld = run != null && credentialSwitchHold(run) !== null;
-  const ownerDecisionHold = workerExhausted || memoryHeld || providerHeld || switchHeld;
+  const retainedRecovery = run?.status === "recovery_wait" && (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed");
+  const forgeHeld = run != null && forgeWaitMode(run) === "held";
+  const ownerDecisionHold = forgeHeld || retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
@@ -1773,10 +1913,11 @@ export function RunView() {
     state.busy = true;
     const active = state;
     // Requests are bounded by newly observed sequence numbers, with no retries;
-    // updates during a request share one follow-up. refreshRun retains its own
-    // request lifecycle and generation fence. Navigation cancels queued follow-ups.
+    // updates during a request share one follow-up. The read is passive (socket-driven,
+    // so it never restores a vault keyslot) and retains refreshRun's request lifecycle
+    // and generation fence. Navigation cancels queued follow-ups.
     const refresh = async () => {
-      try { await refreshRun(); } catch {
+      try { await refreshRunPassive(); } catch {
         // Best effort, as in useRunStream.refreshRun; a later new event can refresh.
       } finally {
         active.busy = false;
@@ -1788,7 +1929,7 @@ export function RunView() {
       }
     };
     void refresh();
-  }, [id, run?.id, messages, refreshRun]);
+  }, [id, run?.id, messages, refreshRunPassive]);
   const [incidentalSummary, setIncidentalSummary] = useState<{ runId: string; count: number } | null>(null);
   const findingsRunId = run?.id;
   const findingsTerminal = !!run && isTerminalRun(run.status);
@@ -1799,7 +1940,9 @@ export function RunView() {
     if (!findingsTerminal || !findingsRunId ||
         summaryContext.current.runId !== findingsRunId || !summaryContext.current.terminal) return;
     const request = ++summaryRequest.current;
-    api.listFindings("to_file", undefined, findingsRunId)
+    // Automatic (status-driven or post-mutation) read: passive, so it never restores
+    // a vault keyslot (ADR-3508).
+    api.listFindings("to_file", undefined, findingsRunId, true)
       .then(({ findings }) => {
         if (summaryRequest.current === request) {
           setIncidentalSummary({ runId: findingsRunId, count: findings.filter((f) => f.status === "open").length });
@@ -1816,6 +1959,7 @@ export function RunView() {
     return () => { requestRef.current++; };
   }, [refreshIncidentalSummary]);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
+  const [repo, setRepo] = useState<Repo | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
   // Issue #3181: the server's refusal of a Resume on a settling token-switch hold, bound to the
@@ -1850,7 +1994,7 @@ export function RunView() {
     setBusy(false);
   };
   const resumeWorkerHold = async () => {
-    if (!canSteer || !(workerExhausted || memoryHeld) || run?.id !== id) return;
+    if (!canSteer || !(forgeHeld || workerExhausted || memoryHeld || retainedRecovery) || run?.id !== id) return;
     const requestRunId = id;
     const isCurrent = startAction();
     try {
@@ -1870,17 +2014,36 @@ export function RunView() {
 
   // Resolve the repo's web URL (for the MR link); the run itself does not carry
   // it. Best-effort — the MR iid is shown as text if the repo is not resolvable.
+  // Issue #3391: the same fetch keeps the run's repo for the plan gate's capability hint and
+  // Docker-allowlist line. Keyed on the repo id (not the run object) and cancelled on change, so a
+  // late list for a previous run's repo can never land on the run now shown.
+  const runRepoId = run?.repo_id;
+  const repoIdRef = useRef(runRepoId);
+  repoIdRef.current = runRepoId;
   useEffect(() => {
+    setRepo(null);
+    setRepoWebUrl(null);
     // A repo-less run (a job, PRD #1908) has no repo and no MR to link.
-    if (!run?.repo_id) return;
+    if (!runRepoId) return;
+    let cancelled = false;
     api
       .listRepos()
       .then(({ repos }: { repos: Repo[] }) => {
-        const repo = repos.find((r) => r.id === run.repo_id);
-        setRepoWebUrl(repo?.web_url ?? null);
+        if (cancelled) return;
+        const match = repos.find((r) => r.id === runRepoId) ?? null;
+        setRepo(match);
+        setRepoWebUrl(match?.web_url ?? null);
       })
-      .catch(() => setRepoWebUrl(null));
-  }, [run]);
+      .catch(() => { if (!cancelled) setRepoWebUrl(null); });
+    return () => { cancelled = true; };
+  }, [runRepoId]);
+  // The PATCH response omits the computed allowlist fields, so only the capability list is
+  // merged into the held repo. Ignored when the viewer has moved to another repo meanwhile.
+  const onRepoRequiredCapabilities = useCallback((repoId: string, caps: string[]) => {
+    if (repoIdRef.current !== repoId) return;
+    setRepo((prev) => (prev && prev.id === repoId ? { ...prev, required_capabilities: caps } : prev));
+  }, []);
+  const isAdmin = useOptionalAuth()?.user?.is_admin === true;
 
   // PRD #84 M4 4d: the workers list backs the plan-gate readiness summary — a required
   // capability is "met" when the run's ASSIGNED worker (run.worker_id) advertises it. Only
@@ -1890,7 +2053,8 @@ export function RunView() {
   useEffect(() => {
     if (run?.status !== "awaiting_approval") return;
     api
-      .listWorkers()
+      // Status-driven (often by a socket update): passive, never restores a keyslot.
+      .listWorkers(true)
       .then(({ workers }: { workers: Worker[] }) => setWorkers(workers))
       .catch(() => setWorkers([]));
   }, [run?.status]);
@@ -1902,7 +2066,8 @@ export function RunView() {
   useEffect(() => {
     if (!showMrRework) return;
     api
-      .getMySettings()
+      // Status-driven: passive, never restores a keyslot (ADR-3508).
+      .getMySettings(true)
       .then(({ settings }) => setMrReworkDefault(settings.mr_rework_enabled ?? null))
       .catch(() => setMrReworkDefault(null));
   }, [showMrRework]);
@@ -2114,7 +2279,7 @@ export function RunView() {
   // stable key ("pool_wait"), since a pool hold has no per-instance identity to
   // re-announce on the way awaiting_input keys on the question.
   // Issue #1197: recovery_wait announces here for the SAME reason as pool_wait — it
-  // is a non-terminal, self-resuming hold with no ActivityFeed message backup (unlike
+  // is a non-terminal recovery park with no ActivityFeed message backup (unlike
   // limit_wait, whose run message ActivityFeed's polite region narrates), so this
   // always-mounted region is its only reliable announcement. RecoveryWaitPanel mounts
   // in the same tick as its content, and a region created with its first content is
@@ -2147,8 +2312,12 @@ export function RunView() {
                   // transient interruption, so it gets its own stable key and sentence.
                   run.recovery_wait_cause === "data_volume_full"
                   ? "data_volume_full"
+                  : run.recovery_wait_cause === "forge_unreachable"
+                    ? `forge:${forgeWaitMode(run)}`
                   : run.recovery_wait_cause === "provider_outage"
                     ? "provider_outage"
+                  : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed")
+                    ? effectiveRunStatus(run)
                   : run.recovery_wait_cause === "worker_requeue_exhausted"
                     ? "worker_requeue_exhausted"
                   : run.recovery_wait_cause === "worker_memory_pressure"
@@ -2178,12 +2347,32 @@ export function RunView() {
         ? "The run is waiting for your next follow-up."
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
+          : parkKey === "retained_recovery_adoption_failed"
+            ? "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
+          : parkKey === "codex_idle_stall_held"
+            ? "Codex idle stall needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry. Resume starts a fresh wall and resets the idle-stall count; Cancel ends the run."
+          : parkKey === "codex_idle_stall_retrying"
+            ? "Codex idle stall has a scheduled retry, which may still be pending when due. Only the run owner can Resume now or Cancel. Resume starts a fresh wall and resets the idle-stall count; Cancel ends the run."
+          : parkKey === "codex_idle_stall_unknown"
+            ? "Codex idle stall timing is unavailable. An owner hold or automatic retry date cannot be inferred."
+          : parkKey === "retained_recovery_held"
+            ? "Retained recovery needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry."
+          : parkKey === "retained_recovery_retrying"
+            ? "Retained recovery will retry automatically after its scheduled time, including when already due. Only the run owner can Resume now or Cancel."
+          : parkKey === "retained_recovery_unknown"
+            ? "Retained recovery timing is unavailable. An owner hold or automatic retry date cannot be inferred."
           : parkKey === "worker_requeue_exhausted"
             ? "Worker recovery needs your decision. Only the run owner can resume or cancel this hold. There is no scheduled retry."
           : parkKey === "worker_memory_pressure"
             ? "Worker memory pressure. Only the run owner can resume or cancel this hold. Resume starts a fresh memory episode. There is no scheduled retry."
           : parkKey === "provider_outage"
             ? "The provider is unavailable. Retries automatically. If a provider recovery bound is enabled and reached, the run enters an owner hold."
+          : parkKey === "forge:held"
+            ? "Forge recovery needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry. Resume permits one bounded ordinary attempt without promising execution or resetting counts, custody or grants."
+          : parkKey === "forge:timed"
+            ? "Forge retry scheduled. Retries automatically after the scheduled time, including when already due. Admission may still block execution; forge recovery is unverified."
+          : parkKey === "forge:unknown"
+            ? "Forge retry timing is unavailable. An owner hold or automatic retry date cannot be inferred."
           : parkKey === "recovery_wait"
             ? "This run paused to recover from a transient interruption and will resume automatically."
             : parkKey === "vault_locked"
@@ -2307,8 +2496,8 @@ export function RunView() {
               <span>/</span>
               {/* PRD #1908: a job run has no repo, so no board to link; its tail is "Job". */}
               {run.repo_id ? (
-                <Link to={`/repos/${run.repo_id}/board`} className="transition-colors hover:text-fg">
-                  Board
+                <Link to={`/repos/${run.repo_id}/board`} title={repoPath || undefined} className="transition-colors hover:text-fg">
+                  {repoPath.split("/").filter(Boolean).pop() || "Board"}
                 </Link>
               ) : (
                 <span className="text-muted">{run.kind === "job" ? "Job" : "No repository"}</span>
@@ -2345,7 +2534,7 @@ export function RunView() {
               <span ref={statusRef} tabIndex={-1} className="rounded-md focus-visible:ring-2 focus-visible:ring-brand/60 focus:outline-none">
                 {pillStatus === "provider_unavailable" || pillStatus === "provider_outage"
                   ? <Badge tone="warning" dot>{parkLabel(run)}</Badge>
-                  : <StatusPill status={pillStatus} />}
+                  : <StatusPill health={run.health} status={pillStatus} recovery_wait_cause={run.recovery_wait_cause} recovery_retry_not_before={run.recovery_retry_not_before} />}
               </span>
               {/* PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action.
                   Both are QUEUED-ONLY (the pill self-hides on any other status; the action
@@ -2401,12 +2590,13 @@ export function RunView() {
                   <Button
                     size="sm"
                     disabled={busy}
-                    onClick={() =>
-                      act(async (isCurrent) => {
+                    onClick={() => {
+                      if (!confirmReserveResume(run)) return;
+                      void act(async (isCurrent) => {
                         await api.resumeRun(run.id);
                         if (isCurrent()) await refreshRun();
-                      })
-                    }
+                      });
+                    }}
                   >
                     ▶ Resume
                   </Button>
@@ -2430,21 +2620,31 @@ export function RunView() {
               {run.pause_requested_at && (
                 <span className="inline-flex flex-wrap items-center gap-2">
                   <Badge tone="info">{pauseRequestedLabel(run)}</Badge>
+                  {run.pause_mode === "reserve" && (
+                    // PRD #3522: the reserve's request cannot be withdrawn (the server 409s a
+                    // cancel), so no Cancel pause is offered; say how to get out of it instead.
+                    <span className="text-xs text-muted" data-pause-source="weekly_reserve">
+                      Set by your weekly usage reserve. Resume the run after it parks, or change the
+                      threshold in Run defaults.
+                    </span>
+                  )}
                   {canSteer && run.status === "running" && (
                     <>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        disabled={busy}
-                        onClick={() =>
-                          act(async () => {
-                            await api.cancelPause(run.id);
-                            await refreshRun();
-                          })
-                        }
-                      >
-                        Cancel pause
-                      </Button>
+                      {run.pause_mode !== "reserve" && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() =>
+                            act(async () => {
+                              await api.cancelPause(run.id);
+                              await refreshRun();
+                            })
+                          }
+                        >
+                          Cancel pause
+                        </Button>
+                      )}
                       {run.pause_mode !== "now" && (
                         <Button
                           variant="secondary"
@@ -2464,6 +2664,7 @@ export function RunView() {
                   )}
                 </span>
               )}
+              <ReserveExemptLine run={run} />
               {run.auto_approve && (
                 <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
                   autopilot
@@ -2554,9 +2755,14 @@ export function RunView() {
                   when resumed") ahead of it when the run carries a wall budget. */}
               {["paused", "limit_wait", "pool_wait", "recovery_wait"].includes(run.status) && run.started_at && <ParkedElapsed run={run} />}
               {/* PRD #1429 M4a / #1653 D-W5: the run's actual harness, the same round
-                  logo chip as the run list, on every run. Placed ahead of the model badge —
-                  which harness executed the run is more fundamental than which model within it. */}
+                  logo chip as the run list, on every run. Placed ahead of the
+                  lead-config chip, since which harness executed the run is more fundamental
+                  than which model and effort within it. */}
               <HarnessBadge harness={run.harness} />
+              {/* PRD #3244: the lead agent's model and effort on every status, replacing the
+                  PRD #300 schedule-model badge; pre-claim, claimed and unrecorded forms are
+                  all produced by leadConfigView. */}
+              <LeadConfigChip run={run} />
               {/* Which Anthropic credential this run spent (PRD #111 M1). Here in
                   the header rather than beside the usage panel because it must show
                   for every claimed run, and the usage panel only appears once a run
@@ -2567,18 +2773,9 @@ export function RunView() {
               {(run.credential_switch === "requested" || run.credential_switch === "released") && (
                 <RunCredentialOverride run={run} />
               )}
-              {/* PRD #300: the per-schedule model this run froze at fire time, shown on
-                  EVERY status (not just completed) so a wrong/typo'd model is visible on a
-                  FAILED or stopped run too (Risks / SC6). null = inherited the owner's
-                  per-user Worker default. */}
-              {run.model && (
-                <Badge tone="neutral" title="Model this run was fired with (frozen by its schedule)">
-                  model {stripUnsafeChars(run.model)}
-                </Badge>
-              )}
               {settingsStates.map(state => <Badge key={state} tone="neutral">{state}</Badge>)}
               {/* PRD #305: the frozen "apply model also to agents" flag, shown on EVERY
-                  status like the model badge (SC6) so a user can confirm a run applied its
+                  status (like the lead chip above) so a user can confirm a run applied its
                   model fleet-wide. Absent = pins won (today's default). */}
               {run.override_subagent_model && (
                 <Badge
@@ -2596,6 +2793,12 @@ export function RunView() {
       {actionErr && <Alert message={actionErr} />}
       <CompletionPending run={run} />
       <SemanticDrift run={run} />
+      {run.status !== "awaiting_approval" && (run.capability_provenance?.capabilities.length ?? 0) > 0 && (
+        <section aria-label="Run capability sources" className="rounded-xl border border-edge bg-surface p-4">
+          <h2 className="mb-2 text-sm font-semibold text-fg">Capability sources</h2>
+          <CapabilitySources provenance={run.capability_provenance} />
+        </section>
+      )}
       {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
           The panel that would word it has unmounted, so the page says it instead. */}
       {revisionMismatch && run.status !== "awaiting_approval" && (
@@ -2612,6 +2815,9 @@ export function RunView() {
           workers={workers}
           busy={busy}
           canSteer={canSteer}
+          repo={repo && repo.id === run.repo_id ? repo : undefined}
+          isAdmin={isAdmin}
+          onRepoRequiredCapabilities={onRepoRequiredCapabilities}
           revisionMismatch={revisionMismatch}
           onApprove={(selection, overrideCapabilities, expectedGateRevision, semanticApproval) =>
             void gateAct(expectedGateRevision, () =>
@@ -2790,6 +2996,7 @@ export function RunView() {
 
 
       <PoolWaitPanel run={run} canSteer={canSteer} onResumed={refreshRun} />
+      <ForgeOriginStatus cooldown={run.forge_origin_cooldown} />
       <RecoveryWaitPanel
         run={run}
         ownerProof={canSteer && confirmedOwner === true}
@@ -2990,7 +3197,7 @@ export function RunView() {
           nothing for every other kind. */}
       <JobResultPanel run={run} />
 
-      {(!(workerExhausted || memoryHeld) || canSteer) && <RecoveryArchivesPanel run={run} />}
+      {(!(forgeHeld || workerExhausted || memoryHeld || retainedRecovery) || canSteer) && <RecoveryArchivesPanel run={run} />}
 
       {/* Checkpoint salvage (PRD #1867): the bounded archive copy of a failed run's last
           published checkpoint at refs/uzi-salvage/<run-id>. Renders only for a failed run

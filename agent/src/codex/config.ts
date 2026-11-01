@@ -100,7 +100,6 @@ function nativeDisabledConfigLines(
     `code_mode_only = false`,
     `code_mode_host = ${codeModeHost}`,
     `code_mode_prewarm = false`,
-    `remote_models = false`,
     `unified_exec = false`,
     `hooks = false`,
     `multi_agent = false`,
@@ -118,12 +117,19 @@ function nativeDisabledConfigLines(
 /**
  * Build the `config.toml` TEXT with native effectful surfaces disabled (#1566 exceptions above).
  *
- * Configurable native effectful surfaces are pinned off: `project_doc_max_bytes
- * = 0`, `web_search = "disabled"`, analytics/feedback/agents off, the whole
- * `[features]` family (apps / plugins / shell_snapshot* / code_mode* / remote_models
- * / unified_exec / hooks / multi_agent* / enable_request_compression) off, and
- * `check_for_update_on_startup = false`. The canonical project is provisioned
- * explicitly `untrusted`. The provider block carries zero retries and no websockets.
+ * The controls emitted by nativeDisabledConfigLines disable native effectful
+ * surfaces, project docs, web search, analytics, feedback, agents and startup
+ * update checks. The canonical project is explicitly `untrusted`; the provider
+ * block carries zero retries and no websockets.
+ *
+ * `remote_models` remains a removed, useless
+ * compatibility flag, so it is omitted. Model metadata may refresh under the
+ * supported runtime authentication/discovery/cache policy; uzi's curated picker
+ * and validation policy remain independent of that metadata refresh.
+ * Upstream RemoteModels and Stage::Removed documentation:
+ * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/features/src/lib.rs
+ * Upstream should_refresh_models and refresh_after_auth_change:
+ * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/models-manager/src/manager.rs
  */
 export function buildCodexConfigToml(opts: CodexConfigOptions): string {
   const { model, provider, projectPath } = opts;
@@ -177,10 +183,10 @@ function validateProductionConfigOptions(opts: CodexProductionConfigOptions): vo
 /**
  * Build the fixed production config used with `account/login/start` authentication.
  *
- * The 0.163.0 built-in `openai` provider has `requires_openai_auth = true` and no
+ * The built-in `openai` provider has `requires_openai_auth = true` and no
  * configured base URL. That absence is load-bearing: API-key auth selects
  * `https://api.openai.com/v1`, while `chatgptAuthTokens` selects the ChatGPT Codex
- * backend. Version 0.163.0 merges configured providers with `or_insert`, so a caller cannot
+ * backend. The runtime merges configured providers with `or_insert`, so a caller cannot
  * override the built-in `openai` provider with a partial table. Its production request and
  * stream retry defaults therefore remain active by design; the zero-retry custom-provider
  * settings belong only to deterministic fake-provider tests.
@@ -200,7 +206,7 @@ export function buildCodexProductionConfigToml(opts: CodexProductionConfigOption
  * is deliberately separate from {@link buildCodexProductionConfigToml}: production
  * keeps the built-in `openai` provider and emits no endpoint override.
  *
- * Codex 0.163.0's built-in provider has WebSockets enabled and cannot be
+ * The built-in provider has WebSockets enabled and cannot be
  * overridden by a same-name provider table (`merge_configured_model_providers` uses
  * `or_insert`). Its app-server tests instead use a distinct custom provider with
  * `requires_openai_auth = true` and `supports_websockets = false`; this reproduces

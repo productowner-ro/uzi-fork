@@ -26,6 +26,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -48,8 +49,10 @@ var cliTestSecret = []byte("0123456789abcdef0123456789abcdef")
 // cliLiveDB builds a live-DB-backed Handler wired with the collaborators the ceiling
 // tests actually reach (wsvc for run reads, settings for /auth/me + the admin
 // settings read), plus its full Routes() router mounting the real RequireUser /
-// RequireAdminRO chain. The limiters are generous (these are not rate-limit tests).
-func cliLiveDB(t *testing.T) (*Handler, http.Handler, *pgxpool.Pool) {
+// RequireAdminRO chain. The vault stays unwired, as most suites expect; the vault
+// suite wires one via cliVaultLiveDB. The optional auth limiter lets vault tests
+// exercise the real per-user budget; other limiters are generous.
+func cliLiveDB(t *testing.T, authLimiters ...*mw.Limiter) (*Handler, http.Handler, *pgxpool.Pool) {
 	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -68,9 +71,10 @@ func cliLiveDB(t *testing.T) (*Handler, http.Handler, *pgxpool.Pool) {
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
 	h := &Handler{
-		pool: pool,
-		q:    q,
-		box:  box,
+		pool:  pool,
+		q:     q,
+		box:   box,
+		vault: vault.NewPostgres(box, pool),
 		cfg: config.Config{
 			JWTSecret:    cliTestSecret,
 			AuthTokenTTL: time.Hour,
@@ -79,8 +83,13 @@ func cliLiveDB(t *testing.T) (*Handler, http.Handler, *pgxpool.Pool) {
 		settings: settings.New(&settingsStore{}, time.Minute),
 		hub:      hub.New(),
 	}
+	h.wsvc.SetVault(h.vault)
 	lim := mw.NewLimiter(100000, time.Minute, nil)
-	router := h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
+	authLimiter := lim
+	if len(authLimiters) > 0 {
+		authLimiter = authLimiters[0]
+	}
+	router := h.Routes(authLimiter, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
 	return h, router, pool
 }
 
@@ -96,7 +105,7 @@ func cliMustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 func cliSeedUser(t *testing.T, pool *pgxpool.Pool, isAdmin bool) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
-	cliMustExec(t, pool, `INSERT INTO users (id, email, password_hash, is_admin) VALUES ($1, $2, 'x', $3)`,
+	cliMustExec(t, pool, `INSERT INTO users (id, email, password_hash, is_admin, vault_mode) VALUES ($1, $2, 'x', $3, 'unprotected')`,
 		id, fmt.Sprintf("cli-%s@e2e", id), isAdmin)
 	return id
 }
@@ -394,6 +403,7 @@ func TestCLICeilingTrioCrossUser404LiveDB(t *testing.T) {
 		"/api/runs/" + runID.String(),
 		"/api/runs/" + runID.String() + "/messages",
 		"/api/runs/" + runID.String() + "/review",
+		"/api/runs/" + runID.String() + "/lead-config", // PRD #3244 M3
 	}
 	for _, p := range paths {
 		// The ceiling: admin's uzc_ is owner-only ⇒ another user's run is 404.
@@ -700,8 +710,8 @@ func TestCLICSRFBypassShapeLiveDB(t *testing.T) {
 
 // -------------------------------------------------------------------------
 // (f) Admin surface: a uza_ reads all 9 admin GETs and is rejected by all 4 admin
-// writes; a uzc_ is rejected by every admin read; /api/vault/* rejects any CLI
-// token; live demotion of the owner kills the uza_'s admin reads with no revoke.
+// writes; a uzc_ is rejected by every admin read; live demotion of the owner
+// kills the uza_'s admin reads with no revoke. Vault access has its own suite.
 // -------------------------------------------------------------------------
 
 var adminReadPaths = []string{
@@ -755,14 +765,6 @@ func TestCLIAdminSurfaceLiveDB(t *testing.T) {
 		if rec := bearerReq(router, wr.method, wr.path, uza); rec.Code != http.StatusUnauthorized {
 			t.Errorf("uza_ %s %s = %d, want 401 (admin writes are cookie-only)\nbody: %s", wr.method, wr.path, rec.Code, rec.Body.String())
 		}
-	}
-
-	// /api/vault/* rejects any CLI token — the password surface is cookie-only.
-	if rec := bearerReq(router, http.MethodGet, "/api/vault/status", uza); rec.Code != http.StatusUnauthorized {
-		t.Errorf("uza_ GET /api/vault/status = %d, want 401 (vault is cookie-only)\nbody: %s", rec.Code, rec.Body.String())
-	}
-	if rec := bearerReq(router, http.MethodPost, "/api/vault/unlock", uzc); rec.Code != http.StatusUnauthorized {
-		t.Errorf("uzc_ POST /api/vault/unlock = %d, want 401 (vault is cookie-only)\nbody: %s", rec.Code, rec.Body.String())
 	}
 
 	// Live demotion: clearing the owner's is_admin makes the uza_'s admin reads fail

@@ -139,10 +139,21 @@ func (h *Handler) TestMySecret(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) testAnthropicSecret(ctx context.Context, userID, id uuid.UUID, rev int64) secretTestResult {
 	row, err := h.q.GetAnthropicTokenToPoll(ctx, store.GetAnthropicTokenToPollParams{UserID: userID, SecretID: pgconv.UUID(id)})
-	if err != nil || row.EnablementRev != rev {
+	if err != nil || row.ID != id || row.UserID != userID || row.EnablementRev != rev {
 		return secretTestResult{Status: "inconclusive", Reason: "superseded"}
 	}
-	plain, err := secretopen.OpenSealed(h.vault, h.box, userID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
+	plain, err := secretopen.OpenSealedAtEpoch(ctx, h.vault, h.box, userID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext, row.VaultEpoch)
+	if err == store.ErrVaultSealStale {
+		fresh, lookupErr := h.q.GetAnthropicTokenToPoll(ctx, store.GetAnthropicTokenToPollParams{UserID: userID, SecretID: pgconv.UUID(id)})
+		if lookupErr != nil || fresh.ID != row.ID || fresh.UserID != row.UserID ||
+			fresh.EnablementRev != row.EnablementRev || fresh.AnthropicSuccessGeneration != row.AnthropicSuccessGeneration {
+			return secretTestResult{Status: "inconclusive", Reason: "superseded"}
+		}
+		plain, err = secretopen.OpenSealedAtEpoch(ctx, h.vault, h.box, userID, store.KindAnthropicToken, fresh.SealedWith, fresh.Ciphertext, fresh.VaultEpoch)
+	}
+	if err == store.ErrVaultSealStale {
+		return secretTestResult{Status: "inconclusive", Reason: "superseded"}
+	}
 	if errors.Is(err, secretopen.ErrVaultLocked) {
 		return secretTestResult{Status: "inconclusive", Reason: "vault_locked"}
 	}
@@ -217,10 +228,17 @@ func (h *Handler) anthropicTestRejected(ctx context.Context, row store.GetAnthro
 }
 
 func (h *Handler) anthropicTestSuccess(ctx context.Context, row store.GetAnthropicTokenToPollRow, reading anthropic.Reading) secretTestResult {
+	// No 5-hour window (reading.FiveHour nil) stores NULL pct + reset.
+	var fhPct pgtype.Int2
+	var fhReset *time.Time
+	if reading.FiveHour != nil {
+		fhPct = pgtype.Int2{Int16: int16(reading.FiveHour.Pct), Valid: true} //nolint:gosec // G115: a rate-limit percentage (0-100), far within int16 range
+		fhReset = reading.FiveHour.ResetsAt
+	}
 	n, err := h.q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID: row.ID, UserID: row.UserID, EnablementRev: row.EnablementRev,
-		FiveHourPct:      pgtype.Int2{Int16: int16(reading.FiveHour.Pct), Valid: true}, //nolint:gosec // G115: a rate-limit percentage (0-100), far within int16 range
-		FiveHourResetsAt: pgconv.TimePtr(reading.FiveHour.ResetsAt),
+		FiveHourPct:      fhPct,
+		FiveHourResetsAt: pgconv.TimePtr(fhReset),
 		SevenDayPct:      pgtype.Int2{Int16: int16(reading.SevenDay.Pct), Valid: true}, //nolint:gosec // G115: a rate-limit percentage (0-100), far within int16 range
 		SevenDayResetsAt: pgconv.TimePtr(reading.SevenDay.ResetsAt),
 		Source:           pgconv.Text(reading.Source), SyncedAt: pgconv.Time(time.Now().UTC()),

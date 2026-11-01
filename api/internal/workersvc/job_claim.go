@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
@@ -151,7 +153,11 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 	if lanes, lerr := s.q.GetUserHarnessModelDefaults(ctx, run.UserID); lerr != nil {
 		slog.Warn("job claim: read user model defaults", "user", run.UserID.String(), "error", lerr)
 	} else {
-		defaultModel = textPtr(lanes.DefaultClaudeModel)
+		if lane := lanes.DefaultClaudeModel; lane.Valid && agenttmpl.CodexRoleModels[strings.TrimSpace(lane.String)] {
+			slog.Warn("job claim: dropped Codex role model from Claude lane", "run_id", run.ID.String(), "model", strings.TrimSpace(lane.String))
+		} else {
+			defaultModel = textPtr(lane)
+		}
 	}
 	if run.Model.Valid && harnessModelCompatible(Harness(run.Harness), run.Model.String) {
 		defaultModel = textPtr(run.Model)
@@ -191,24 +197,26 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		return nil, policyErr
 	}
 	return &ClaimPayload{
-		MemoryEpisode:           run.MemoryEpisode,
-		MemoryInterventionCount: run.MemoryInterventionCount,
-		MemoryPolicy:            frozenMemoryPolicy,
-		RunID:                   run.ID.String(),
-		Kind:                    run.Kind,
-		ClaimGeneration:         run.ClaimGeneration,
-		IssueTitle:              run.IssueTitle,
-		IssueDescription:        run.IssueDescription,
-		Status:                  run.Status,
-		Job:                     job,
-		BudgetWallSeconds:       &wall32,
-		LastSeq:                 run.LastSeq,
-		IterationCount:          run.IterationCount,
-		RequeueCount:            run.RequeueCount,
-		Secrets:                 ClaimSecrets{AnthropicOAuthToken: string(cred.Token)},
-		Agents:                  []ClaimAgent{},
-		Skills:                  skills,
-		SkillsDropped:           skillDrops,
-		Config:                  cfg,
+		MemoryEpisode:              run.MemoryEpisode,
+		MemoryInterventionCount:    run.MemoryInterventionCount,
+		MemoryPolicy:               frozenMemoryPolicy,
+		RunID:                      run.ID.String(),
+		Kind:                       run.Kind,
+		ClaimGeneration:            run.ClaimGeneration,
+		WorkerRecoveryEpisode:      claimRecoveryEpisode(run),
+		WorkerRecoveryOwnerEpisode: run.WorkerRecoveryEpisode,
+		IssueTitle:                 run.IssueTitle,
+		IssueDescription:           run.IssueDescription,
+		Status:                     run.Status,
+		Job:                        job,
+		BudgetWallSeconds:          &wall32,
+		LastSeq:                    run.LastSeq,
+		IterationCount:             run.IterationCount,
+		RequeueCount:               run.RequeueCount,
+		Secrets:                    ClaimSecrets{AnthropicOAuthToken: string(cred.Token)},
+		Agents:                     []ClaimAgent{},
+		Skills:                     skills,
+		SkillsDropped:              skillDrops,
+		Config:                     cfg,
 	}, nil
 }

@@ -57,6 +57,7 @@ var checkMeta = map[string]struct {
 	"forge.ciwatch":          {"owner", groupIntegrations, "CI watch capacity", ""},
 	"slack.socket":           {"owner", groupIntegrations, "Slack socket", ""},
 	"schedules.paused":       {"owner", groupHousekeeping, "Paused schedules", ""},
+	"maintenance.active":     {"instance", groupHousekeeping, "Maintenance mode", "instance-maintenance"},
 	"board.drift":            {"owner", groupHousekeeping, "Board drift", ""},
 	"custody.holds":          {"owner", groupHousekeeping, "Recovery custody holds", ""},
 	"recovery.storage":       {"owner", groupHousekeeping, "Recovery storage", ""},
@@ -94,7 +95,7 @@ func sincePtr(t time.Time) *string {
 
 // safe strips control bytes (incl. tabs/newlines) and bounds an untrusted identifier or
 // enum before it renders into an admin surface. CellText folds \t/\n to spaces and strips
-// terminal escapes / bidi overrides; SanitizeBounded then caps the length. The result
+// terminal control bytes / bidi overrides; SanitizeBounded then caps the length. The result
 // carries no control characters and is at most maxEvidenceBytes long.
 func safe(v string) string {
 	clean := termsafe.SanitizeBounded(termsafe.CellText(v), maxEvidenceBytes)
@@ -785,6 +786,7 @@ func (s *Service) checkQueueWaiting(ctx context.Context, now time.Time, health h
 			oldest = r.HealthSince.Time
 		}
 	}
+	s.presentQueue(ctx, &evidence)
 	c.Evidence = evidence.finish()
 	c.Severity = sevOK
 	c.Summary = "No run has been waiting for a worker longer than 10 minutes."
@@ -801,7 +803,7 @@ func (s *Service) checkQueueWaiting(ctx context.Context, now time.Time, health h
 		}
 		c.Summary = fmt.Sprintf("A run has been waiting for a worker for %s.", humanDur(now.Sub(oldest)))
 		c.Since = sincePtr(oldest)
-		c.Action = strPtr("Check fleet.capacity and fleet.roll — a stuck roll or zero capacity is the usual cause.")
+		c.Action = strPtr("Open the waiting run for details, then check Worker capacity and Worker image roll for availability or upgrade problems.")
 	}
 	if unknownAge && c.Severity != sevDanger {
 		c.Severity = sevUnknown
@@ -1184,6 +1186,70 @@ func (s *Service) checkSchedulesPaused(ctx context.Context, now time.Time) apity
 	c.Summary = fmt.Sprintf("%d user(s) have paused all schedules while owning enabled schedules.", n)
 	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Users", Value: fmt.Sprintf("%d", n)}}
 	c.Action = strPtr("Their labelled issues look queued but will not run until they unpause.")
+	return c
+}
+
+// maintenanceReasonMax matches store.IntakePauseReasonMax: the pause reason is already
+// sanitized and capped when written, and is re-bounded here so a value that slipped that gate
+// cannot render control bytes or an unbounded string into an admin surface.
+const maintenanceReasonMax = 280
+
+// checkMaintenanceActive warns while instance maintenance mode holds new runs back (PRD
+// #3454), with the pause's since/reason and the drain readout counts. A deleted singleton row
+// reads as paused (fail closed, as fn_instance_intake_paused does) and says so. A state read
+// error is unknown; a readout error keeps the warning (the state is known) without counts.
+func (s *Service) checkMaintenanceActive(ctx context.Context) apitypes.HealthCheckDTO {
+	c := s.base("maintenance.active")
+	missing := false
+	st, err := s.cfg.Store.GetInstanceIntakePause(ctx)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		missing = true
+		st = store.InstanceIntakePause{ID: true, Active: true}
+	case err != nil:
+		return degradeUnknown(c, "maintenance.active", err)
+	}
+	if !st.Active {
+		c.Severity = sevOK
+		c.Summary = "uzi is not in maintenance mode."
+		return c
+	}
+	c.Severity = sevWarn
+	if missing {
+		c.Summary = "The maintenance state row is missing, so new runs are held in the queue (a missing row reads as maintenance mode)."
+		c.Action = strPtr("Switch maintenance mode off in Admin Settings to re-create the state row and release the queue.")
+	} else {
+		c.Summary = "Maintenance mode is on: new runs wait in the queue."
+		if st.Reason.Valid {
+			if r := termsafe.SanitizeBounded(termsafe.CellText(st.Reason.String), maintenanceReasonMax); r != "" {
+				c.Summary += " Reason: " + r
+			}
+		}
+		c.Action = strPtr("Switch maintenance mode off in Admin Settings when the work is done; queued runs then start.")
+	}
+	if st.Since.Valid {
+		c.Since = sincePtr(st.Since.Time)
+	}
+	if s.cfg.MaintenanceReadout == nil {
+		return c
+	}
+	ro, rerr := s.cfg.MaintenanceReadout(ctx)
+	if rerr != nil {
+		slog.Warn("healthsvc: maintenance readout failed", "error", rerr)
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Readout", Value: "unavailable"})
+		return c
+	}
+	clear := "no"
+	if ro.Clear() {
+		clear = "yes"
+	}
+	c.Evidence = append(c.Evidence,
+		apitypes.HealthEvidenceDTO{Label: "Running", Value: fmt.Sprintf("%d", ro.Active.Count)},
+		apitypes.HealthEvidenceDTO{Label: "Held", Value: fmt.Sprintf("%d", ro.Held.Count)},
+		apitypes.HealthEvidenceDTO{Label: "Custody holds", Value: fmt.Sprintf("%d", ro.Custody.Count)},
+		apitypes.HealthEvidenceDTO{Label: "Queued", Value: fmt.Sprintf("%d", ro.Queued.Count)},
+		apitypes.HealthEvidenceDTO{Label: "Clear", Value: clear},
+	)
 	return c
 }
 

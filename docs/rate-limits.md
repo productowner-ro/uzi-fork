@@ -6,10 +6,17 @@ audience: user
 
 # Claude rate limits
 
-Anthropic caps every account against two rolling windows — **5-hour** and
-**7-day** — and once either is exhausted your runs queue until it resets.
-uzi reads both windows for you, server-side, using your own
+Anthropic caps every account against a rolling **7-day** window and, on plans
+that still have one, a rolling **5-hour** window. Once a window is exhausted,
+your runs queue until it resets. uzi reads the windows for you, server-side,
+using your own
 [Anthropic tokens](./anthropic-token.md), and shows them as live meters.
+
+Some plans have no 5-hour window (Anthropic removed it for them in late
+October 2026). For such a token Anthropic reports only the 7-day window, so
+uzi shows a single 7-day meter and no 5-hour row, and the `uzi` CLI lists the
+5-hour column as `-`. If Anthropic reports a 5-hour window for a token, both
+meters appear again with no change on your side.
 
 That covers a run that hasn't started yet. A run already **in progress**
 when it hits one of these windows is a different page —
@@ -116,10 +123,11 @@ interval. That reading carries a **Recorded at usage limit** badge and says
 so next to the timestamp, because the timestamp itself still shows the last
 poll, not this park.
 
-If your vault is locked, uzi can't open your tokens to poll them: your
+If your protected vault is locked, uzi can't open your tokens to poll them: your
 last known reading stays on screen but greys out and is marked **stale**
 (or explicitly **vault locked** on the admin page) until you unlock again.
-Nothing is lost, and nothing renders as a false zero.
+Nothing is lost, and nothing renders as a false zero. Off accounts do not need
+an unlock for polling; see [Vault choice](./anthropic-token.md#vault-choice).
 
 ## Choosing a token near its limit
 
@@ -201,6 +209,106 @@ or switch accounts.
 linked Codex subscription login produces a meter; an API-key-only default
 shows nothing here, and Settings says so next to the credential itself.
 
+### Temporary account admission waits
+
+Linked Codex subscription accounts normally have unlimited account admission.
+A model-reported rate limit temporarily delays new claims on that account.
+Overload needs reports from **two distinct runs within five minutes**; three
+retries in one run are insufficient. Idle time, silence, generic transport
+errors or 5xx responses, usage-quota exhaustion, authentication failures and
+a usage-meter GET returning 429 do not trigger this wait.
+
+The wait is shared by your saved aliases of the same verified account,
+including after refresh or re-import. Another authorized account remains
+independent; uzi does not rotate accounts automatically.
+
+| Evidence | Initial wait | Exponential cap before jitter | Quiet reset |
+|---|---|---|---|
+| Model rate limit | 30 seconds | 15 minutes | 30 minutes |
+| Repeated overload | 15 seconds | 5 minutes | 15 minutes |
+
+Each opening adds persisted positive jitter of 0–20%. The classes keep
+independent schedules; the later expiry controls, with rate limit winning a
+tie. Qualifying evidence during a class's active wait does not extend its
+expiry or advance its step. Quiet-reset clocks follow qualifying unique
+observations; a repeated overload vote does not extend its five-minute life.
+Recovery adds a stable spread per run, up to the opening wait's duration or
+60 seconds, whichever is smaller. A new episode cannot bring eligibility
+forward; after the finite recovery window, account admission is unlimited again.
+
+New runs stay **queued** while held. Already claimed subscription runs check
+the same canonical-account policy before each supported **new model dispatch**
+and wait in place, keeping their flight, session, positive claim generation,
+custody, gate presentation and pending feedback. Their lifecycle stays
+`claimed`, `running` or `awaiting_approval`. A turn already dispatched continues.
+There is no standing account seat limit, active counter, mid-turn pause or
+force-park. Claim/provisioning statement snapshots and operation reads can race
+concurrent cooldown evidence or credential/source updates; neither is atomic
+revocation or an account seat lock.
+
+For queued waits, your run detail, list, board and CLI show the current class
+and eligibility time, including recovery spread:
+
+- `waiting: provider reported a rate limit; account admission eligible after <time>`
+- `waiting: provider reported overload; account admission eligible after <time>`
+
+Eligibility is **not a promised start time**. The copy clears on a read after
+expiry; maintenance and account-unavailability reasons take precedence, with
+admission details available independently. Shared views and admin summaries
+for another owner omit these fields. There is no per-run Slack burst,
+account settings panel or Resume now override for this wait.
+
+For required blocked work in a claimed run, owner surfaces instead say
+`waiting for account cooldown`, with `account_cooldown_class` (`rate_limit`
+or `overload`) and `account_cooldown_eligible_at`. The absolute earliest time
+includes finite per-run spread and is not a promised dispatch time. This is
+`waiting_account_cooldown` health, not a lifecycle state or `waiting_worker`.
+Optional background advice cannot label an otherwise working root blocked.
+The display requires current ownership, positive generation, credential binding
+and revision source, plus an accepted active snapshot with a 45-second lease.
+Omission, lease/eligibility expiry or a source/status change clears it on an
+accepted fresh read. Foreign shared/admin summaries omit account class and time.
+Missing, disabled or unsupported optional snapshots (including an old API) mean
+specialized visibility is unknown; operation enforcement is independent.
+Independent faults, freshness warnings and near-spent wall budgets retain
+precedence. See [Run health](run-health.md#account-cooldown-waits).
+
+Each supported new dispatch needs fresh authorization: root planning and initial
+implementation, human and automatic revisions, prose/clarification continuations,
+classified-provider retries and fresh-session fallbacks; worker-created children;
+production advice for intent, plan, Now, delivery/PR description, judge and diff
+review; and both plan/code checker stages. An earlier admission is not reused.
+Native HTTP retries, tool continuations and possible compaction/internal requests
+inside a dispatched turn have no demonstrated worker seam. This does not gate
+every upstream request; native `multi_agent` and `multi_agent_v2` stay disabled.
+Caller-key evaluators and offline replay have no worker subscription authority.
+
+Waiting charges elapsed wall time or the existing whole-call deadline once,
+with the model idle watchdog disarmed and no fabricated progress, processing
+or productivity. It neither consumes nor creates an owner recovery grant.
+Cancel, reject, replacement revision, pause, wall deadlines and vault/ownership
+controls remain effective; Resume cannot bypass admission. Capture/checkpoint,
+refresh needed for preservation, tool settlement, persistence and teardown are
+not gated. Children wait independently within deadlines that include existing
+setup time, without an exemption, extension or parent-held permit; notification
+reading and settlement continue without a demultiplexer deadlock. Optional
+summaries may time out without dispatch.
+
+**An admission-service outage blocks the next dispatch of every negotiated
+subscription flight, including accounts with no known cooldown.** Already
+running turns and preservation continue under existing controls, budgets and
+deadlines. Never-negotiated flights retain legacy behavior; once negotiated,
+feature loss, clear/re-registration, transport errors, 5xx, malformed replies
+and an untyped route 404 cannot downgrade a flight to allow or fabricate a
+provider failure. See [upgrade and rollback limits](installation.md#codex-account-admission-upgrades)
+and the [durable operation boundary](../adr/1106-codex-harness.md#durable-model-operation-boundary-3531-2026-10-28).
+
+Queued maintenance and weekly reserve precedence, credential selection and
+worker slots remain independent; waiting can occupy a slot. Usage-window and
+account-unavailability parking, OpenAI API keys, Claude, chat, versioned jobs
+and isolated-lane eligibility keep their existing policy. There is no new
+provider streak, backoff policy, automatic account rotation or Retry-After use.
+
 ### Where to look
 
 | Surface | What you see |
@@ -230,7 +338,7 @@ re-derived by the client:
 | `no_reading` | A poll was attempted and failed, with nothing successful yet. |
 | `fresh` | A successful reading no older than 3× the poll interval. |
 | `stale` | A reading exists but has aged past that window — shown greyed rather than dropped. |
-| `vault_locked` | Your vault is locked, so uzi can't open the login to poll it; the last known reading stays visible, marked stale. |
+| `vault_locked` | Your protected vault is locked, so uzi can't open the login to poll it; the last known reading stays visible, marked stale. |
 | `credential_action_required` | The login needs re-authentication (re-import it) before polling can resume. |
 | `polling_disabled` | The operator has turned the Codex poller off entirely (`UZI_CODEX_USAGE_POLL_INTERVAL=0`); any retained reading shows as stale, since nothing will ever refresh it again. |
 
@@ -242,3 +350,127 @@ A user with **no linked Codex subscription account** — including one whose
 only saved Codex credential is an API key — sees no accounts at all here: no
 row, no placeholder meter, on any surface. That's the empty-set shape, not a
 status of its own.
+
+## Weekly usage reserve
+
+If you share one subscription between uzi and your own work, you can keep part
+of the weekly allowance untouched. The **weekly usage reserve** is a per-user
+threshold on the **7-day** window: while the credential a run would spend reads
+at or above it, uzi starts no new work on that credential and, optionally,
+pauses running runs at their next milestone. It is **off by default**; with no
+threshold set, nothing in this section applies to you.
+
+### Setting it
+
+| Surface | How |
+|---|---|
+| **Settings → Run defaults → Usage limits** | The **Keep a weekly usage reserve** switch, a threshold (a whole number from 1 to 100) and the pause-running toggle. |
+| **CLI** | `uzi settings reserve --threshold <1..100\|off> [--pause-running=true\|false]`. Omitting `--pause-running` keeps the stored value. `uzi settings get` ends with a `Weekly usage reserve:` line. |
+| **API** | `PUT /api/me/usage-reserve` with `{"threshold_pct": <1..100 or null>, "pause_running": <bool>}`. Both fields are required; `null` turns the reserve off. A `uzc_` Bearer token works. |
+
+**Also pause running runs** is on by default once a threshold is set. A change
+takes effect on the next claim and the next sweeper pass; it is not
+instantaneous. See [CLI](cli.md#weekly-usage-reserve) for the command.
+
+### What is measured
+
+- **Only the 7-day window counts.** The 5-hour window is ignored by the
+  reserve; a 5-hour exhaustion is still handled by
+  [`limit_wait`](run-limit-wait.md).
+- **A credential is held when its 7-day percent is at or above the
+  threshold** (`pct >= threshold`, compared on the unrounded reading), so a
+  70% threshold holds at exactly 70%.
+- **Claude:** the `seven_day` reading of the token the run would spend.
+- **Codex:** the account window whose reported duration is exactly 7 days,
+  whether it is the primary or the secondary window. Codex buckets carry no
+  model, so when several buckets report a weekly window the **highest** one
+  decides.
+
+### When the reading is unknown, new work holds
+
+With a threshold set, a reading that cannot be trusted reads as **unknown**
+and **holds** new work rather than silently dropping the protection. Unknown
+means:
+
+- no reading at all (not polled yet);
+- a **stale** reading, older than 3× the poll interval (the same rule as
+  [How fresh is this?](#how-fresh-is-this));
+- a reading synced **before** a 7-day reset that has since passed, because it
+  describes the old week: release waits for the next poll after the reset;
+- a **partial** reading, such as a successful poll with no weekly utilization
+  (Claude), or a weekly window whose percent is missing or invalid (Codex).
+
+Two consequences to plan for:
+
+- **Console API keys hold.** Every Anthropic credential is treated as metered,
+  because OAuth tokens and console API keys cannot be told apart reliably. A
+  console API key has no subscription usage to read, so with a threshold set
+  it reads unknown and holds new work. If a console key is the only Anthropic
+  credential you use, leave the reserve off.
+- **A disabled poller holds.** With the usage poller turned off
+  (`UZI_USAGE_POLL_INTERVAL=0` for Claude, `UZI_CODEX_USAGE_POLL_INTERVAL=0`
+  for Codex), no reading is ever fresh, so every subscription credential reads
+  unknown while a threshold is set. This is an operator setting; see
+  [Configuration](./configuration.md).
+
+An unknown reading holds **new work only**. It never pauses a run that is
+already running, so a poller outage cannot stop every active run.
+
+### What it holds
+
+A held run stays `queued`; it is not a new status and it does not touch the
+usage-limit counters or wall budget. A run is held when it would spend a
+credential that reads held or unknown:
+
+- **Every worker run kind except chat**: issue, task, prompt, self-improve,
+  CI-fix, MR-rework, job, judge and cross-check, whether started by hand, by a
+  schedule or as a resume.
+- **Chat is never gated.** It is the interactive use the reserve protects.
+- **Judge and self-improve** are gated on your judge-lane credential, and a
+  **cross-check** on its own credential, which is on the opposite harness from
+  the run it checks. A held checker keeps its deadline; if it expires, it
+  settles as an expired check does today.
+- **Not gated, by structure:** a Codex API-key alias and an OpenAI API key have
+  no subscription meter, so they are never held. A missing reading is never
+  used to decide this.
+- **The auto pool skips held tokens.** A run on [auto
+  credential selection](anthropic-token.md) can start on another pooled token
+  that reads below the threshold; it never leaves the pool or its pinning
+  rules to do so. It holds only when every pooled token is held or unknown.
+
+A previously started run's resume claim is gated only while **Also pause
+running runs** is on. With it off, started runs continue above the threshold
+and only never-started work stays held.
+
+### What you see
+
+A held queued run shows the reason `weekly usage reserve: 72% >= 70%`, or
+`weekly usage reserve: weekly usage unknown` when the reading is unknown. The
+run DTO carries it as `reserve_hold_reason`, with `queue_reason` set to
+`weekly_reserve` (`maintenance` wins when both apply). `uzi run get` prints a
+`RESERVE` row and a `QUEUE_REASON` row. The reason is written by the periodic
+sweeper, so it can appear a short while after the run is queued. It is dropped
+on the next pass once you clear the threshold, whatever the freshness of any
+reading. Turning the toggle off drops it only for a run that has already
+started; never-started work stays held. On `/api/v1/jobs` the job carries the
+reason as `reserve_hold_reason`, the fixed text `Waiting for the owner's weekly
+usage reserve.` without your usage figures, and leaves `queue_reason` to
+maintenance.
+
+Running runs pause after their current milestone and resume on a fresh reading
+below the threshold; see [Pausing and resuming a run](run-pause.md#paused-by-the-weekly-usage-reserve).
+
+### It is best effort
+
+The reserve is not a strict cap, and usage can exceed the threshold:
+
+- the poll lags (default 5 minutes), so a reading can trail real usage;
+- a pausing run first finishes its current milestone;
+- kinds that cannot pause mid-run (CI-fix, MR-rework, job, judge, cross-check,
+  interactive tasks) are held at admission only, and one already running
+  finishes;
+- chat is exempt;
+- a pause whose checkpoint fails lets the run continue and is re-requested at
+  the next boundary.
+
+Overshoot is not bounded.

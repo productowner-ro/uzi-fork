@@ -20,6 +20,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/theme"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -33,7 +34,8 @@ import (
 // tokens whose rate meters the user surfaced on the sidebar rail — the default
 // token always shows and is never listed; empty means default-only.
 type userSettingsDTO struct {
-	CrossCheckPins []crossCheckPinDTO `json:"cross_check_pins"`
+	VaultAutoReunlock bool               `json:"vault_auto_reunlock"`
+	CrossCheckPins    []crossCheckPinDTO `json:"cross_check_pins"`
 	// DefaultModel is DEPRECATED (PRD #1551 D2/D3): the retained model defaults now live
 	// in the two per-harness lanes below. On GET/PUT this legacy field is a PROJECTION of
 	// the lane for the effective harness (ResolveSettingsHarness), kept one release as a
@@ -86,6 +88,13 @@ type userSettingsDTO struct {
 	// JudgeModels is the read-only resolved view of both judge lanes (PRD #3245), ordered
 	// claude then codex. It is never accepted on a PUT.
 	JudgeModels []apitypes.ModelSettingCellDTO `json:"judge_models"`
+	// EffortSettings is the read-only resolved view of both ordinary effort preferences
+	// (PRD #3247), ordered claude then codex. It is never accepted on a PUT.
+	EffortSettings []apitypes.EffortSettingCellDTO `json:"effort_settings"`
+	// WeeklyReservePct and WeeklyReservePauseRunning are the weekly usage reserve (PRD
+	// #3522), read-only here: PUT /api/me/usage-reserve owns the write. null = off.
+	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
+	WeeklyReservePauseRunning bool `json:"weekly_reserve_pause_running"`
 }
 
 // userSettingsResponse reads the user's settings row (one GetUserSettings query,
@@ -149,6 +158,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	// needed (PRD #362 M2).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
+			VaultAutoReunlock:      settingsAutoReunlock(r),
 			CrossCheckPins:         pins,
 			DefaultModel:           textPtrValue(legacyModel.Valid, legacyModel.String),
 			DefaultClaudeModel:     textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
@@ -169,6 +179,11 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			Typeface:               textPtrValue(s.Typeface.Valid, s.Typeface.String),
 			DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
 			JudgeModels:            judgeModelCells(judgeLane, codexJudgeLane, instance),
+			EffortSettings: effortSettingCells(
+				textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
+				textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String)),
+			WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
+			WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
 		},
 	})
 }
@@ -209,7 +224,7 @@ func (h *Handler) GetMySettings(w http.ResponseWriter, r *http.Request) {
 // card and the Appearance theme picker save independently over the one endpoint
 // without clobbering each other. default_model is validated by the same
 // validateModel used for agent templates (PRD #17); default_effort by the
-// closed-enum validateEffort (PRD #617); theme by the same theme registry the
+// closed-enum validateDefaultEffort (PRD #617, #3247); theme by the same theme registry the
 // admin default surface uses (PRD #21), so no pair of write paths can drift.
 //
 // The handler runs in two phases: it DECODES + VALIDATES every present field
@@ -227,8 +242,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	// RawMessage distinguishes an absent field (nil) from a present null (the
 	// bytes `null`); a plain *string cannot, and absent must mean "unchanged".
 	var req struct {
-		CrossCheckPins json.RawMessage `json:"cross_check_pins"`
-		DefaultModel   json.RawMessage `json:"default_model"`
+		VaultAutoReunlock *bool           `json:"vault_auto_reunlock"`
+		CrossCheckPins    json.RawMessage `json:"cross_check_pins"`
+		DefaultModel      json.RawMessage `json:"default_model"`
 		// The two per-harness lanes (PRD #1551 M1 / D2), same absent/null/value tri-state
 		// as default_model: absent ⇒ lane unchanged, null ⇒ clear to inherit, a validated
 		// value ⇒ set. Cross-vocabulary rejection uses closed lists only (D3).
@@ -299,8 +315,8 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		// Closed-list cross-vocabulary guard (D3): a curated Codex id must not sit in the
-		// Claude lane. No prefix guessing — only the curated Codex ids are rejected.
+		// Closed-list cross-vocabulary guard: a known Codex role id must not sit in
+		// the Claude lane. Custom ids outside that shared set remain provider-validated.
 		if err := rejectCodexIDInClaudeLane("default_claude_model", v); err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
@@ -338,7 +354,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "invalid default_effort")
 			return
 		}
-		v, err := validateEffort(raw)
+		v, err := validateDefaultEffort(raw)
 		if err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
@@ -354,7 +370,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "invalid default_codex_effort")
 			return
 		}
-		v, err := validateEffort(raw)
+		v, err := validateDefaultEffort(raw)
 		if err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
@@ -597,6 +613,23 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	// single-column statement (PATCH semantics); the four appearance columns go in
 	// ONE atomic conditional UPDATE (no read-merge-write, so two concurrent saves
 	// of different fields cannot clobber each other).
+
+	if req.VaultAutoReunlock != nil {
+		if h.vault == nil {
+			httpx.Error(w, http.StatusServiceUnavailable, "vault not configured")
+			return
+		}
+		if !*req.VaultAutoReunlock {
+			clearVaultSlot(w)
+		}
+		if err := h.vault.SetAutoReunlock(r.Context(), vault.Snapshot(user), *req.VaultAutoReunlock); err != nil {
+			slog.Warn("vault preference failed", "phase", "set preference", "owner", user.ID)
+			httpx.Error(w, http.StatusServiceUnavailable, "vault preference could not be confirmed; retry")
+			return
+		}
+		user.VaultAutoReunlock = *req.VaultAutoReunlock
+		r = r.WithContext(mw.ContextWithUser(r.Context(), user))
+	}
 
 	if err := h.saveCrossCheckPins(r.Context(), pinPatches); err != nil {
 		slog.Error("save cross-check pins", "error", err)
@@ -982,12 +1015,6 @@ func validateHarness(raw *string) (pgtype.Text, error) {
 	}
 }
 
-// curatedCodexModels is the closed Codex model vocabulary (PRD #1551 D3), a hand-kept
-// mirror of workersvc.codexModels and the web CLAUDE_MODEL_ALIASES sibling. Used ONLY by
-// the closed-list cross-vocabulary guard: a value in this set is rejected from the Claude
-// lane. Deliberately NOT a prefix check — no `gpt-` guessing.
-var curatedCodexModels = agenttmpl.CuratedCodexModels
-
 // knownClaudeAliases is the closed Claude alias set the web ModelSelect curates
 // (CLAUDE_MODEL_ALIASES: opus, sonnet, haiku, fable). Used ONLY by the cross-vocabulary
 // guard: one of these is rejected from the Codex lane. A full custom Claude id (e.g.
@@ -995,11 +1022,13 @@ var curatedCodexModels = agenttmpl.CuratedCodexModels
 // `claude-` prefix check (D3).
 var knownClaudeAliases = agenttmpl.KnownClaudeAliases
 
-// rejectCodexIDInClaudeLane fails when a validated model value is a curated Codex id sitting
+// rejectCodexIDInClaudeLane fails when a validated model value is a Codex role id sitting
 // in a Claude-vocabulary field (PRD #1551 D3). A NULL/blank (clear) value never trips it.
 func rejectCodexIDInClaudeLane(field string, v pgtype.Text) error {
-	if v.Valid && curatedCodexModels[v.String] {
-		return fmt.Errorf("%s: %q is a Codex model id and cannot be a Claude model default", field, v.String)
+	if v.Valid {
+		if _, err := agenttmpl.ValidateClaudeLaneModel(v.String); err != nil {
+			return fmt.Errorf("%s: %w", field, err)
+		}
 	}
 	return nil
 }
@@ -1257,4 +1286,11 @@ func validateTypeface(v string) error {
 		return fmt.Errorf("typeface: must be one of %s, %s", theme.TypefaceSystem, theme.TypefacePlex)
 	}
 	return nil
+}
+
+// The authenticated users row carries this preference; GetUserSettings projects
+// model and appearance columns only. PUT updates the context after core confirms.
+func settingsAutoReunlock(r *http.Request) bool {
+	user, _ := mw.UserFromContext(r.Context())
+	return user.VaultAutoReunlock
 }

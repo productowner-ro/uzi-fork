@@ -91,7 +91,7 @@ func (t pgxClaimFinishTx) Rollback(ctx context.Context) error { return t.tx.Roll
 // nor a transactional store there is no fenced writer, so it refuses rather than falling back.
 func (s *Service) beginClaimFinish(ctx context.Context) (claimFinishTx, error) {
 	if s.txBeginner != nil {
-		tx, err := s.txBeginner.Begin(ctx)
+		tx, err := s.beginReadCommitted(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -161,8 +161,12 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 		return nil, nil
 	}
 	assemblyErr = claudeCheckerClaimError(run, assemblyErr)
-	transient := errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
-		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing)
+	// errReserveHeld (PRD #3522 M3) is transient like errVaultLocked: the run returns to queued with
+	// the visible reserve reason. It is deliberately NOT mapped by claudeCheckerClaimError, so a held
+	// Claude checker stays queued and expires through its own cc.deadline_at path.
+	transient := errors.Is(assemblyErr, store.ErrVaultSealStale) || errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
+		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing) ||
+		errors.Is(assemblyErr, errReserveHeld)
 	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
 	// transient nor terminal, so it must pass this early return to reach the fenced park.
 	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) &&
@@ -216,7 +220,7 @@ func isClaudeCheckerChild(run store.Run) bool {
 // carries no credential detail. The finalizer selects the stage-specific failure
 // reason; the sentinel retains its legacy plan text. Other run shapes return err unchanged.
 func claudeCheckerClaimError(run store.Run, err error) error {
-	if err == nil || !isClaudeCheckerChild(run) || errors.Is(err, errVaultLocked) {
+	if err == nil || !isClaudeCheckerChild(run) || errors.Is(err, errVaultLocked) || errors.Is(err, store.ErrVaultSealStale) {
 		return err
 	}
 	if errors.Is(err, errCredentialUnavailable) || errors.Is(err, errCredentialDisabled) || errors.Is(err, errAutoPoolEmpty) {
@@ -235,6 +239,18 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		return nil, "", err
 	}
 	defer func() { _ = q.Rollback(ctx) }()
+	if len(run.CheckpointCoordinates) > 0 {
+		live, ok := q.(pgxClaimFinishTx)
+		if !ok {
+			return nil, "", errClaimRecoveryNoTx
+		}
+		if _, err := live.GetWorkerForUpdate(ctx, identity.workerID); err != nil {
+			return nil, "", err
+		}
+		if err := live.OptInCheckpointCoordinates(ctx); err != nil {
+			return nil, "", err
+		}
+	}
 	// Intrinsic pin failures and every Claude checker claim enter lead-first: the
 	// locked credential re-check may decide the check. The persisted stage selects
 	// the verdict lock and settlement before the child row is locked.
@@ -380,10 +396,37 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		}
 	}
 	if decision == nil {
-		if err := q.Commit(ctx); err != nil {
-			return nil, "", err
+		if locked.Kind == runkind.Task && len(locked.CheckpointCoordinates) > 0 && payload != nil {
+			live, ok := q.(pgxClaimFinishTx)
+			if !ok {
+				return nil, "", errClaimRecoveryNoTx
+			}
+			// A fresh READ COMMITTED statement after the run lock observes confirmation
+			// and attempt admission together. False is evidence only at this admission.
+			projection, err := live.GetClaimCheckpointRecovery(ctx, locked.ID)
+			if err != nil {
+				return nil, "", err
+			}
+			payload.CheckpointTip = textPtr(projection.CheckpointTip)
+			payload.CheckpointAttestedSource = textPtr(projection.CheckpointAttestedSource)
+			payload.CheckpointWriteUnresolved = &projection.CheckpointWriteUnresolved
 		}
-		return payload, "", nil
+		// Issue #3396: measure the final payload, after every projection above, so a claim
+		// that would exceed the worker's read cap fails here with a clear reason instead of
+		// being delivered and refused. The exact-claim identity checks above already ran
+		// against this payload, so the terminal path below settles this exact mint.
+		if serr := s.refuseOversizeRunClaim(payload); serr != nil {
+			if !errors.Is(serr, errClaimTooLarge) {
+				return nil, "", serr // a marshal error is not this classification: roll back
+			}
+			decision, origin = serr, "provisioning_failed"
+			holdClass, transient = false, false
+		} else {
+			if err := q.Commit(ctx); err != nil {
+				return nil, "", err
+			}
+			return payload, "", nil
+		}
 	}
 
 	expected := 0
@@ -474,7 +517,9 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	case transient:
 		n, err = q.RequeueClaimAssemblyExact(ctx, store.RequeueClaimAssemblyExactParams{
 			PoolWait: errors.Is(decision, errAutoPoolEmpty),
-			ID:       run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+			// PRD #3522 M3: persisted only for a reserve hold; NULL leaves the column as it is.
+			ReserveHoldReason: pgconv.TextOrNull(reserveHeldReasonOf(decision)),
+			ID:                run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
 		})
 	default:
 		failureReason := decision.Error()
@@ -569,7 +614,7 @@ func claimAssemblyOrigin(err error) string {
 		return "guardrail_blocked"
 	case errors.Is(err, errCredentialUnavailable):
 		return "credential_unavailable"
-	case errors.Is(err, errToolPackagesRejected):
+	case errors.Is(err, errToolPackagesRejected), errors.Is(err, errClaimTooLarge):
 		return "provisioning_failed"
 	// ErrCrossCheckRefused is a separate sentinel grouped under the same origin; the legacy
 	// mr_rework refusal arrives via errGuardrailBlockedClaim (legacyReviewClaimError).

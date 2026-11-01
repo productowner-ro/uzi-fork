@@ -1,3 +1,4 @@
+import { terminalSealMaterial } from "../src/codex/executor-lifetime.js";
 import { summaryOwnership } from "../src/codex/summary-ownership.js";
 import { provisionNative } from "./codex-provision-fixture.js";
 import { provisionRunTools } from "../src/provision-run.js";
@@ -6,7 +7,7 @@ import { m3Calls } from "./m3-recovery-fixture.js";
 import { PARK_RUN_CONTINUATION } from "../src/park-run.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
 import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
-import { describe, it, mock } from "node:test";
+import { describe, it, mock, type TestContext } from "node:test";
 import { dependencyWaitQuestion, dependencyWaitAnswer, dependencyWaitProgress, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import assert from "node:assert/strict";
 import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWallRunner } from "./dependency-wait-runner-fixture.js";
@@ -63,8 +64,10 @@ import { GitCache, assertCaptureLaunch } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
+import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
+import { PlanRevisionRecovery } from "../src/plan-revision-retry.js";
 import { WORKER_UID, RUNNER_UID, runnerCommand, commandRootCommand } from "../src/runner-uid.js";
 import { gitEnv } from "../src/git.js";
 import { forgeToolNames } from "../src/forge-tools.js";
@@ -94,6 +97,7 @@ import { followSuccessfulPush as m2FollowPush } from "./publication-fixture.js";
 import { shutdownContentProof } from "./shutdown-3101-content-fixture.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { closingDirectiveFor as m2ClosingDirective } from "../src/pr-description.js";
+import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
@@ -102,6 +106,7 @@ import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_L
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
+import { CommandCacheStartError } from "../src/codex/launcher.js";
 import { isBrokerModelCommand, type CapturedMemoryContext, type SpawnCommandOptions } from "../src/codex/broker.js";
 import { WorkerMemoryCommands } from "../src/worker-memory-commands.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
@@ -109,7 +114,8 @@ import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/p
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
-import type { AgentTemplate, MilestoneProgress } from "../src/protocol.js";
+import type { AgentTemplate, ClaimConfig, LeadConfigReportBody, MilestoneProgress } from "../src/protocol.js";
+import { LeadConfigReporter, leadConfigActive } from "../src/lead-config-report.js";
 import { EpochCleanupUnprovenError, type BoundaryRequest, type BoundaryPermit } from "../src/harness.js";
 import type { CodexExecutionSafetyImpl } from "../src/codex/safety.js";
 import type {
@@ -128,6 +134,15 @@ import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } f
 
 /** Issue #1718: every implement prompt now ends with the roster line; makeCtx has no agents. */
 const NO_SUBAGENTS_BLOCK = "\n\nNo subagents are available; do the work yourself.";
+
+/** Issue #3462: a zero-evidence idle trip is an ordinary, non-provider-origin recovery. */
+const recoveryMessage = "provider sent no model output within the idle timeout";
+const isRecovery = (error: unknown): boolean => {
+  assert.ok(error instanceof TransientRecoveryError, String(error));
+  assert.equal(error.message, recoveryMessage);
+  assert.equal(error.providerOrigin, false);
+  return true;
+};
 
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production CodexExecutor + the claim-aware
 // DARK selection seam, driven with an in-memory transport and scripted app-server frames
@@ -804,7 +819,7 @@ describe("M3 actual runner memory Codex delivery", () => {
         const time = performance.now();
         return { available: true, sampleId: ++sampleId, startedAtMs: time, completedAtMs: time,
           currentBytes: usage, limitBytes: 1000,
-          stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+          stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
           pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
             full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
       } },
@@ -988,6 +1003,12 @@ describe("M3 actual runner memory Codex delivery", () => {
             return dispose(...args);
           });
           await withTimeout(running, lateCapture ? 1500 : 3000, "memory deadline must not await Codex captureTail");
+          if (!lateCapture) {
+            // Public deadline expiry does not order capture settlement before executor cleanup.
+            assert.ok(memory.operation, "late cleanup retains the original capture operation");
+            await withTimeout(memory.operation, 6000, "late-cleanup capture settlement");
+            await waitFor(() => cleanupEntered, "late-cleanup executor finally remains gated", 6000);
+          }
           assert.equal(memory.settled === true, !lateCapture,
             "cover both pending capture and capture already settled beneath pending executor cleanup");
           assert.equal(runner.isExecuting(f.claim.run_id), true);
@@ -1037,7 +1058,7 @@ describe("M3 actual runner memory Codex delivery", () => {
             "m3-thread", "m3-turn", "m3-retry-call"));
           await waitFor(() => !!response(23962), "held retry callback");
           assert.equal(rec(rec(response(23962)).result).success, false);
-          assert.match(JSON.stringify(response(23962)), /Shell admission is held/);
+          assert.match(JSON.stringify(response(23962)), /Shell admission is pressure-held/);
           assert.equal(modelLaunches, 1, "held retry never launches a fake root");
           const beforeLow = f.samples();
           f.pressure(100);
@@ -2546,7 +2567,13 @@ describe("ordinary teardown capture eligibility", () => {
       const initialSafety = exec.safety;
       exec["epochSafeties"].set(registry, facade);
       exec["unverifiedEpochRegistries"].add(registry);
-      if (mode === "already-disposed" || mode === "already-disposed-no-facade") assert.equal((await registry.disposeTools(1000)).kind, "disposed");
+      if (mode === "already-disposed" || mode === "already-disposed-no-facade") {
+        const closed = await registry.quiesceChildren(1000);
+        assert.equal(closed.kind, "quiescent");
+        if (closed.kind !== "quiescent") throw new Error("prior drain did not quiesce");
+        assert.equal((await registry.reapProcesses(1000, closed.epoch)).kind, "observed_empty");
+        assert.equal((await registry.disposeTools(1000)).kind, "disposed");
+      }
       const harness = mode === "harness-cleanup"
         ? { close: async () => { throw new Error("harness cleanup unconfirmed"); } } as unknown as CodexHarness : undefined;
       const fileop = mode === "fileop-cleanup"
@@ -2565,6 +2592,10 @@ describe("ordinary teardown capture eligibility", () => {
       }
       if (mode === "foreign-facade") {
         const foreign = new ExecutionRegistry(newLocalExecutionEpoch(2853));
+        const closed = await foreign.quiesceChildren(1000);
+        assert.equal(closed.kind, "quiescent");
+        if (closed.kind !== "quiescent") throw new Error("foreign drain did not quiesce");
+        assert.equal((await foreign.reapProcesses(1000, closed.epoch)).kind, "observed_empty");
         assert.equal((await foreign.disposeTools(1000)).kind, "disposed");
         exec.safety = createCodexExecutionSafety(foreign, async () => { throw new Error("no foreign spawn"); });
       }
@@ -2599,12 +2630,13 @@ describe("ordinary teardown capture eligibility", () => {
           unverifiedAfterTeardown: !successful, unverifiedAfterSecond: !successful,
           unverifiedAfterCapture: !successful, oldFacadeTrackedAfterCapture: !successful,
           result: successful ? "observed_empty" : "incomplete", actions: successful ? 1 : 0,
-          reapsAfterFirst: repeated ? 1 : 0, reapsAfterCapture: repeated ? 1 : 0,
+          reapsAfterFirst: 1, reapsAfterCapture: 1,
           injected: mode === "late-reservation-repeat",
           admissionState: mode === "late-reservation-repeat" ? "closed" : undefined,
-          admission: mode === "late-reservation-repeat" ? "reserved" : undefined,
+          admission: mode === "late-reservation-repeat" ? "denied" : undefined,
           registered: undefined, lateReaps: 0, lateDisposals: 0, roots: 1, pending: 0,
-          state: "disposed", poison: false, initialSafetyUndefined: !repeated,
+          state: mode === "late-reservation-repeat" ? "poisoned" : "disposed",
+          poison: mode === "late-reservation-repeat", initialSafetyUndefined: !repeated,
           releases: 0, refreshes: 0, launches: 0, probes: 0,
         }, "B2-R1: only proven clean repeats may forget the old epoch and admit capture");
       }
@@ -2623,10 +2655,11 @@ describe("ordinary teardown capture eligibility", () => {
         assert.deepEqual(facts, {
           clean: false, unverifiedAfterTeardown: true, unverifiedAfterCapture: true,
           result: "incomplete", actions: 0, injected: true, admissionState: "closed",
-          admission: "reserved", registered: reservationOnly ? undefined : true,
-          initialReaps: 1, lateReaps: 0, lateDisposals: reservationOnly ? 0 : 1,
-          roots: reservationOnly ? 1 : 2, pending: 0,
-          state: "disposed", poison: false, releases: 0, refreshes: 0, launches: 0, probes: 0,
+          admission: mode === "late-reap-root" ? "reserved" : "denied",
+          registered: mode === "late-reap-root" ? true : undefined,
+          initialReaps: 1, lateReaps: 0, lateDisposals: mode === "late-reap-root" ? 1 : 0,
+          roots: mode === "late-reap-root" ? 2 : 1, pending: 0,
+          state: "poisoned", poison: true, releases: 0, refreshes: 0, launches: 0, probes: 0,
         });
       } else if (mode === "clean" || mode === "clean-repeat") {
         assert.deepEqual(result, { kind: "observed_empty", value: "local-only" });
@@ -3956,9 +3989,12 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     try {
       await assert.rejects(
         withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "idle run"),
-        /idle timeout/,
+        (error: Error) => error instanceof TransientRecoveryError && !error.providerOrigin,
       );
       assert.equal(lateTerminalDelivered, true, "the idle trip wins despite delivery of a late terminal");
+      await tick();
+      assert.equal(rig.transport.turnStartCount, 1, "a late terminal cannot start a second turn");
+      assert.equal(rig.sessionOps.persist, 1, "the idle recovery settles once");
     } finally {
       removeAbortListener();
     }
@@ -4709,40 +4745,53 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     assert.ok(emitted.some((m) => m.payload.event === "resume_lineage_break"));
   });
 
-  it("(13) the fileop helper is spawned with a SCRUBBED, replaced env (no inherited secrets)", async () => {
-    const rig = makeRig();
-    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
-    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "fileop run");
-    assert.equal(rig.fileopSpawns.length, 1);
-    const spawn0 = rig.fileopSpawns[0];
-    assert.ok(spawn0);
-    const env = spawn0.env;
-    // No packages provisioned in this rig (the real provisionRunTools is a no-op with no
-    // config.tool_packages), so the command env is exactly the fixed scrubbed keys — no
-    // folded nix vars, and the PATH is the fixed toolchain+system boundary (item 6). Issue
-    // #1716 adds the worker's two-pair git trust: reset safe.directory, then trust only the
-    // checkout. WORKSPACE does not exist, so the canonical path is the ENOENT fallback.
-    assert.deepEqual(
-      Object.keys(env).sort(),
-      [
-        "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_VALUE_1",
-        "HOME", "LANG", "PATH", "TMPDIR",
-      ],
-      "exactly the scrubbed keys",
-    );
-    assert.equal(env.GIT_CONFIG_COUNT, "2");
-    assert.equal(env.GIT_CONFIG_KEY_0, "safe.directory");
-    assert.equal(env.GIT_CONFIG_VALUE_0, "", "pair 0 resets every inherited safe.directory entry");
-    assert.equal(env.GIT_CONFIG_KEY_1, "safe.directory");
-    assert.equal(env.GIT_CONFIG_VALUE_1, path.resolve(WORKSPACE), "pair 1 trusts only the run's checkout");
-    assert.equal(env.PATH, "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    assert.equal(env.LANG, "C");
-    assert.match(String(env.HOME), /^\/tmp\/uzi-codex-command-/);
-    assert.equal(env.TMPDIR, env.HOME, "one random Landlock-allowed tmp per command root");
-    // Nothing inherited from the worker: no PAT/token/provider credential shape.
-    assert.doesNotMatch(JSON.stringify(env), new RegExp(FRESH_TOKEN + "|run-cap|claim-tok"));
-    assert.equal(spawn0.worktreePath, WORKSPACE);
-  });
+  for (const sqlcDir of [undefined, "/synthetic/uzi-sqlc-cache"]) {
+    it(`(13) the fileop helper is spawned with a SCRUBBED, replaced env (no inherited secrets) (UZI_SQLC_DIR ${sqlcDir === undefined ? "absent" : "present"})`, async () => {
+      const savedSqlcDir = process.env.UZI_SQLC_DIR;
+      try {
+        if (sqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = sqlcDir;
+        const rig = makeRig();
+        rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "fileop run");
+        assert.equal(rig.fileopSpawns.length, 1);
+        const spawn0 = rig.fileopSpawns[0];
+        assert.ok(spawn0);
+        const env = spawn0.env;
+        // No packages provisioned in this rig (the real provisionRunTools is a no-op with no
+        // config.tool_packages), so the command env is exactly the fixed scrubbed keys — no
+        // folded nix vars, and the PATH is the fixed toolchain+system boundary (item 6). Issue
+        // #1716 adds the worker's two-pair git trust: reset safe.directory, then trust only the
+        // checkout. WORKSPACE does not exist, so the canonical path is the ENOENT fallback.
+        assert.deepEqual(
+          Object.keys(env).sort(),
+          [
+            "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_VALUE_1",
+            "HOME", "LANG", "PATH", "TMPDIR",
+            ...(sqlcDir === undefined ? [] : ["UZI_SQLC_DIR"]),
+          ],
+          "exactly the scrubbed keys",
+        );
+        assert.equal(Object.hasOwn(env, "UZI_SQLC_DIR"), sqlcDir !== undefined);
+        assert.equal(env.UZI_SQLC_DIR, sqlcDir);
+        assert.equal(env.GIT_CONFIG_COUNT, "2");
+        assert.equal(env.GIT_CONFIG_KEY_0, "safe.directory");
+        assert.equal(env.GIT_CONFIG_VALUE_0, "", "pair 0 resets every inherited safe.directory entry");
+        assert.equal(env.GIT_CONFIG_KEY_1, "safe.directory");
+        assert.equal(env.GIT_CONFIG_VALUE_1, path.resolve(WORKSPACE), "pair 1 trusts only the run's checkout");
+        assert.equal(env.PATH, "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        assert.equal(env.LANG, "C");
+        assert.match(String(env.HOME), /^\/tmp\/uzi-codex-command-/);
+        assert.equal(env.TMPDIR, env.HOME, "one random Landlock-allowed tmp per command root");
+        // Nothing inherited from the worker: no PAT/token/provider credential shape.
+        assert.doesNotMatch(JSON.stringify(env), new RegExp(FRESH_TOKEN + "|run-cap|claim-tok"));
+        assert.equal(spawn0.worktreePath, WORKSPACE);
+      } finally {
+        if (savedSqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = savedSqlcDir;
+      }
+    });
+  }
 
   it("(14) terminal cleanup reaps the registry roots, persists the session, and NEVER removes the store (m4-3)", async () => {
     const rig = makeRig();
@@ -5106,7 +5155,7 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
           await new Promise<void>(resolve => setTimeout(resolve, IDLE_MS + 50));
           assert.equal(parks, route === "refused wall" ? 1 : 0, "current callback suppresses idle without a stale wall park");
           fresh.settleCallback(current.token, "ok");
-          await assert.rejects(withTimeout(running, 2000, "idle after current callback settles"), /codex run idle timeout/);
+          await assert.rejects(withTimeout(running, 2000, "idle after current callback settles"), isRecovery);
           assert.equal(parks, route === "refused wall" ? 1 : 0, "idle does not consume the newer wall budget");
         } finally {
           ExecutionRegistry.prototype.subscribeCallbacks = subscribe;
@@ -5225,6 +5274,51 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     } else assert.ok("value" in result && result.value.branch);
     assert.ok(!JSON.stringify(emitted).includes("PRIVATE"));
     assert.equal(rig.transport.turnStartCount, 2, "one root and one child, no policy retry");
+  });
+
+  it("admission signals follow the production child wrapper with pre-dispatch identity, exact binding and class deduplication", async t => {
+    const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
+    const sent: import("../src/codex/admission-signal.js").AdmissionSignal[] = [];
+    const reporter = new CodexAdmissionReporter(7, () => true, async body => { sent.push(body); return 204; });
+    const identities = new Map<string, string>();
+    const begin = reporter.begin.bind(reporter);
+    t.mock.method(reporter, "begin", (thread: string) => {
+      const attempt = begin(thread);
+      identities.set(thread, attempt.id);
+      return attempt;
+    });
+    const error = (info: string, th: string, tn: string): CodexNotification => ({
+      kind: "codex_error", method: "error", threadId: th, turnId: tn, willRetry: true,
+      params: { threadId: th, turnId: tn, willRetry: true, error: { codexErrorInfo: info } },
+    });
+    const responder = delegationResponder((transport, th, tn) => {
+      assert.match(identities.get(th)!, /^[0-9a-f-]{36}$/, "identity exists inside actual child turn/start");
+      transport.push(error("rateLimitExceeded", th, "stale"))
+        .push(error("rateLimitExceeded", th, tn))
+        .push(error("rateLimitExceeded", th, tn))
+        .push({ ...turnCompleted("failed", th, tn), params: { threadId: th, turn: { id: tn, status: "failed",
+          error: { codexErrorInfo: "serverOverloaded" } } } });
+    });
+    const rig = makeRig({ responder });
+    const getterCalls: unknown[][] = [];
+    Object.assign(rig.client, { codexAdmissionReporter: (...args: unknown[]) => {
+      getterCalls.push(args); return args[1] === 7 ? reporter : undefined;
+    } });
+    rig.transport.push(threadStarted()).push(spawn(1, "admission-child", { subagent_type: "coder", prompt: "work" }));
+    const { ctx } = makeCtx({ agents, claimGeneration: 7 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await finishRoot(rig, [1]);
+      const result = await withTimeout(running, 3000, "admission child integration");
+      await tick();
+      assert.ok(result.branch, "child provider failure preserves the root result");
+      assert.deepEqual(getterCalls, [[ctx.runId, 7]]);
+      assert.deepEqual(sent.map(body => body.class), ["rate_limit", "overload"]);
+      assert.ok(sent.every(body => body.provider_thread_id === "th-child-1" &&
+        body.provider_turn_id === "tn-th-child-1" &&
+        body.attempt_id === identities.get("th-child-1") && body.claim_generation === 7));
+      assert.notEqual(identities.get("th-1"), identities.get("th-child-1"));
+    } finally { reporter.seal(true); rig.transport.end(); await running.catch(() => {}); }
   });
 
   const DISPATCH_ID = /^cx-[0-9a-f]{12}-t\d+-/;
@@ -5752,6 +5846,172 @@ describe("CodexExecutor: m1 response usage", () => {
     assert.ok(terminal);
     for (const m of usage) assert.ok(emitted.indexOf(m) < emitted.indexOf(terminal));
     assert.equal(rig.transport.turnStartCount, 2, "one root turn and one child turn");
+  });
+});
+
+// PRD #3247 preservation: these pass on the pre-change tree and pin that a claim with no
+// default_effort keeps every Codex wire request free of an `effort` key.
+describe("CodexExecutor: no default_effort on the claim leaves the effort key off every wire request (preservation)", () => {
+  it("root thread/start, root turn/start and a delegated child turn/start carry no effort key", async () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport.push(turnCompleted("completed", "th-child", "tn-child"));
+        return { turn: { id: "tn-child" } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
+    const { ctx } = makeCtx({ agents, config: { default_model: "gpt-6.1-sol" } });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply");
+    rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await withTimeout(runP, 3000, "no-effort delegation run");
+
+    const turns = rig.transport.requests.filter((request) => request.method === "turn/start");
+    const threads = rig.transport.requests.filter((request) => request.method === "thread/start");
+    assert.equal(turns.length, 2, "one root turn and one child turn");
+    assert.equal(threads.length, 2, "one root thread and one child thread");
+    for (const request of [...turns, ...threads]) {
+      assert.equal(Object.hasOwn(rec(request.params), "effort"), false, `${request.method} carries no effort key`);
+    }
+  });
+});
+
+// PRD #3247 M2: Codex catalog probe + unsupported-level policy through the executor.
+describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", () => {
+  const opt = (reasoningEffort: string) => ({ reasoningEffort, description: "d" });
+  const catalog = (model: string, levels: string[]) =>
+    ({ data: [{ id: model, model, supportedReasoningEfforts: levels.map(opt), defaultReasoningEffort: "medium" }] });
+  const NOTE_EVENT = "effort_not_in_catalog";
+
+  async function run(opts: {
+    effort?: string; model?: string; list: (c: ResponderCtx) => unknown; timeoutMs?: number;
+    rejectTurn?: boolean; sessionId?: string; providerModel?: string; rejectResume?: boolean;
+  }) {
+    let emittedRef: { kind: string; payload: Record<string, unknown> }[] = [];
+    const log: string[] = [];
+    const rig = makeRig({ responder: (c) => {
+      if (c.method === "model/list") { log.push("model/list"); return opts.list(c); }
+      if (c.method === "turn/start") {
+        log.push(`turn/start:notes=${emittedRef.filter((m) => m.payload.event === NOTE_EVENT).length}`);
+        return { turn: { id: "tn-1" } };
+      }
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      return {};
+    } });
+    if (opts.rejectTurn) {
+      rig.transport.requestOverride = (c) => c.method === "turn/start"
+        ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" }))
+        : undefined;
+    }
+    if (opts.rejectResume) {
+      rig.transport.requestOverride = (c) => c.method === "thread/resume"
+        ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" }))
+        : undefined;
+    }
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx, emitted } = makeCtx({
+      config: { ...(opts.effort !== undefined ? { default_effort: opts.effort as never } : {}), ...(opts.model ? { default_model: opts.model } : {}) },
+      ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+    });
+    emittedRef = emitted as never;
+    const executor = makeExecutor({ ...rig, deps: { ...rig.deps, catalogProbeTimeoutMs: opts.timeoutMs ?? 10 } }, bindingOf(SUBSCRIPTION), noopLog, undefined,
+      opts.providerModel ? { ...provider, model: opts.providerModel } : provider);
+    let error: unknown;
+    try { await withTimeout(executor.run(ctx), 3000, "catalog probe run"); } catch (e) { error = e; }
+    const notes = (emitted as { payload: Record<string, unknown> }[]).filter((m) => m.payload.event === NOTE_EVENT);
+    return { rig, notes, log, error };
+  }
+
+  it("lists low..xhigh, claim effort max: one note before the first turn/start, level sent unchanged", async () => {
+    const { rig, notes, log, error } = await run({
+      effort: "max", model: "example-model", list: () => catalog("example-model", ["low", "medium", "high", "xhigh"]),
+    });
+    assert.equal(error, undefined);
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0]!.payload.text,
+      "Codex does not list reasoning effort max for example-model. uzi sends it unchanged; the provider may reject it. Choose a listed level or Runtime default.");
+    assert.deepEqual(log, ["model/list", "turn/start:notes=1"]);
+    const turns = rig.transport.requests.filter((r) => r.method === "turn/start");
+    assert.equal(turns.length, 1);
+    assert.equal(rec(turns[0]!.params).effort, "max");
+    const list = rig.transport.requests.find((r) => r.method === "model/list");
+    assert.deepEqual(list?.params, { limit: 200, includeHidden: true });
+  });
+
+  it("sanitizes the model id in the note", async () => {
+    const hostile = "evil\u001b[31m\nmodel";
+    const { notes } = await run({ effort: "max", providerModel: hostile, list: () => catalog(hostile, ["low"]) });
+    assert.equal(notes.length, 1);
+    const text = String(notes[0]!.payload.text);
+    assert.ok(!text.includes("\u001b") && !text.includes("\n"), "control characters are replaced");
+  });
+
+  it("a provider rejection of turn/start fails the run through the normal path with exactly one turn/start", async () => {
+    const { rig, notes, error } = await run({
+      effort: "max", list: () => catalog("gpt-6-astra", ["low", "high"]), rejectTurn: true,
+    });
+    assert.ok(error instanceof Error, "the run fails");
+    assert.equal(notes.length, 1);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1);
+  });
+
+  const quiet: [string, Parameters<typeof run>[0]][] = [
+    ["a listed level", { effort: "high", list: () => catalog("gpt-6-astra", ["low", "high"]) }],
+    ["Runtime default (no default_effort): the probe is never called", { list: () => { throw new Error("must not be called"); } }],
+    ["no matching entry", { effort: "max", list: () => catalog("other-model", ["low"]) }],
+    ["oversized data", { effort: "max", list: () => ({ data: Array.from({ length: 201 }, () => ({ id: "gpt-6-astra", model: "gpt-6-astra", supportedReasoningEfforts: [opt("low")] })) }) }],
+    ["a malformed entry (efforts not an array)", { effort: "max", list: () => ({ data: [{ id: "gpt-6-astra", model: "gpt-6-astra", supportedReasoningEfforts: "low" }] }) }],
+    ["an overlong effort string", { effort: "max", list: () => ({ data: [{ id: "gpt-6-astra", model: "gpt-6-astra", supportedReasoningEfforts: ["x".repeat(17)] }] }) }],
+    ["an unanswered model/list (10 ms timeout)", { effort: "max", list: () => new Promise(() => undefined) }],
+    ["a rejected model/list", { effort: "max", list: () => Promise.reject(new Error("boom")) }],
+  ];
+  for (const [name, input] of quiet) {
+    it(`emits no note and the turn proceeds: ${name}`, async () => {
+      const { rig, notes, error } = await run(input);
+      assert.equal(error, undefined);
+      assert.equal(notes.length, 0);
+      const turns = rig.transport.requests.filter((r) => r.method === "turn/start");
+      assert.equal(turns.length, 1);
+      assert.equal(rec(turns[0]!.params).effort, input.effort);
+      const listed = rig.transport.requests.filter((r) => r.method === "model/list").length;
+      assert.equal(listed, input.effort === undefined ? 0 : 1);
+    });
+  }
+
+  it("a recreated later epoch in the same run sends no second model/list", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "checkpoint")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    rig.deps = { ...rig.deps, catalogProbeTimeoutMs: 10 };
+    const { ctx } = makeCtx({ config: { default_effort: "max" as never }, checkpoint: async () => undefined });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "two-epoch run");
+    assert.equal(rig.providerLaunches(), 2, "a second epoch was really built");
+    const listed = rig.epochs.map((e) => e.transport.requests.filter((r) => r.method === "model/list").length);
+    assert.deepEqual(listed, [1, 0]);
+    assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "turn/start"));
+  });
+
+  it("a resume rejection fallback probes at most once and sends one root turn/start", async () => {
+    const { rig, error } = await run({
+      effort: "max", list: () => catalog("gpt-6-astra", ["high"]), sessionId: "claimed-thread", rejectResume: true,
+    });
+    assert.equal(error, undefined);
+    assert.ok(rig.transport.requests.some((r) => r.method === "thread/resume"));
+    assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 1);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1);
   });
 });
 
@@ -7835,7 +8095,11 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
       assert.ok(turnTexts(rig, 0)[0]!.includes(issueDescription), "planning received all four issue criteria");
       assert.equal(rig.providerLaunches(), 2, "normal approval epoch recreation retained");
       const request = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
-      return (request.params as { input: { text: string }[] }).input[0]!.text;
+      const prompt = (request.params as { input: { text: string }[] }).input[0]!.text;
+      const normalized = prompt.replace(/\s+/g, " ");
+      assert.ok(normalized.includes("it supersedes the plan you drafted in this thread and, except for in-scope additions the approval advice above permits, the issue text; do not re-plan or resubmit it."));
+      assert.ok(!normalized.includes("supersedes the issue text and the plan you drafted"));
+      return prompt;
     }
     const baseline = await capture();
     assert.equal(await capture(null), baseline);
@@ -8950,6 +9214,27 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.TMPDIR, "/private/tmp");
   });
 
+  it("issue #3382: applies the configured Go concurrency after the toolEnv fold, and adds no key when unset", () => {
+    const tool = { PATH: "/provisioned/go/bin", GOFLAGS: "-toolexec=evil", GOMAXPROCS: "99" };
+    try {
+      configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+      const set = buildCommandEnv("/private/tmp", tool);
+      assert.equal(set.GOFLAGS, "-p=2");
+      assert.equal(set.GOMAXPROCS, "3");
+      assert.equal(set.PATH, `${FIXED_PATH}:/provisioned/go/bin`);
+      configureGoConcurrency({ maxProcs: 4 });
+      const partial = buildCommandEnv("/private/tmp", {});
+      assert.equal(partial.GOMAXPROCS, "4");
+      assert.equal(Object.hasOwn(partial, "GOFLAGS"), false);
+      configureGoConcurrency({});
+      const unset = buildCommandEnv("/private/tmp", {});
+      assert.equal(Object.hasOwn(unset, "GOFLAGS"), false);
+      assert.equal(Object.hasOwn(unset, "GOMAXPROCS"), false);
+    } finally {
+      configureGoConcurrency({});
+    }
+  });
+
   it("with no provisioned PATH the fixed boundary PATH stands alone", () => {
     assert.equal(buildCommandEnv("/private/tmp", {}).PATH, FIXED_PATH);
   });
@@ -9010,6 +9295,50 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.LOCALE_ARCHIVE, "/nix/locale-archive");
     assert.equal(env.UZI_CODEX_COMMANDENV_CANARY, undefined, "process.env is not inherited into the credential-free command identity");
   });
+
+  // Issue #3382: asserted at the launch seams of a real executor run (the fileop root's launch
+  // spec and the env the command seam receives), with a provisioned toolEnv in play.
+  for (const [label, settings, expected] of [
+    ["both set", { buildParallelism: 2, maxProcs: 3 }, { GOFLAGS: "-p=2", GOMAXPROCS: "3" }],
+    ["unset", {}, {}],
+  ] as const) {
+    it(`issue #3382: run() launches commands with the configured Go concurrency (${label}) next to a provisioned toolEnv`, async () => {
+      const rig = makeRig();
+      rig.deps = {
+        ...rig.deps,
+        provisionRunTools: async () => ({
+          toolEnv: { PATH: "/provisioned/go/bin" } as Record<string, string>,
+        }),
+      };
+      rig.transport
+        .push(threadStarted())
+        .push(toolCall(1, "Bash", { command: "go build ./..." }, "th-1", "tn-1", "c-go"))
+        .push(signalDone())
+        .push(turnCompleted("completed"))
+        .end();
+      try {
+        configureGoConcurrency(settings);
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "go concurrency run");
+      } finally {
+        configureGoConcurrency({});
+      }
+      assert.equal(rig.fileopSpawns.length, 1);
+      assert.equal(rig.spawnCommandCalls.length, 1, "the Bash effect reached the command seam");
+      const launched = [
+        rig.fileopSpawns[0]!.env,
+        (rig.spawnCommandCalls[0]!.opts as { env: NodeJS.ProcessEnv }).env,
+      ];
+      for (const env of launched) {
+        assert.ok(String(env.PATH).includes("/provisioned/go/bin"), "the provisioned PATH rides in the same env");
+        assert.equal(env.GOFLAGS, (expected as { GOFLAGS?: string }).GOFLAGS);
+        assert.equal(env.GOMAXPROCS, (expected as { GOMAXPROCS?: string }).GOMAXPROCS);
+        if (label === "unset") {
+          assert.equal(Object.hasOwn(env, "GOFLAGS"), false, "an unset setting adds no GOFLAGS key");
+          assert.equal(Object.hasOwn(env, "GOMAXPROCS"), false);
+        }
+      }
+    });
+  }
 
   // PRD #1493 M3 (part C) — the sandbox mode in the emitted --mode token comes ONLY from the
   // worker Config, never from a UZI_CODEX_COMMAND_SANDBOX value smuggled through the
@@ -9481,7 +9810,7 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
               env: { PATH: "/usr/bin:/bin" }, timeout: 10_000, encoding: "utf8",
               input: frames.map(frame => JSON.stringify(frame) + "\n").join(""),
             });
-            assert.equal(result.status, 0, result.stderr || result.error?.message);
+            assert.equal(result.status, 0, result.stderr || result.error?.message || "child failed without stderr or error");
             const replies = result.stdout.trim().split("\n").map(line => JSON.parse(line));
             assert.equal(replies.length, frames.length);
             assert.equal(replies[0].id, 1);
@@ -9502,7 +9831,7 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
             const confined = spawnSync(sandbox.command, sandbox.args, {
               env: { PATH: "/usr/bin:/bin" }, timeout: 10_000, encoding: "utf8",
             });
-            assert.equal(confined.status, 0, confined.stderr || confined.error?.message);
+            assert.equal(confined.status, 0, confined.stderr || confined.error?.message || "child failed without stderr or error");
             assert.equal(confined.stdout, "sandbox-control-ok");
             assert.equal(await fs.readFile(file, "utf8"), bytes.toString());
             assert.equal(await fs.readFile(sentinel, "utf8"), canary);
@@ -9736,6 +10065,7 @@ describe("production advice data teardown (#2324)", () => {
       let swapped = false;
       const pin = mock.method(fs, "stat", async (...args: Parameters<typeof fs.stat>) => {
         const result = await originalStat(...args);
+        assert.ok(result, "fs.stat resolved without stats");
         if (!swapped && String(result.ino) === String(identity.ino) && String(result.dev) === String(identity.dev) && args[1]?.bigint) {
           swapped = true;
           uidScript(runnerCommand, "const fs=require('node:fs');fs.renameSync(process.argv[1],process.argv[1]+'.retained');fs.mkdirSync(process.argv[1]);fs.writeFileSync(process.argv[1]+'/planted','keep')", owned);
@@ -10017,6 +10347,14 @@ describe("production session-seed cleanup (#2324)", () => {
     let adopted = 0;
     const deps: CodexExecutorDeps = {
       ...rig.deps,
+      // Issue #3642: the idle and wall timers are armed before the harness lazily
+      // launches the provider root, so this real-filesystem seeding (4,400 sequential
+      // writes) and the production seed teardown run inside the turn. A trip does not
+      // interrupt the seam; it replaces the launcher sentinel's error, so makeRig's
+      // incidental 5 s budgets could mask the result on a slow filesystem. Test-only:
+      // production defaults are unchanged and the 120 s per-test timeout still bounds this.
+      idleMs: 60_000,
+      wallMs: 60_000,
       launchProviderRoot: async () => { throw launchSentinel; },
       provisionRunTools: async () => ({ toolEnv: {} }),
       spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
@@ -11668,8 +12006,12 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     const proof = exec["completedCaptures"].get(registry);
     assert.ok(proof);
     assert.deepEqual(c.holder.releases, []);
-    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
-    assert.equal(registry.state(), "disposed", "public terminal disposal actually ran");
+    const disposed = await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
+    assert.equal(disposed.kind, "incomplete", "pre-existing uncertainty refuses disposal proof");
+    assert.equal(registry.state(), "poisoned");
+    assert.equal(registry.isPoisoned(), true);
+    assert.ok(registry.poisonErrors().some(error => error.message === "pre-existing cleanup uncertainty"),
+      "terminal disposal retains the original fault");
     assert.equal(exec["completedCaptures"].get(registry), proof, "no substitute proof");
     assert.equal(registry.acceptsCompletedCapture(proof), false);
     assert.deepEqual(c.holder.releases, [false], "public terminal settlement retains the cache");
@@ -11735,20 +12077,361 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     assert.deepEqual(c.holder.releases, [true], "the partial epoch's fileop root was reaped clean before the release");
   });
 
+  // Issue #3675 m2: the run's cache is measured after commands and rotated to a fresh holder once it
+  // reaches the budget. Driven through the PRODUCTION command seam (spawnCommand undefined) with a
+  // DISTINCT fake holder per start, an injected measurement over a byte counter that each cached
+  // command root "writes" to, and gates (never sleeps) for every ordering.
+  describe("command cache rotation (issue #3675)", () => {
+    const PER_COMMAND = 600;
+    const BUDGET = 1000;
+    const REMOVED_RESULT: CacheCleanupResult = { state: "removed", reason: "" };
+    interface Gate<T = void> { promise: Promise<T>; resolve(value: T): void }
+    function gate<T = void>(): Gate<T> {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((r) => { resolve = r; });
+      return { promise, resolve };
+    }
+    interface RotHolder {
+      holder: CommandCacheHolder;
+      token: string;
+      dir: string;
+      releases: boolean[];
+      close: Gate<CacheCleanupResult>;
+      die(): void;
+    }
+    function rotHolder(token: string, mode: "removed" | "pending", result?: CacheCleanupResult): RotHolder {
+      const dir = `/var/cache/uzi-codex-cmd/${token}`;
+      let alive = true;
+      const releases: boolean[] = [];
+      const close = gate<CacheCleanupResult>();
+      return {
+        token, dir, releases, close,
+        // A dead holder's process has closed without a verdict.
+        die: () => { alive = false; close.resolve({ state: "error", reason: "exited" }); },
+        holder: {
+          token, path: dir, alive: () => alive,
+          release: async (drained) => {
+            releases.push(drained);
+            alive = false;
+            if (mode === "pending") return { state: "pending", reason: "", settlement: close.promise };
+            const outcome = result ?? REMOVED_RESULT;
+            close.resolve(outcome);
+            return outcome;
+          },
+        },
+      };
+    }
+
+    interface RotRig extends CacheRig {
+      holders: RotHolder[];
+      starts: string[];
+      measured: string[];
+      bytes: Map<string, number>;
+      removeAnswers: CacheCleanupResult[];
+      /** Hold back the nth (0-based) start until resolved. */
+      gateStart(n: number): Gate;
+      /** Make the nth start throw this after announcing its helper. */
+      failStart(n: number, error: unknown, close: Gate<CacheCleanupResult>): void;
+      /** Hold back the nth measurement until resolved with the byte count to report. */
+      gateMeasure(n: number): Gate;
+      dirOf(commandIndex: number): string | undefined;
+    }
+    function rotationRig(opts: {
+      holderMode?: "removed" | "pending";
+      unclean?: (index: number, spec: CodexEffectLaunchSpec) => boolean;
+      onLaunch?: (index: number, rig: RotRig) => void;
+      remove?: () => CacheCleanupResult;
+    } = {}): RotRig {
+      const base = cacheRig({ unclean: opts.unclean });
+      const holders: RotHolder[] = [];
+      const starts: string[] = [];
+      const measured: string[] = [];
+      const bytes = new Map<string, number>();
+      const startGates = new Map<number, Gate>();
+      const startFailures = new Map<number, { error: unknown; close: Gate<CacheCleanupResult> }>();
+      const measureGates = new Map<number, Gate>();
+      const removeAnswers: CacheCleanupResult[] = [];
+      const rr: RotRig = {
+        ...base, holders, starts, measured, bytes, removeAnswers,
+        gateStart: (n) => { const g = gate(); startGates.set(n, g); return g; },
+        failStart: (n, error, close) => { startFailures.set(n, { error, close }); },
+        gateMeasure: (n) => { const g = gate(); measureGates.set(n, g); return g; },
+        dirOf: (i) => {
+          const spec = base.specs[i];
+          const at = spec?.args.indexOf("--cache") ?? -1;
+          return spec !== undefined && at >= 0 ? spec.args[at + 1] : undefined;
+        },
+      };
+      const launch = base.rig.deps.launchEffectRoot!;
+      base.rig.deps = {
+        ...base.rig.deps,
+        commandCacheRunBytes: BUDGET,
+        cacheMeasureMinIntervalMs: 0,
+        startCacheHolder: async (token, startOpts) => {
+          const n = starts.length;
+          starts.push(token);
+          const h = rotHolder(token, opts.holderMode ?? "removed");
+          holders.push(h);
+          if (n > 0) startOpts?.onSpawned?.(startFailures.get(n)?.close.promise ?? h.close.promise);
+          await startGates.get(n)?.promise;
+          const failure = startFailures.get(n);
+          if (failure) throw failure.error;
+          return h.holder;
+        },
+        measureCommandCache: async (token) => {
+          const n = measured.length;
+          measured.push(token);
+          await measureGates.get(n)?.promise;
+          return { state: "complete", bytes: bytes.get(`/var/cache/uzi-codex-cmd/${token}`) ?? 0 };
+        },
+        removeCommandCache: async (token) => {
+          base.events.push("remove");
+          base.removals.push(token);
+          const answer = opts.remove?.() ?? REMOVED_RESULT;
+          removeAnswers.push(answer);
+          return answer;
+        },
+        launchEffectRoot: async (spec, ...rest) => {
+          const at = spec.args.indexOf("--cache");
+          if (at >= 0 && !spec.args.includes(ENV_PROBE_SCRIPT)) {
+            const dir = spec.args[at + 1]!;
+            bytes.set(dir, (bytes.get(dir) ?? 0) + PER_COMMAND);
+          }
+          opts.onLaunch?.(base.specs.length, rr);
+          return launch(spec, ...rest);
+        },
+      };
+      return rr;
+    }
+    function driver(c: RotRig) {
+      const t = c.rig.transport;
+      let seq = 0;
+      t.push(threadStarted());
+      return {
+        bash: (command: string): void => { t.push(toolCall(10 + seq, "Bash", { command }, "th-1", "tn-1", `c-rot-${seq}`)); seq++; },
+        finish: (): void => { t.push(signalDone()).push(turnCompleted("completed")).end(); },
+      };
+    }
+    const executorFor = (c: RotRig, log: Logger = noopLog): CodexExecutor => makeExecutor(c.rig, bindingOf(SUBSCRIPTION), log);
+
+    it("REGRESSION 3675: an over-budget cache rotates; later commands carry the new holder's dir, the old one is never reused and is released only once idle", async () => {
+      const c = rotationRig();
+      const d = driver(c);
+      const exec = executorFor(c);
+      const running = exec.run(makeCtx().ctx);
+      d.bash("echo one");
+      d.bash("echo two");
+      await waitFor(() => c.starts.length === 2, "the replacement holder to start");
+      const g1 = c.holders[0]!;
+      const g2 = c.holders[1]!;
+      assert.equal(c.dirOf(1), g1.dir);
+      assert.equal(c.dirOf(2), g1.dir, "the pending generation keeps admitting until the replacement is adopted");
+      await waitFor(() => g1.releases.length === 1, "G1 to retire");
+      assert.deepEqual(g1.releases, [true], "released drained only after its last root was disposed");
+      assert.equal(c.specs.length, 3, "no command was launched meanwhile");
+      d.bash("echo three");
+      await waitFor(() => c.specs.length === 4, "the third command");
+      assert.equal(c.dirOf(3), g2.dir, "later command specs carry G2's dir");
+      d.finish();
+      await withTimeout(running, 3000, "rotation run");
+      assert.deepEqual(c.specs.filter((s) => s.args.includes(g1.dir)).length, 2, "G1 was never reacquired");
+      assert.deepEqual(g1.releases, [true]);
+      assert.deepEqual(g2.releases, [true], "G2 is released at terminal teardown");
+      assert.deepEqual(c.removals, []);
+      assert.equal(c.starts.length, 2);
+    });
+
+    it("G1 to G2 to G3: closes stay unresolved, no concurrent extra replacement, the seal waits for them", async () => {
+      const c = rotationRig({ holderMode: "pending" });
+      const d = driver(c);
+      const exec = executorFor(c);
+      const running = exec.run(makeCtx().ctx);
+      d.bash("echo one");
+      d.bash("echo two");
+      await waitFor(() => c.starts.length === 2, "G2 start");
+      const [g1, g2] = c.holders as [RotHolder, RotHolder];
+      await waitFor(() => g1.releases.length === 1, "G1 retired");
+      // G1's close is its own (pending) settlement; it is fully removed before the second switch.
+      g1.close.resolve(REMOVED_RESULT);
+      await tick();
+      assert.equal(c.starts.length, 2, "exactly one replacement so far");
+      d.bash("echo three");
+      d.bash("echo four");
+      await waitFor(() => c.starts.length === 3, "G3 start");
+      const g3 = c.holders[2]!;
+      await waitFor(() => g2.releases.length === 1, "G2 retired after G3 was adopted");
+      d.bash("echo five");
+      await waitFor(() => c.specs.length === 6, "the fifth command");
+      assert.equal(c.dirOf(5), g3.dir);
+      d.finish();
+      await withTimeout(running, 3000, "G1-G2-G3 run");
+      assert.equal(c.starts.length, 3, "startCacheHolder called exactly 3 times");
+      assert.deepEqual(g2.releases, [true]);
+      assert.deepEqual(g3.releases, [true], "terminal drainage releases G3 exactly once");
+      let sealed = false;
+      const sealing = exec.sealLifetime({}).then((value) => { sealed = true; return value; });
+      await tick(); await tick();
+      assert.equal(sealed, false, "the seal waits for G2's and G3's closes");
+      g2.close.resolve(REMOVED_RESULT);
+      await tick(); await tick();
+      assert.equal(sealed, false, "and for G3's");
+      g3.close.resolve(REMOVED_RESULT);
+      assert.equal((await sealing).kind, "sealed");
+    });
+
+    it("holder loss after a rotation: later commands get no cache; the lost holder is removed by token at the terminal settle", async () => {
+      const c = rotationRig();
+      const d = driver(c);
+      const exec = executorFor(c);
+      const running = exec.run(makeCtx().ctx);
+      d.bash("echo one");
+      d.bash("echo two");
+      await waitFor(() => c.holders.length === 2 && c.holders[0]!.releases.length === 1, "G1 retired");
+      const g2 = c.holders[1]!;
+      d.bash("echo three");
+      await waitFor(() => c.specs.length === 4, "a G2 command");
+      assert.equal(c.dirOf(3), g2.dir);
+      g2.die();
+      d.bash("echo four");
+      await waitFor(() => c.specs.length === 5, "a command after the loss");
+      assert.equal(c.dirOf(4), undefined, "no --cache once the current holder is gone");
+      d.finish();
+      await withTimeout(running, 3000, "holder loss run");
+      assert.deepEqual(c.removals, [g2.token], "terminal settle removes only the lost G2");
+      assert.deepEqual(c.holders[0]!.releases, [true]);
+      assert.deepEqual(g2.releases, []);
+      assert.equal((await exec.sealLifetime({})).kind, "sealed");
+    });
+
+    describe("negative controls", () => {
+      async function lostRun(remove: () => CacheCleanupResult) {
+        const c = rotationRig({ remove });
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.holders.length === 2 && c.holders[0]!.releases.length === 1, "G1 retired");
+        const g2 = c.holders[1]!;
+        g2.die();
+        d.bash("echo three");
+        await waitFor(() => c.specs.length === 4, "an uncached command");
+        d.finish();
+        await withTimeout(running, 3000, "lost run");
+        return { c, exec, g2 };
+      }
+
+      it("a removal that stays pending forever never seals", async () => {
+        const { exec } = await lostRun(() => ({ state: "pending", reason: "", settlement: new Promise<CacheCleanupResult>(() => undefined) }));
+        let settled = false;
+        void exec.sealLifetime({}).then(() => { settled = true; });
+        await tick(); await tick(); await tick();
+        assert.equal(settled, false, "no seal inside the observed window, and never sealed");
+      });
+
+      it("a retained/live or errored removal is unproven", async () => {
+        for (const answer of [
+          { state: "retained", reason: "live" },
+          { state: "error", reason: "protocol" },
+        ] as const) {
+          const { exec } = await lostRun(() => answer);
+          assert.equal((await exec.sealLifetime({})).kind, "unproven", answer.state);
+        }
+      });
+
+      it("a lost holder with an unclean root is retained without a removal, and unproven", async () => {
+        const c = rotationRig({ unclean: (i) => i === 3 });
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.holders.length === 2 && c.holders[0]!.releases.length === 1, "G1 retired");
+        d.bash("echo three");
+        await waitFor(() => c.specs.length === 4, "an unclean G2 command");
+        c.holders[1]!.die();
+        d.finish();
+        await withTimeout(running.catch(() => undefined), 3000, "unclean lost run");
+        assert.deepEqual(c.removals, []);
+        assert.deepEqual(c.holders[1]!.releases, []);
+        assert.equal((await exec.sealLifetime({})).kind, "unproven");
+      });
+
+      it("the positive scenario plus an independent distrust is still unproven", async () => {
+        const c = rotationRig();
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        d.finish();
+        await withTimeout(running, 3000, "distrust run");
+        (exec as unknown as { lifetime: { distrust(): void } }).lifetime.distrust();
+        assert.equal((await exec.sealLifetime({})).kind, "unproven");
+      });
+
+      it("a failed replacement start whose helper closes retained is unproven, and seals only after that close", async () => {
+        const c = rotationRig();
+        const close = gate<CacheCleanupResult>();
+        c.failStart(1, new CommandCacheStartError("timeout", close.promise), close);
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.starts.length === 1 + 1, "the replacement attempt");
+        d.bash("echo three");
+        await waitFor(() => c.specs.length === 4, "a command on the still-current G1");
+        assert.equal(c.dirOf(3), c.holders[0]!.dir, "a failed replacement never changes admission");
+        d.finish();
+        await withTimeout(running, 3000, "failed replacement run");
+        let settled = false;
+        const sealing = exec.sealLifetime({}).then((value) => { settled = true; return value; });
+        await tick(); await tick();
+        assert.equal(settled, false, "the live replacement helper keeps the seal pending");
+        close.resolve({ state: "retained", reason: "unattested" });
+        assert.equal((await sealing).kind, "unproven");
+        assert.equal(c.starts.length, 2, "no second replacement");
+        assert.deepEqual(c.removals, []);
+      });
+
+      it("an abandoned replacement whose release resolves removed is clean", async () => {
+        const c = rotationRig();
+        const hold = c.gateStart(1);
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.starts.length === 2, "the replacement attempt");
+        d.finish();
+        await withTimeout(running, 3000, "abandoned replacement run");
+        const sealing = exec.sealLifetime({});
+        hold.resolve();
+        assert.equal((await sealing).kind, "sealed");
+        assert.deepEqual(c.holders[1]!.releases, [true], "the late, never-used replacement was released");
+        assert.deepEqual(c.holders[0]!.releases, [true]);
+        assert.deepEqual(c.removals, []);
+      });
+    });
+  });
+
   describe("HeldRunCommandCache", () => {
     const cleanLaunch = async (): Promise<CodexRootHandle> => effectHandle(false);
     const spec = {} as CodexEffectLaunchSpec;
     const WAITS = { releaseMs: 100, removeMs: 100 };
 
-    it("once settle has begun, current() is undefined and a launch gets no cache (even while the holder is alive)", async () => {
+    it("once settle has begun, reserve() is undefined and a launch gets no cache (even while the holder is alive)", async () => {
       let answer!: (r: CacheCleanupResult) => void;
       const releaseAnswer = new Promise<CacheCleanupResult>((r) => { answer = r; });
       const base = fakeHolder([]);
       const cache = new HeldRunCommandCache({ ...base.holder, release: () => releaseAnswer });
-      assert.deepEqual(cache.current(), { dir: CACHE_DIR });
+      const reservation = cache.reserve();
+      assert.equal(reservation?.dir, CACHE_DIR);
+      reservation!.cancel();
       const settling = cache.settle(noopLog, async () => ({ state: "removed", reason: "" }), WAITS);
       assert.equal(base.holder.alive(), true, "the holder has not answered the release yet");
-      assert.equal(cache.current(), undefined, "no cache is handed out once settle has begun");
+      assert.equal(cache.reserve(), undefined, "no cache is handed out once settle has begun");
 
       const launched: CodexEffectLaunchSpec[] = [];
       const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
@@ -11773,7 +12456,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     it("drained is true with no roots and with every tracked root disposed clean", async () => {
       const cache = new HeldRunCommandCache(fakeHolder([]).holder);
       assert.equal(cache.drained(), true);
-      const h = await cache.track(cleanLaunch)(spec);
+      const h = await cache.reserve()!.launch(cleanLaunch)(spec);
       assert.equal(cache.drained(), false, "a launched, not yet disposed root is not drained");
       await h.dispose(10);
       assert.equal(cache.drained(), true);
@@ -11781,16 +12464,16 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
 
     it("an unclean dispose, a rejected dispose or a failed launch makes it false (sticky)", async () => {
       const unclean = new HeldRunCommandCache(fakeHolder([]).holder);
-      await (await unclean.track(async () => effectHandle(true))(spec)).dispose(10);
+      await (await unclean.reserve()!.launch(async () => effectHandle(true))(spec)).dispose(10);
       assert.equal(unclean.drained(), false);
 
       const rejected = new HeldRunCommandCache(fakeHolder([]).holder);
-      const h = await rejected.track(async () => ({ ...effectHandle(false), dispose: async () => { throw new Error("boom"); } }))(spec);
+      const h = await rejected.reserve()!.launch(async () => ({ ...effectHandle(false), dispose: async () => { throw new Error("boom"); } }))(spec);
       await assert.rejects(h.dispose(10), /boom/);
       assert.equal(rejected.drained(), false);
 
       const failed = new HeldRunCommandCache(fakeHolder([]).holder);
-      await assert.rejects(failed.track(async () => { throw new Error("launch failed"); })(spec), /launch failed/);
+      await assert.rejects(failed.reserve()!.launch(async () => { throw new Error("launch failed"); })(spec), /launch failed/);
       assert.equal(failed.drained(), false);
     });
 
@@ -11798,7 +12481,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
       const cache = new HeldRunCommandCache(fakeHolder([]).holder);
       const registry = new ExecutionRegistry(newLocalExecutionEpoch(9));
       cache.watchRegistry(registry);
-      await (await cache.track(cleanLaunch)(spec)).dispose(10);
+      await (await cache.reserve()!.launch(cleanLaunch)(spec)).dispose(10);
       assert.equal(cache.drained(), true);
       registry.poison({ category: "protocol", message: "poisoned" });
       assert.equal(cache.drained(), false);
@@ -11815,20 +12498,22 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
       await a.settle(rlog.log, remove, WAITS);
       await a.settle(rlog.log, remove, WAITS);
       assert.deepEqual(alive.releases, [true]);
-      assert.equal(a.current(), undefined, "no cache is handed out after settle");
+      assert.equal(a.reserve(), undefined, "no cache is handed out after settle");
       assert.ok(rlog.lines.some((l) => l.includes('"level":"warn"') && l.includes('"reason":"mismatch"')), "a retained release is a warn with its reason");
 
       const dead = fakeHolder(events);
       const d = new HeldRunCommandCache(dead.holder);
-      assert.deepEqual(d.current(), { dir: CACHE_DIR });
+      const held = d.reserve();
+      assert.equal(held?.dir, CACHE_DIR);
+      held!.cancel();
       dead.die();
-      assert.equal(d.current(), undefined, "no cache after holder loss");
+      assert.equal(d.reserve(), undefined, "no cache after holder loss");
       await d.settle(noopLog, remove, WAITS);
       assert.deepEqual(removals, [CACHE_TOKEN]);
 
       const undrained = fakeHolder(events);
       const u = new HeldRunCommandCache(undrained.holder);
-      await (await u.track(async () => effectHandle(true))(spec)).dispose(10);
+      await (await u.reserve()!.launch(async () => effectHandle(true))(spec)).dispose(10);
       undrained.die();
       await u.settle(noopLog, remove, WAITS);
       assert.deepEqual(removals, [CACHE_TOKEN], "not drained: no removal");
@@ -11848,6 +12533,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
       const rlog = recordingLog();
       const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION), rlog.log);
       await withTimeout(exec.run(makeCtx().ctx), 3000, "deferred cache run");
+      await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {});
       await exec.safety!.dispose({ boundary: "terminal", deadlineMs });
       assert.equal(c.holder.releaseTimeouts.length, 1);
       const t = c.holder.releaseTimeouts[0]!;
@@ -11861,7 +12547,8 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     pushBashTurn(lost.rig, ["echo one"]);
     const exec = makeExecutor(lost.rig, bindingOf(SUBSCRIPTION));
     await withTimeout(exec.run(makeCtx().ctx), 3000, "deferred holder-loss run");
-    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 2000 });
+    await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {});
+    assert.equal((await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 2000 })).kind, "disposed");
     assert.equal(lost.removeTimeouts.length, 1);
     assert.ok(lost.removeTimeouts[0]! >= 1000 && lost.removeTimeouts[0]! <= 2000, `remove wait ${lost.removeTimeouts[0]}`);
   });
@@ -12608,7 +13295,7 @@ describe("Codex completion interlock", () => {
         parkForWall: async () => { parks++; return "parked"; },
       });
       const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-      if (trip === "idle") await assert.rejects(withTimeout(running, 3000, "pre-attempt idle"), /codex run idle timeout/);
+      if (trip === "idle") await assert.rejects(withTimeout(running, 3000, "pre-attempt idle"), isRecovery);
       else assert.deepEqual((await withTimeout(running, 3000, "pre-attempt wall")).walled, { reason: "codex run wall-clock timeout" });
       assert.equal(attempts, 0);
       assert.equal(holds, 0);
@@ -12634,7 +13321,7 @@ describe("Codex completion interlock", () => {
     assert.equal(result.completionHeld, undefined);
   });
 
-  it("rethrows idle after an attempt when the completion hold is refused", async () => {
+  it("recovers zero-evidence idle after an attempt when the completion hold is refused", async () => {
     const rig = makeMultiEpochRig([firstEpoch(1), quietEpoch(2)]);
     rig.deps = { ...rig.deps, wallMs: 5000, idleMs: 30 };
     const holds: string[] = [];
@@ -12645,7 +13332,7 @@ describe("Codex completion interlock", () => {
       enterCompletionHold: async (reason) => { holds.push(reason); return false; },
       parkForWall: async () => { parks++; return "parked"; },
     });
-    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "refused idle hold"), /codex run idle timeout/);
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "refused idle hold"), isRecovery);
     assert.deepEqual(holds, ["codex run idle timeout"]);
     assert.equal(parks, 0);
   });
@@ -12676,6 +13363,84 @@ describe("Codex completion interlock", () => {
     assert.ok(rig.sessionOps.persist >= 2);
     assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "thread/resume"));
     assert.match(JSON.stringify(rig.epochs[1]!.transport.requests.find((r) => r.method === "turn/start")?.params), /m2: Remaining/);
+  });
+
+  // PRD #1232 M2: the Codex arm of the #1220 (b0ffd0ea) regression, mirroring the Claude arm in
+  // runner-completion-1220-regression.test.ts. Five milestones frozen, the lead declares four.
+  const FROZEN_FIVE = ["m1", "m2", "m3", "m4", "m5"].map((id) => ({ id, title: `title of ${id}` }));
+  const declareEpoch = (n: number, declared: string[], first: boolean): Responder => {
+    const frames = (t: FakeTransport, th: string, tn: string): void => {
+      t.push(toolCall(n, "signal_done", { milestones_completed: declared }, th, tn, `done-${n}`))
+        .push(turnCompleted("completed", th, tn));
+    };
+    return first ? epochResponder("th-1", `tn-${n}`, frames) : resumedEpochResponder("th-1", `tn-${n}`, frames);
+  };
+  const turnPrompts = (rig: MultiRig): string[] =>
+    rig.epochs.map((e) => JSON.stringify(e.transport.requests.find((r) => r.method === "turn/start")?.params));
+
+  it("b0ffd0ea shape: 5 frozen / 4 declared checkpoints first, names m5 on the SAME thread, never finalizes", async () => {
+    const four = ["m1", "m2", "m3", "m4"];
+    const rig = makeMultiEpochRig([declareEpoch(1, four, true), declareEpoch(2, four, false), declareEpoch(3, four, false)]);
+    const order: string[] = [];
+    const attempts: unknown[] = [];
+    const holds: string[] = [];
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 10 },
+      frozenMilestones: FROZEN_FIVE,
+      checkpoint: async () => { order.push("checkpoint"); },
+      worktreeFingerprint: async () => "TIP\n M docs/adr.md",
+      recordCompletionAttempt: async (args) => {
+        order.push("attempt");
+        attempts.push(args);
+        return { unmet: ["m5"], attemptCount: attempts.length };
+      },
+      askCompletionQuestion: async (unmet) => {
+        assert.deepEqual(unmet, ["m5"]);
+        order.push("ask");
+        return { outcome: "expired" };
+      },
+      enterCompletionHold: async (reason) => { order.push("hold"); holds.push(reason); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex b0ffd0ea");
+
+    assert.deepEqual(order.slice(0, 2), ["checkpoint", "attempt"], "checkpoint precedes the first server attempt");
+    assert.deepEqual(attempts, Array.from({ length: 3 }, () => ({
+      declared: four, head: "TIP", worktreeFingerprint: "TIP\n M docs/adr.md",
+    })), "three identical no-progress attempts, each declaring only m1..m4");
+    // Same thread: every re-prompt is a thread/resume of th-1 whose turn names m5 and its title.
+    const prompts = turnPrompts(rig);
+    assert.equal(rig.providerLaunches(), 3);
+    for (const [i, epoch] of rig.epochs.slice(1).entries()) {
+      const resumes = epoch.transport.requests.filter((r) => r.method === "thread/resume");
+      assert.deepEqual(resumes.map((r) => rec(r.params).threadId), ["th-1"], `epoch ${i + 1} resumed th-1`);
+      assert.match(prompts[i + 1]!, /m5: title of m5/);
+      assert.doesNotMatch(prompts[i + 1]!, /m4: title of m4/, "only the unmet milestone is named");
+    }
+    // Never finalized: parked in the hold, no publishable (non-held) result.
+    assert.equal(holds.length, 1);
+    assert.deepEqual(order.slice(-2), ["ask", "hold"]);
+    assert.deepEqual(result.completionHeld, { reason: holds[0] });
+    assert.deepEqual(result.milestonesCompleted, four);
+  });
+
+  it("mutation control (positive): all 5 declared (unmet empties) finalizes", async () => {
+    const rig = makeMultiEpochRig([declareEpoch(1, ["m1", "m2", "m3", "m4", "m5"], true)]);
+    const attempts: unknown[] = [];
+    const holds: string[] = [];
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 10 },
+      frozenMilestones: FROZEN_FIVE,
+      checkpoint: async () => {},
+      worktreeFingerprint: async () => "TIP\n M docs/adr.md",
+      recordCompletionAttempt: async (args) => { attempts.push(args); return { unmet: [], attemptCount: attempts.length }; },
+      enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex 5 declared");
+    assert.equal(attempts.length, 1, "one attempt, then finalize");
+    assert.deepEqual(holds, []);
+    assert.equal(result.completionHeld, undefined);
+    assert.equal(rig.providerLaunches(), 1, "no rework turn");
+    assert.deepEqual(result.milestonesCompleted, ["m1", "m2", "m3", "m4", "m5"]);
   });
 
   it("asks at three identical attempts, continues with guidance, then holds on expiry", async () => {
@@ -13218,6 +13983,55 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
       assert.match(pr.description, /Approved Codex follow-up remains/);
       assert.equal(m2ClosingDirective(pr.description, 2172, "org/repo"), false);
     });
+    it("issue #3721 all-met interlocked Codex run: broker non_closing + deferred scope notes deliver an open-issue PR with no completion hold", async () => {
+      m2Runner.api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+      await m2Runner.client.register("codex-3721-owner-acceptance");
+      const prApi = new FakePrDescApi();
+      m2Runner.api.prDescription = prApi;
+      const reason = "Owner acceptance pending: live dev-cluster rollout check";
+      const rig = makeMultiEpochRig([script("th-1", [
+        (th, tn) => [done(3721, th, tn, {
+          milestones_completed: ["m1", "m2"],
+          non_closing: { reason },
+          pr_summary: {
+            what: "Adds the thing.",
+            scope_notes: [
+              { kind: "deferred", text: "Owner acceptance: live dev-cluster rollout check" },
+              { kind: "deferred", text: "Owner acceptance: dashboard sign-off" },
+            ],
+          },
+        })],
+      ])]);
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const delivery: Executor = { run: async ctx => {
+        commitInTree(ctx.worktreePath, "m3721.txt", "delivered work\n");
+        return executor.run(ctx);
+      } };
+      const { gitlab, pr } = m2Runner.fakeGitlab();
+      m2FollowPush(m2Runner.git, pr);
+      const claim = m2Runner.gitlabClaim(3721, {
+        claim_generation: 7, issue_title: "Fixes #3721", plan_md: "Two milestones; owner acceptance is planned outside them", plan_approved: true, plan_source: "seeded",
+        milestones: [{ id: "m1", title: "Build" }, { id: "m2", title: "Wire" }],
+        config: { completion_contract_version: 1, contract_revision: 1 },
+      });
+      m2Runner.api.setPublicationState(claim.run_id, [], 1);
+      // The completion permit is canned (always granted), so the "no completion hold" assert below
+      // guards agent-side holding only, not the server's all-milestones-met decision.
+      m2Runner.api.setCompletionPermitResponse(true);
+      await m2Runner.runner(delivery, gitlab).execute(claim);
+      const states = m2Runner.api.states.filter(s => s.runId === claim.run_id).map(s => s.body.status);
+      assert.ok(states.includes("completed"), JSON.stringify(states));
+      assert.ok(!states.includes("awaiting_input"), "no completion question or owner-decision park");
+      assert.equal(m2Runner.api.completionHoldRequests.length, 0, "no completion hold");
+      assert.equal(m2Runner.api.completionPermitRequests.length, 1, "the permit is still requested");
+      assert.equal(m2ClosingDirective(pr.title + "\n" + pr.description, 3721, "org/repo"), false);
+      assert.doesNotMatch(pr.description, /Closes #3721/);
+      assert.ok(pr.title.includes("#3721"));
+      assert.ok(pr.description.includes(`> **Issue remains open.** ${reason}`), pr.description);
+      assert.match(pr.description, /- Deferred: Owner acceptance: live dev-cluster rollout check/);
+      assert.match(pr.description, /- Deferred: Owner acceptance: dashboard sign-off/);
+      assert.equal(prApi.calls.find(c => c.op === "stage")!.body.source, "lead_only", "the notes came from the lead's claims");
+    });
     it("m2 non-closing actual broker callback retitles a closing issue title (issue #2779)", async () => {
       const rig = makeMultiEpochRig([script("th-1", [
         (th, tn) => [done(2172, th, tn, { non_closing: { reason: "Approved Codex follow-up remains" } })],
@@ -13328,6 +14142,106 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
       const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "m1 rework");
       assert.equal(attempts, 2);
       assert.deepEqual((result as unknown as { nonClosing: unknown }).nonClosing, { reason: "non_closing" in later ? "latest" : "first" });
+    });
+  }
+
+  it("#3469 regression Codex prompt terminating signal_done forwards exact summary and proposal", async () => {
+    const summary = "Prompt findings\n\nNo repair needed.";
+    const proposal = { title: "Follow-up", body: "Investigate the scheduler." };
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(3469, th, tn, { summary, proposal })]])]);
+    const { ctx } = makeCtx({ kind: "prompt" });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 prompt");
+    assert.equal(result.summary, summary);
+    assert.deepEqual(result.proposal, proposal);
+    assert.ok(!("reportOnly" in result));
+  });
+
+  it("#3469 control Codex undeclared summary proposal and reportOnly keys are absent", async () => {
+    for (const kind of ["issue", "prompt"] as const) {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(3469, th, tn)]])]);
+      const { ctx } = makeCtx({ kind });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 absent");
+      for (const key of ["summary", "proposal", "reportOnly"]) assert.ok(!(key in result), key);
+    }
+  });
+
+  it("#3469 control Codex plain-text completion does not synthesize declarations", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [
+      agentMessage("Finished. Summary: prose only. Proposal: prose only.", th),
+      done(3469, th, tn),
+    ]])]);
+    const { ctx } = makeCtx({ kind: "prompt" });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 prose");
+    for (const key of ["summary", "proposal", "reportOnly"]) assert.ok(!(key in result), key);
+  });
+
+  it("#3469 control Codex report-only remains issue-only and other kinds omit summary", async () => {
+    for (const kind of ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job", "cross_check"] as const) {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [
+        done(3469, th, tn, { report_only: true, summary: "findings" }),
+      ]])]);
+      const { ctx } = makeCtx({ kind });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 kind gate");
+      if (kind === "issue") assert.equal(result.reportOnly, true);
+      else assert.ok(!("reportOnly" in result), kind);
+      if (kind !== "issue" && kind !== "prompt") assert.ok(!("summary" in result), kind);
+    }
+  });
+
+  it("#3469 post-fix positive Codex issue and absent-kind default forward exact summary", async () => {
+    for (const kind of ["issue", undefined] as const) {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [
+        done(3469, th, tn, { report_only: true, summary: "issue findings" }),
+      ]])]);
+      const { ctx } = makeCtx({ kind });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 issue summary");
+      assert.equal(result.summary, "issue findings");
+      assert.equal(result.reportOnly, true);
+    }
+  });
+
+  it("#3469 post-fix positive Codex every kind forwards exact proposal", async () => {
+    const proposal = { title: "Follow-up", body: "Investigate the scheduler." };
+    for (const kind of ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job", "cross_check"] as const) {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(3469, th, tn, { proposal })]])]);
+      const { ctx } = makeCtx({ kind });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 proposal");
+      assert.deepEqual(result.proposal, proposal, kind);
+    }
+  });
+
+  for (const mode of ["last declared wins", "bare later done retains declarations", "questions cannot overwrite accepted declarations"] as const) {
+    it(`#3469 post-fix positive Codex multi-turn ${mode}`, async () => {
+      const first = { summary: "first findings", proposal: { title: "First", body: "First proposal." } };
+      const later = { summary: "later findings", proposal: { title: "Later", body: "Later proposal." } };
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [done(34691, th, tn, { ...first, milestones_completed: ["m1"] })]]),
+        script("th-1", [
+          (th, tn) => [
+            done(34692, th, tn, { ...(mode === "bare later done retains declarations" ? {} : later), milestones_completed: ["m1", "m2"] }),
+            ...(mode === "questions cannot overwrite accepted declarations"
+              ? [toolCall(34693, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, th, tn, "ask-34693")]
+              : []),
+          ],
+          (th, tn) => [done(34694, th, tn, { milestones_completed: ["m1", "m2"] })],
+        ]),
+      ]);
+      let attempts = 0;
+      let asked = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: true, config: { max_iterations: 5 },
+        frozenMilestones: [{ id: "m1", title: "Alpha" }, { id: "m2", title: "Beta" }],
+        checkpoint: async () => {},
+        recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m2"] : [], attemptCount: attempts }),
+        askUser: async () => { asked++; return { kind: "answer", answers: ["server"] }; },
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 rework");
+      assert.equal(attempts, 2, "both accepted done turns reach the interlock");
+      assert.equal(asked, mode === "questions cannot overwrite accepted declarations" ? 1 : 0);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, asked + 1);
+      const expected = mode === "last declared wins" ? later : first;
+      assert.equal(result.summary, expected.summary);
+      assert.deepEqual(result.proposal, expected.proposal);
     });
   }
 
@@ -17713,6 +18627,1505 @@ describe("CodexExecutor planning settlement (#1733)", () => {
   }
 });
 
+describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
+  const retryNote = (info: unknown, willRetry = true, threadId = "th-1", turnId = "tn-1"): CodexNotification => ({
+    kind: "codex_error", method: "error", threadId, turnId, willRetry,
+    params: { error: { message: "untrusted provider detail", codexErrorInfo: info } },
+  });
+  const retryCases = [
+    { name: "initial planning", phase: "initial", notes: [retryNote("rateLimitExceeded")], provider: true },
+    { name: "automatic revision", phase: "automatic", notes: [retryNote("rateLimitExceeded")], provider: true },
+    { name: "rate limit", notes: [retryNote("rateLimitExceeded")], provider: true },
+    { name: "transport absent status", notes: [retryNote({ httpConnectionFailed: {} })], provider: true },
+    { name: "transport 503", notes: [retryNote({ httpConnectionFailed: { httpStatusCode: 503 } })], provider: true },
+    { name: "transport 400", notes: [retryNote({ httpConnectionFailed: { httpStatusCode: 400 } })], provider: false },
+    { name: "latest permanent", notes: [retryNote("rateLimitExceeded"), retryNote({ httpConnectionFailed: { httpStatusCode: 400 } })], provider: false },
+    { name: "latest transient", notes: [retryNote({ httpConnectionFailed: { httpStatusCode: 400 } }), retryNote("rateLimitExceeded")], provider: true },
+    { name: "final missing then late retry", notes: [retryNote("rateLimitExceeded"), retryNote(undefined, false), retryNote("rateLimitExceeded")], provider: false },
+    { name: "final unknown then late retry", notes: [retryNote("rateLimitExceeded"), retryNote("unrecognized", false), retryNote("rateLimitExceeded")], provider: false },
+    { name: "final transient", notes: [retryNote("rateLimitExceeded"), retryNote("rateLimitExceeded", false)], provider: false },
+    { name: "stale", notes: [retryNote("rateLimitExceeded", true, "th-1", "old")], provider: false },
+    { name: "foreign", notes: [retryNote("rateLimitExceeded", true, "foreign")], provider: false },
+  ];
+  for (const scenario of retryCases) it(`3506 blackbox retry notification watchdog: ${scenario.name}`, async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted());
+        if (scenario.phase === "automatic" && c.turnStartCount === 1)
+          c.transport.push(toolCall(1, "submit_plan", { plan_md: "initial" }, "th-1", "tn-1", "plan")).push(turnCompleted("completed"));
+        else for (const note of scenario.notes) c.transport.push(note);
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    const { ctx, emitted } = makeCtx({ codexIdleStallRecovery: true,
+      ...(scenario.phase ? { planApproved: false, approvedPlan: undefined } : {}),
+      gatePlan: async () => ({ kind: "revise", feedback: "change", automatic: true, round: 1 }),
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      const starts = scenario.phase === "automatic" ? 2 : 1;
+      await until(() => rig.transport.turnStartCount === starts);
+      for (let i = 0; i < 10; i++) await tick();
+      t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError);
+        assert.equal(error.providerOrigin, scenario.provider);
+        assert.equal(error.idleStallKind, "zero_evidence");
+        assert.equal(error.originalIdle?.message, "codex run idle timeout");
+        if (scenario.provider) assert.equal(error.message, "silence after a provider-reported rate limit or transport retry");
+        return true;
+      });
+      assert.equal(rig.transport.turnStartCount, starts, "watchdog parks directly without a #2099 retry");
+      assert.equal(rig.sessionOps.persist, 1);
+      assert.ok(!JSON.stringify(emitted).includes("untrusted provider detail"));
+    } finally { rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("3506 blackbox watchdog snapshots retry context before abort replaces the turn", async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted()).push(retryNote("rateLimitExceeded"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    const original = CodexHarness.prototype.startTurn;
+    let replaced = false;
+    const mocked = mock.method(CodexHarness.prototype, "startTurn", function(this: CodexHarness, request: Parameters<typeof original>[0]) {
+      const turn = original.call(this, request);
+      request.signal.addEventListener("abort", () => {
+        // A replacement resets context synchronously before the old iterator rejects.
+        original.call(this, { ...request, signal: new AbortController().signal });
+        replaced = true;
+      }, { once: true });
+      return turn;
+    });
+    const { ctx } = makeCtx();
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.transport.turnStartCount === 1);
+      for (let i = 0; i < 10; i++) await tick();
+      t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError && error.providerOrigin);
+        assert.equal(error.idleStallKind, "zero_evidence");
+        assert.equal(error.originalIdle?.message, "codex run idle timeout");
+        return true;
+      });
+      assert.equal(replaced, true);
+      assert.equal(rig.transport.turnStartCount, 1);
+    } finally { mocked.mock.restore(); rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const late of [
+    { name: "final missing classification", note: retryNote(undefined, false), expected: undefined },
+    { name: "final unknown classification", note: retryNote("unrecognized", false), expected: undefined },
+    { name: "permanent replacement retry", note: retryNote({ httpConnectionFailed: { httpStatusCode: 400 } }),
+      expected: { classification: "httpConnectionFailed", category: "transport", httpStatus: 400 } },
+  ]) it(`3506 watchdog snapshot survives late ${late.name} after idle trip`, async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted()).push(retryNote("rateLimitExceeded"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    const atTrip = { classification: "rateLimitExceeded", category: "rate_limit" };
+    let retryContext: (() => CodexHarness["retryClassification"]) | undefined;
+    let lateMapped: Promise<void> | undefined;
+    let persistedAfterLate = false;
+    const persist = rig.deps.sessionStore!.persist.bind(rig.deps.sessionStore);
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000,
+      sessionStore: { ...rig.deps.sessionStore!, persist: async (...args) => {
+        assert.ok(lateMapped, "abort admitted the late notification before recovery persistence");
+        await lateMapped;
+        assert.deepEqual(retryContext!(), late.expected);
+        persistedAfterLate = true;
+        return persist(...args);
+      } },
+    };
+    const original = CodexHarness.prototype.startTurn;
+    const mocked = mock.method(CodexHarness.prototype, "startTurn", function(this: CodexHarness, request: Parameters<typeof original>[0]) {
+      retryContext = () => this.retryClassification;
+      const turn = original.call(this, request);
+      request.signal.addEventListener("abort", () => {
+        // runTurn checks the aborted signal before mapping queued notes. Invoke its existing
+        // mapper here: the real idle trip has captured context, but recovery has not routed.
+        const mapper = this as unknown as {
+          mapNote(transport: CodexTransport, note: CodexNotification, signal?: AbortSignal): Promise<unknown>;
+        };
+        lateMapped = (async () => {
+          assert.deepEqual(this.retryClassification, atTrip);
+          const event = await mapper.mapNote(rig.transport, late.note, request.signal);
+          assert.deepEqual(event, { kind: "activity", sessionId: "th-1" });
+          assert.deepEqual(this.retryClassification, late.expected, "late normalized notification changed live context");
+          assert.notDeepEqual(this.retryClassification, atTrip);
+        })();
+        void lateMapped.catch(() => undefined);
+      }, { once: true });
+      return turn;
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => retryContext?.()?.classification === "rateLimitExceeded");
+      for (let i = 0; i < 10; i++) await tick();
+      t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError);
+        assert.equal(error.providerOrigin, true, "classification comes from the trip, before the late note");
+        assert.equal(error.idleStallKind, "zero_evidence");
+        assert.equal(error.message, "silence after a provider-reported rate limit or transport retry");
+        assert.ok(error.originalIdle instanceof Error);
+        assert.equal(error.originalIdle.message, "codex run idle timeout");
+        assert.equal(rec(error.originalIdle).processedEvents, 0);
+        assert.deepEqual(rec(error.originalIdle).retryClassification, atTrip);
+        return true;
+      });
+      assert.ok(lateMapped);
+      await lateMapped;
+      assert.equal(persistedAfterLate, true);
+      assert.equal(rig.sessionOps.persist, 1);
+      assert.equal(rig.transport.turnStartCount, 1, "no replacement root or in-process retry");
+    } finally { mocked.mock.restore(); rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  // Readiness polls real event-loop turns against a real-time deadline (performance.now is not
+  // mocked), independently of the frozen Date. A turn count alone runs out before real I/O on a
+  // loaded runner: 500 turns elapsed in under 5 ms on CI.
+  async function until(predicate: () => boolean): Promise<void> {
+    const deadline = performance.now() + 5000;
+    while (!predicate() && performance.now() < deadline) await tick();
+    assert.ok(predicate(), "event barrier was not reached");
+  }
+
+  for (const phase of ["initial", "automatic", "implement", "human"] as const) {
+    for (const negotiated of [false, true]) it(`M2 productive idle ${phase}, negotiated=${negotiated}`, async t => {
+      const revision = phase === "automatic" || phase === "human";
+      const target = revision ? 2 : 1;
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted());
+          if (revision && c.turnStartCount === 1)
+            c.transport.push(toolCall(1, "submit_plan", { plan_md: "initial" }, "th-1", "tn-1", "plan"))
+              .push(turnCompleted("completed"));
+          else c.transport.push(agentMessage("partial model output"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+      let settled = 0, retries = 0;
+      const { ctx, emitted } = makeCtx({
+        codexIdleStallRecovery: negotiated,
+        planApproved: phase === "implement", approvedPlan: phase === "implement" ? "approved" : undefined,
+        gatePlan: async () => phase === "automatic"
+          ? { kind: "revise", feedback: "revise", automatic: true, round: 1 }
+          : { kind: "revise", feedback: "revise", inputId: 1 },
+        onModelTurnSettled: async () => { settled++; },
+        retryPlanRevisionTurn: async cause => { retries++; throw cause; },
+      });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.transport.turnStartCount === target && emitted.some(m => m.kind === "text"));
+        await tick(); t.mock.timers.tick(100);
+        await assert.rejects(running, (error: unknown) => {
+          assert.ok(error instanceof Error);
+          if (negotiated && phase !== "human") {
+            assert.ok(error instanceof TransientRecoveryError);
+            assert.equal(error.idleStallKind, "productive");
+            assert.equal(error.providerOrigin, false);
+            assert.equal(error.message, "model output stalled within the idle timeout");
+            assert.equal(error.originalIdle?.message, "codex run idle timeout");
+            assert.equal(rig.sessionOps.persist, 1);
+          } else {
+            assert.ok(!(error instanceof TransientRecoveryError));
+            assert.equal(error.message, "codex run idle timeout");
+          }
+          return true;
+        });
+        assert.equal(retries, 0);
+        assert.equal(settled, revision ? 1 : 0, "stalled output is never a settled turn");
+      } finally { rig.transport.end(); t.mock.timers.reset(); }
+    });
+  }
+
+  it("M2 turn_finished with callbacks settled but iterator tail idle remains recoverable without progress", async t => {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    rig.transport.push(threadStarted()).push(agentMessage("partial output"))
+      .push(toolCall(91, "signal_done", {}, "th-1", "tn-1", "settled"))
+      .push(turnCompleted("completed"));
+    let tail = false, release!: () => void, settled = 0;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const original = CodexHarness.prototype.startTurn;
+    const mocked = mock.method(CodexHarness.prototype, "startTurn", function(this: CodexHarness, ...args: Parameters<typeof original>) {
+      const turn = original.apply(this, args);
+      args[0].signal?.addEventListener("abort", () => release(), { once: true });
+      return { ...turn, events: (async function* () { yield* turn.events; tail = true; await barrier; })() };
+    });
+    const { ctx } = makeCtx({ codexIdleStallRecovery: true, onModelTurnSettled: async () => { settled++; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => tail && rig.transport.responses.some(r => r.requestId === 91));
+      t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError && error.idleStallKind === "productive");
+        return true;
+      });
+      assert.equal(settled, 0);
+      assert.equal(rig.sessionOps.persist, 1);
+      mocked.mock.restore();
+      t.mock.timers.reset();
+      const resumed = makeRig({ responder: c => {
+        if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push(signalDone("th-1", "tn-2")).push(turnCompleted("completed", "th-1", "tn-2"));
+          return { turn: { id: "tn-2" } };
+        }
+        return {};
+      } });
+      resumed.deps = { ...resumed.deps, sessionStore: { ...resumed.deps.sessionStore!, inspect: async () => "present" } };
+      const { ctx: resumeCtx } = makeCtx({ sessionId: "th-1", codexIdleStallRecovery: true,
+        onModelTurnSettled: async () => { settled++; } });
+      await makeExecutor(resumed, bindingOf(SUBSCRIPTION)).run(resumeCtx);
+      assert.equal(resumed.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+      assert.equal(resumed.transport.turnStartCount, 1, "resume reasks the model despite the prior signal_done");
+      assert.equal(settled, 1, "only the resumed completed iterator settles");
+    } finally { release(); rig.transport.end(); mocked.mock.restore(); t.mock.timers.reset(); }
+  });
+
+  for (const retry of [false, true]) it(`3462 ${retry ? "serverOverloaded then silent retry" : "first-turn silence"} parks without another start`, async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted());
+        if (retry && c.turnStartCount === 1) c.transport.push({
+          kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+          params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "serverOverloaded" } } },
+        });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000, transientBackoffBaseMs: 1 };
+    const { ctx, emitted } = makeCtx();
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.transport.turnStartCount === 1);
+      if (retry) {
+        await until(() => emitted.some(m => /transient error/.test(String(rec(m.payload).text))));
+        await tick();
+        t.mock.timers.tick(1);
+        await until(() => rig.transport.turnStartCount === 2);
+      }
+      await tick();
+      t.mock.timers.tick(100);
+      await assert.rejects(running, isRecovery);
+      assert.equal(rig.transport.turnStartCount, retry ? 2 : 1);
+      assert.equal(rig.sessionOps.persist, 1, "persist the live session before recovery capture");
+      assert.equal(emitted.filter(m => /transient error/.test(String(rec(m.payload).text))).length, retry ? 1 : 0);
+    } finally { rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const evidence of ["lifecycle", "text", "tool"] as const) it(`3462 ${evidence} before silence has the correct evidence contract`, async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted());
+        c.transport.push(retryNote("rateLimitExceeded"));
+        if (evidence === "text") c.transport.push(agentMessage("working"));
+        else if (evidence === "tool") c.transport.push(toolCall(91, "Bash", { command: "true" }, "th-1", "tn-1", "settled-tool"));
+        else c.transport.push({ kind: "turn_started", method: "turn/started", threadId: "th-1", turnId: "tn-1", params: {} })
+          .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 10 }))
+          .push({ kind: "codex_error", method: "error", threadId: "th-1", turnId: "tn-1", willRetry: true,
+            params: { threadId: "th-1", turnId: "tn-1", willRetry: true, error: { message: "retrying", codexErrorInfo: "rateLimitExceeded" } } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    const { ctx, emitted } = makeCtx();
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => evidence === "tool" ? rig.transport.responses.some(r => r.requestId === 91)
+        : evidence === "text" ? emitted.some(m => m.kind === "text") : rig.transport.turnStartCount === 1);
+      for (let i = 0; i < 5; i++) await tick();
+      t.mock.timers.tick(100);
+      await assert.rejects(running, evidence === "lifecycle" ? (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError && error.providerOrigin);
+        return true;
+      } : (error: unknown) => {
+        assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+        assert.equal(error.message, "codex run idle timeout");
+        return true;
+      });
+      assert.equal(rig.transport.turnStartCount, 1);
+    } finally { rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const productive of [false, true]) for (const retry of productive ? [false] : [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 ${interruption} during pre-recovery persistence productive=${productive} retry=${retry}`, async t => {
+    const rig = makeRig();
+    if (productive) rig.transport.push(agentMessage("partial model output"));
+    else if (retry) rig.transport.push(retryNote("rateLimitExceeded"));
+    let entered = false;
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 1000,
+      sessionStore: { ...rig.deps.sessionStore!, persist: async () => {
+        entered = true; await barrier; return { files: 0, bytes: 0 };
+      } },
+    };
+    let mode: "now" | null = null;
+    let interrupt: (() => void) | undefined;
+    let cancelled = false, pauses = 0, walls = 0;
+    const { ctx, emitted } = makeCtx({ codexIdleStallRecovery: productive,
+      onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode,
+      cancelRequested: () => cancelled,
+      parkForPause: async () => { pauses++; return true; },
+      parkForWall: async () => { walls++; return "parked"; },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.transport.turnStartCount === 1);
+      if (productive) await until(() => emitted.some(m => m.kind === "text"));
+      await tick(); t.mock.timers.tick(100);
+      await until(() => entered);
+      if (interruption === "pause") { mode = "now"; interrupt?.(); }
+      if (interruption === "wall") t.mock.timers.tick(1000);
+      if (interruption === "cancel") cancelled = true;
+      release();
+      if (interruption === "none") await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError);
+        assert.equal(error.idleStallKind, productive ? "productive" : retry ? "zero_evidence" : undefined);
+        assert.equal(error.providerOrigin, retry);
+        return true;
+      });
+      else if (interruption === "cancel") await assert.rejects(running, /cancel/);
+      else {
+        const result = await running;
+        assert.ok(interruption === "pause" ? result.pausedAt : result.walled);
+      }
+      assert.equal(pauses, interruption === "pause" ? 1 : 0);
+      assert.equal(walls, interruption === "wall" ? 1 : 0);
+      assert.equal(rig.transport.turnStartCount, 1, "no unintended redrive");
+    } finally { release(); rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const productive of [false, true]) for (const retry of productive ? [false] : [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 declined completion hold rechecks ${interruption} productive=${productive} retry=${retry}`, async t => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", transport => transport.push(signalDone()).push(turnCompleted("completed"))),
+      epochResponder("th-2", "tn-2", transport => {
+        if (productive) transport.push(agentMessage("partial model output", "th-2"));
+        else if (retry) transport.push(retryNote("rateLimitExceeded", true, "th-2", "tn-2"));
+      }),
+    ]);
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 1000 };
+    let entered = false, release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    let mode: "now" | null = null, interrupt: (() => void) | undefined;
+    let cancelled = false, holds = 0, pauses = 0, walls = 0;
+    const { ctx, emitted } = makeCtx({ codexIdleStallRecovery: productive, kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+      enterCompletionHold: async reason => {
+        holds++;
+        if (reason === "codex run wall-clock timeout") return false;
+        entered = true; await barrier; return false;
+      },
+      onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode,
+      cancelRequested: () => cancelled,
+      parkForPause: async () => {
+        pauses++;
+        // A newer generation during a declined pause must survive consumption of
+        // the handled generation, and park before any replacement turn starts.
+        if (pauses === 1) { interrupt?.(); return false; }
+        return true;
+      },
+      parkForWall: async () => { walls++; return "parked"; },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[1]!.transport.turnStartCount === 1);
+      if (productive) await until(() => emitted.some(m => m.kind === "text"));
+      await tick(); t.mock.timers.tick(100);
+      await until(() => entered);
+      if (interruption === "pause") { mode = "now"; interrupt?.(); }
+      if (interruption === "wall") t.mock.timers.tick(1000);
+      if (interruption === "cancel") cancelled = true;
+      release();
+      if (interruption === "none") await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError);
+        assert.equal(error.idleStallKind, productive ? "productive" : retry ? "zero_evidence" : undefined);
+        assert.equal(error.providerOrigin, retry);
+        return true;
+      });
+      else if (interruption === "cancel") await assert.rejects(running, /cancel/);
+      else {
+        const result = await running;
+        assert.ok(interruption === "pause" ? result.pausedAt : result.walled);
+      }
+      assert.equal(holds, interruption === "wall" ? 2 : 1);
+      assert.equal(pauses, interruption === "pause" ? 2 : 0);
+      assert.equal(walls, 0, "declined wall completion hold stops without wall capture");
+      assert.equal(rig.providerLaunches(), 2);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+    } finally { release(); for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const productive of [false, true]) for (const retry of productive ? [true] : [false, true]) it(`3462 a vault latch after the first idle trip retains the idle outcome productive=${productive} retry=${retry}`, async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted());
+        if (retry) c.transport.push(retryNote("rateLimitExceeded"));
+        if (productive) c.transport.push(agentMessage("partial model output"));
+        c.transport.push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
+          params: { reason: "unauthorized", previousAccountId: null } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    let refreshing = false, release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    rig.client.refreshCodex = async () => {
+      refreshing = true; await barrier;
+      throw new RequestError("POST", "/refresh", 409, JSON.stringify({ reason: "vault_locked" }));
+    };
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({ codexIdleStallRecovery: productive }).ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => refreshing);
+      t.mock.timers.tick(100); release();
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+        assert.equal(error.message, "codex run idle timeout"); return true;
+      });
+      assert.equal(rig.transport.turnStartCount, 1);
+      assert.equal(rig.client.releaseCalls.length, 1);
+    } finally { release(); rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const retry of [false, true]) for (const followup of ["none", "clarification", "prose"] as const) it(`3466 human revision ${followup} silence retry=${retry} retries the exact prompt in a fresh epoch`, async t => {
+    const silentTurn = followup === "none" ? 2 : 3;
+    const rig = makeMultiEpochRig([c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted())
+          .push(toolCall(1, "submit_plan", { plan_md: "initial" }, "th-1", "tn-1", "plan"))
+          .push(turnCompleted("completed"));
+        else if (c.turnStartCount === 2 && followup !== "none") {
+          c.transport.push(followup === "prose" ? agentMessage("I will revise this")
+            : toolCall(2, "ask_user", { questions: [{ question: "Which?", header: "Target" }] }, "th-1", "tn-1", "ask"))
+            .push(turnCompleted("completed"));
+        }
+        if (retry && c.turnStartCount === silentTurn) c.transport.push(retryNote("rateLimitExceeded"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    }, epochResponder("th-1", "tn-1", transport => transport
+      .push(toolCall(3, "submit_plan", { plan_md: "revised" }, "th-1", "tn-1", "revised"))
+      .push(turnCompleted("completed")))]);
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    const releaseCodex = rig.client.releaseCodex.bind(rig.client);
+    rig.client.releaseCodex = async (...args) => {
+      if (rig.client.releaseCalls.length) assert.ok(rig.epochs[0]!.disposed() > 0, "dispose precedes fresh release");
+      return releaseCodex(...args);
+    };
+    let retries = 0, gates = 0, questions = 0;
+    const settled: (number | undefined)[] = [];
+    const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      config: { plan_max_revisions: 1, question_max: 1 },
+      gatePlan: async (plan, _milestones, _summary, input) => {
+        gates++; settled.push(input);
+        if (gates === 1) return { kind: "revise", feedback: "change", inputId: 11 };
+        assert.equal(plan, "revised");
+        return { kind: "reject", reason: "test complete" };
+      },
+      askUser: async () => { questions++; return { kind: "answer", answers: ["server"] }; },
+      retryPlanRevisionTurn: async cause => {
+        assert.ok(cause instanceof TransientRecoveryError && cause.idleStallKind === "zero_evidence");
+        assert.equal(cause.providerOrigin, retry);
+        assert.equal(cause.originalIdle?.message, "codex run idle timeout");
+        assert.ok(rig.epochs[0]!.disposed() > 0);
+        retries++;
+      },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[0]!.transport.turnStartCount === silentTurn);
+      await tick(); t.mock.timers.tick(100);
+      await assert.rejects(running, PlanRejectedError);
+      assert.equal(retries, 1); assert.equal(gates, 2);
+      assert.deepEqual(settled, [undefined, 11]);
+      assert.equal(questions, followup === "clarification" ? 1 : 0);
+      assert.equal(emitted.filter(m => m.kind === "plan_feedback").length, 1);
+      assert.equal(rig.providerLaunches(), 2);
+      assert.equal(rig.client.releaseCalls.length, 2);
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, silentTurn);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+      const failed = rig.epochs[0]!.transport.requests.filter(r => r.method === "turn/start").at(-1)!;
+      const retried = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
+      assert.deepEqual(retried.params, failed.params, "the answered or nudged prompt and all turn budgets survive");
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("3462 a typed idle trip with undefined evidence cannot recover", async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    // Exercise the real typed error without exporting the private error class.
+    const seam = executor as unknown as {
+      tripError(reason: string, token: { seq: number; sharedPauseAbort: boolean }, evidence?: number): Error;
+    };
+    const trip = seam.tripError.bind(seam);
+    let typed: Error | undefined;
+    seam.tripError = (reason, token) => {
+      typed = trip(reason, token, undefined);
+      assert.equal((typed as Error & { processedEvents?: number }).processedEvents, undefined);
+      return typed;
+    };
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = executor.run(makeCtx().ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.transport.turnStartCount === 1);
+      await tick(); t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.equal(error, typed);
+        assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+        assert.equal(error.message, "codex run idle timeout");
+        return true;
+      });
+      assert.equal(rig.transport.turnStartCount, 1);
+    } finally { rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  // The first turn publishes a plan; the human revision produces no model event.
+  function silentRevisionRig() {
+    const rig = makeMultiEpochRig([c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted())
+          .push(toolCall(1, "submit_plan", { plan_md: "initial" }, "th-1", "tn-1", "plan"))
+          .push(turnCompleted("completed"));
+        else c.transport.push(retryNote("rateLimitExceeded"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    }, epochResponder("th-1", "tn-1", transport => transport
+      .push(toolCall(2, "submit_plan", { plan_md: "revised" }, "th-1", "tn-1", "revised"))
+      .push(turnCompleted("completed")))]);
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 100000, initialCredentialAttempts: 1 };
+    return rig;
+  }
+
+  function revisionContext(overrides: Partial<RunContext> = {}) {
+    let gates = 0;
+    return makeCtx({ planApproved: false, approvedPlan: undefined, config: { plan_max_revisions: 1 },
+      gatePlan: async () => ++gates === 1 ? { kind: "revise", feedback: "change", inputId: 11 }
+        : { kind: "reject", reason: "test complete" }, ...overrides }).ctx;
+  }
+
+  for (const fallback of ["absent hook", "unnegotiated", "inactive", "idless"] as const)
+    it(`3466 ${fallback} preserves the original idle failure`, async t => {
+      const rig = silentRevisionRig();
+      let original: Error | undefined;
+      const recovery = new PlanRevisionRecovery({ generation: 1,
+        ownership: async () => ({ status: "running", claim_generation: 1, gate_revision: 1, claim_released: false }),
+        signal: () => new AbortController().signal, checkControl: () => {}, notice: async () => {},
+        steering: { takeRevisionRecoveryEvent: () => undefined, takeRevisionRecoveryControl: () => undefined,
+          awaitRevisionRecoveryEvent: async () => { throw new Error("unsupported recovery waited"); },
+          retirePersistedRevision: () => {}, setGateRevision: () => {} },
+      });
+      if (fallback === "idless") {
+        recovery.seed({ status: "awaiting_approval", plan_md: "initial" }, 1, async () => ({ applied: true }));
+        recovery.accept({ kind: "revise", feedback: "change", inputId: 11, sourceGateRevision: 1 });
+      }
+      const ctx = revisionContext(fallback === "absent hook" ? {} : {
+        retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
+          assert.ok(cause instanceof TransientRecoveryError && cause.idleStallKind === "zero_evidence");
+          original = cause.originalIdle;
+          if (fallback === "unnegotiated") throw cause;
+          await recovery.retry(cause, observer, remainingWallMs);
+        },
+      });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const trip = executor["tripError"].bind(executor);
+      executor["tripError"] = (...args) => {
+        const error = trip(...args);
+        if (error.message === "codex run idle timeout") original = error;
+        return error;
+      };
+      const dispose = rig.epochs[0]!.root.dispose!;
+      rig.epochs[0]!.root.dispose = async (...args) => {
+        assert.ok(rig.sessionOps.persist > 0, "session persisted before idle disposal");
+        return dispose(...args);
+      };
+      const running = executor.run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+        await tick(); t.mock.timers.tick(100);
+        await assert.rejects(running, (error: unknown) => {
+          assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+          assert.equal(error.message, "codex run idle timeout");
+          assert.equal(error, original);
+          return true;
+        });
+        assert.equal(rig.providerLaunches(), 1);
+        assert.equal(rig.client.releaseCalls.length, 1);
+        assert.ok(rig.epochs[0]!.disposed() > 0);
+      } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+    });
+
+  for (const control of ["source", "claim", "cancel", "pause", "wall"] as const)
+    for (const boundary of ["teardown", "backoff", "credential", "effect"] as const)
+    it(`3466 ${control} at ${boundary} prevents replacement admission`, async t => {
+      const rig = silentRevisionRig();
+      let cancelled = false, paused = false, stopped = false, retries = 0, parks = 0;
+      let released = 0, effects = 0;
+      const sourceError = new Error("source gate lost");
+      const controller = new AbortController();
+      const stop = () => {
+        stopped = true;
+        if (control === "cancel") cancelled = true;
+        if (control === "pause") { paused = true; controller.abort(new PauseNowSignal()); }
+        if (control === "wall") t.mock.timers.tick(100000);
+      };
+      const dispose = rig.epochs[0]!.root.dispose!;
+      rig.epochs[0]!.root.dispose = async (...args) => {
+        await dispose(...args);
+        if (boundary === "teardown") stop();
+      };
+      const release = rig.client.releaseCodex.bind(rig.client);
+      rig.client.releaseCodex = async (...args) => {
+        released++;
+        if (released === 2 && boundary === "credential") stop();
+        return release(...args);
+      };
+      const effect = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, launchEffectRoot: async (...args) => { effects++; return effect(...args); } };
+      const ctx = revisionContext({
+        signal: controller.signal, cancelRequested: () => cancelled, pauseModeRequested: () => paused ? "now" : null,
+        claimFenced: () => control === "claim" && stopped,
+        beforePlanRevisionTurn: async () => {
+          if (rig.epochs[0]!.disposed() === 0) return;
+          // A probe after credential release is the final effect-root admission fence.
+          if (boundary === "effect" && released === 2) stop();
+          if (stopped && control === "source") throw sourceError;
+        },
+        retryPlanRevisionTurn: async () => {
+          retries++;
+          assert.ok(rig.epochs[0]!.disposed() > 0, "disposal precedes backoff");
+          if (boundary === "backoff") stop();
+        },
+        parkForWall: async () => { parks++; return "parked"; },
+      });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+        await tick(); t.mock.timers.tick(100);
+        if (control === "wall") {
+          const result = await running;
+          assert.equal(result.walled?.reason, "codex run wall-clock timeout");
+          assert.equal(parks, 1);
+        } else await assert.rejects(running, (error: unknown) => {
+          if (control === "source") assert.equal(error, sourceError);
+          else if (control === "claim") assert.ok(error instanceof CodexRequestFailure && error.kind === "parent_abort");
+          else if (control === "pause") assert.ok(error instanceof PauseNowSignal);
+          else assert.equal((error as Error).message, "run cancelled");
+          return true;
+        });
+        assert.equal(rig.providerLaunches(), 1);
+        assert.equal(released, boundary === "credential" || boundary === "effect" ? 2 : 1);
+        assert.equal(effects, 1, "no replacement effect root after lost authority");
+        assert.equal(retries, boundary === "teardown" && control !== "source" && control !== "claim" ? 0 : 1);
+      } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+    });
+
+  for (const failure of ["vault", "unavailable"] as const)
+    for (const replacement of [false, true])
+    it(`3466 replacement ${failure} consumes three allowances before construction; owner replacement=${replacement}`, async t => {
+      const rig = silentRevisionRig();
+      let attempts = 0, retries = 0, probes = 0, expirations = 0;
+      const waits: number[] = [], notices: string[] = [];
+      const release = rig.client.releaseCodex.bind(rig.client);
+      rig.client.releaseCodex = async (...args) => {
+        attempts++;
+        if (attempts > 1) {
+          assert.equal(notices.filter(text => text.includes("re-driving the failed turn")).length,
+            attempts - 1, "allowance spent before every credential construction attempt");
+          throw new RequestError("POST", "/release", failure === "vault" ? 409 : 503,
+            failure === "vault" ? JSON.stringify({ reason: "vault_locked" }) : "unavailable");
+        }
+        return release(...args);
+      };
+      const recovery = new PlanRevisionRecovery({ generation: 1,
+        ownership: async () => { probes++; return { status: "running", claim_generation: 1, gate_revision: 1, claim_released: false }; },
+        signal: () => new AbortController().signal, checkControl: () => {}, notice: async text => { notices.push(text); },
+        policy: { random: () => 0, sleep: async (ms, signal) => {
+          waits.push(ms);
+          if (ms === 30000) return new Promise<void>((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+          t.mock.timers.tick(ms);
+        } },
+        steering: { takeRevisionRecoveryEvent: () => undefined, takeRevisionRecoveryControl: () => undefined,
+          awaitRevisionRecoveryEvent: async () => replacement && ++expirations === 1
+            ? { kind: "revise", feedback: "replacement J", inputId: 12, sourceGateRevision: 1 }
+            : { kind: "reject", reason: "exhausted", sourceGateRevision: 1 },
+          retirePersistedRevision: () => assert.fail("pending revision retired"), setGateRevision: () => {} },
+      });
+      recovery.seed({ status: "awaiting_approval", plan_md: "initial", presentation_id: "source" }, 1,
+        async () => ({ applied: true, status: "awaiting_approval", gateRevision: 1 }));
+      recovery.accept({ kind: "revise", feedback: "change", inputId: 11, sourceGateRevision: 1 });
+      const ctx = revisionContext({ beforePlanRevisionTurn: observer => recovery.beforeTurn(observer),
+        retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => { retries++; await recovery.retry(cause, observer, remainingWallMs); } });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+        await tick(); t.mock.timers.tick(100);
+        await assert.rejects(running, PlanRejectedError);
+        assert.equal(attempts, replacement ? 7 : 4, "initial credential plus three charged constructions per revision");
+        assert.equal(retries, replacement ? 7 : 4, "each exhausted allowance expires without construction");
+        assert.equal(rig.providerLaunches(), 1);
+        assert.equal(waits.filter(ms => ms !== 30000).reduce((a, b) => a + b, 0), replacement ? 65000 : 35000);
+        if (replacement) assert.deepEqual(recovery.fields(12).superseded_revision_input_ids, [11]);
+        assert.ok(probes > 3, "admission revalidates repeatedly without spending twice");
+        assert.match(notices.at(-1)!, /retry allowance exhausted/);
+      } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+    });
+
+  it("3466 source is proved after the last disposal even without a capture revision", async t => {
+    const rig = silentRevisionRig();
+    let disposals = 0, proofsAfterLastDisposal = 0, retries = 0;
+    const lost = new Error("source changed during final disposal");
+    const wire = rig.deps.wireFileop!;
+    rig.deps = { ...rig.deps, wireFileop: (...args) => {
+      const handle = wire(...args);
+      return { ...handle, dispose: async () => { await handle.dispose(); disposals++; } };
+    } };
+    const ctx = revisionContext({ beforePlanRevisionTurn: async () => {
+      if (disposals >= 2) { proofsAfterLastDisposal++; throw lost; }
+    }, retryPlanRevisionTurn: async () => { retries++; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+      await tick(); t.mock.timers.tick(100);
+      await assert.rejects(running, error => error === lost);
+      assert.equal(proofsAfterLastDisposal, 1);
+      assert.equal(retries, 1);
+      assert.equal(rig.client.releaseCalls.length, 1);
+      assert.equal(rig.providerLaunches(), 1);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const outcome of ["rebuild", "reject", "cancel"] as const)
+    for (const deferred of [false, true])
+    it(`3466 repeated teardown revokes the exact captured disposal proof outcome=${outcome} deferred=${deferred}`, async t => {
+    const rig = silentRevisionRig();
+    const wire = rig.deps.wireFileop!;
+    let disposals = 0, retries = 0;
+    rig.deps = { ...rig.deps, deferRegistryTeardown: deferred, wireFileop: (...args) => {
+      const handle = wire(...args);
+      return { ...handle, dispose: async () => {
+        if (++disposals > 1) throw new Error("second teardown failed");
+        await handle.dispose();
+      } };
+    } };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const ownerExit = outcome === "reject" ? new PlanRejectedError("owner reject", 1) : new Error("run cancelled");
+    const tearDown = executor["tearDownEpoch"].bind(executor);
+    let teardownCalls = 0;
+    executor["tearDownEpoch"] = (...args) => {
+      if (++teardownCalls === 2) {
+        assert.equal(args[5], outcome === "rebuild" ? "replacement" : undefined,
+          "owner controls must exercise run() terminal cleanup directly");
+        assert.equal(args[4], outcome === "rebuild" ? true : !deferred);
+      }
+      return tearDown(...args);
+    };
+    let oldSafety: Parameters<typeof executor["verifiedDisposedCaptureFacades"]["has"]>[0];
+    let oldRegistry: ExecutionRegistry | undefined;
+    const ctx = revisionContext({ beforePlanRevisionTurn: async () => {
+      if (!oldRegistry) {
+        const entry = [...executor["epochSafeties"]].find(([, safety]) => safety === executor.safety);
+        assert.ok(entry);
+        [oldRegistry, oldSafety] = entry;
+      }
+    }, retryPlanRevisionTurn: async () => {
+      retries++;
+      assert.ok(executor["verifiedDisposedCaptureFacades"].has(oldSafety!));
+      assert.equal(executor["unverifiedEpochRegistries"].has(oldRegistry!), false);
+      if (outcome !== "rebuild") throw ownerExit;
+    } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = executor.run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+      await tick(); t.mock.timers.tick(100);
+      await assert.rejects(running, error => {
+        if (outcome === "rebuild") assert.ok(error instanceof EpochCleanupUnprovenError);
+        else assert.equal(error, ownerExit, "cleanup must preserve the owner control outcome");
+        return true;
+      });
+      assert.ok(teardownCalls >= 2, "the repeated teardown ran");
+      assert.equal(retries, 1);
+      assert.equal(rig.client.releaseCalls.length, 1);
+      assert.equal(rig.providerLaunches(), 1);
+      assert.equal(executor["verifiedDisposedCaptureFacades"].has(oldSafety!), false);
+      assert.equal(executor["unverifiedEpochRegistries"].has(oldRegistry!), true);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const wallMs of [100000, 34000]) it(`3466 owner wait is free but backoff is charged wall=${wallMs}`, async t => {
+    const rig = silentRevisionRig();
+    // Three further silent epochs, then a successful owner replacement.
+    const silent: Responder = c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+      return {};
+    };
+    const extra = makeMultiEpochRig([silent, silent, silent]);
+    rig.epochs.splice(1, 0, ...extra.epochs);
+    rig.deps = { ...rig.deps, wallMs };
+    let waits = 0, retries = 0, parks = 0, suspended = false, backoff = 0, ownerWait = 0, lastBackoff = 0;
+    const recovery = new PlanRevisionRecovery({ generation: 1,
+      ownership: async () => {
+        assert.equal(suspended, false, "source work must be charged");
+        t.mock.timers.tick(10);
+        return { status: "running", claim_generation: 1, gate_revision: 1, claim_released: false };
+      }, signal: () => new AbortController().signal, checkControl: () => {}, notice: async () => {},
+      policy: { random: () => 0, sleep: async (ms, signal) => {
+        if (ms !== 30000) { backoff += ms; lastBackoff = ms; t.mock.timers.tick(ms); return; }
+        if (++waits <= 4) { ownerWait += ms; t.mock.timers.tick(ms); return; }
+        return new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      } },
+      steering: { takeRevisionRecoveryEvent: () => undefined, takeRevisionRecoveryControl: () => undefined,
+        awaitRevisionRecoveryEvent: async () => waits >= 4
+          ? { kind: "revise", feedback: "J", inputId: 12, sourceGateRevision: 1 }
+          : new Promise(() => {}),
+        retirePersistedRevision: () => assert.fail("pending revision retired"), setGateRevision: () => {} },
+    });
+    recovery.seed({ status: "awaiting_approval", plan_md: "initial", presentation_id: "source" }, 1,
+      async () => { assert.equal(suspended, false); t.mock.timers.tick(10);
+        return { applied: true, status: "awaiting_approval", gateRevision: 1 }; });
+    recovery.accept({ kind: "revise", inputId: 11, sourceGateRevision: 1, feedback: "I" });
+    const ctx = revisionContext({ beforePlanRevisionTurn: observer => recovery.beforeTurn(observer),
+      retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
+        retries++;
+        await recovery.retry(cause, waiting => { observer?.(waiting); suspended = waiting; }, remainingWallMs);
+      }, parkForWall: async () => { parks++; return "parked"; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      for (let epoch = 0; epoch < (wallMs === 100000 ? 4 : 3); epoch++) {
+        await until(() => rig.epochs[epoch]!.transport.turnStartCount === (epoch === 0 ? 2 : 1));
+        await tick(); t.mock.timers.tick(100);
+      }
+      if (wallMs === 100000) {
+        await assert.rejects(running, PlanRejectedError);
+        assert.equal(rig.providerLaunches(), 5);
+        assert.equal(waits, 5);
+        assert.deepEqual(recovery.fields(12).superseded_revision_input_ids, [11]);
+      } else {
+        assert.equal((await running).walled?.reason, "codex run wall-clock timeout");
+        assert.equal(parks, 1);
+        assert.equal(waits, 0);
+        assert.equal(rig.providerLaunches(), 3);
+        assert.equal(rig.client.releaseCalls.length, 3, "no credentials for another root after wall exhaustion");
+        assert.equal(lastBackoff, 10, "final sleep is capped below the 250 ms slice");
+      }
+      assert.equal(ownerWait, wallMs === 100000 ? 120000 : 0);
+      assert.equal(backoff, wallMs === 100000 ? 35000 : 33510);
+      assert.equal(retries, wallMs === 100000 ? 4 : 3);
+      assert.equal(suspended, false);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const entry of ["retry", "beforeTurn", "owner tick"] as const)
+    for (const work of ["source", "restoration", "unavailable", "uncertain", "restore unavailable"] as const)
+    for (const extended of [false, true])
+    it(`3466 exhausted ${entry} ${work} work spends wall before owner wait; extended=${extended}`, async t => {
+      const rig = silentRevisionRig();
+      rig.deps = { ...rig.deps, wallMs: 1000 };
+      let waits = 0, parks = 0, spent = false, replacement = false, afterTick = false, replacementProbes = 0;
+      let restoring = false;
+      let proofUnavailable = false, failedProbes = 0;
+      let status: "running" | "awaiting_approval" = "awaiting_approval";
+      const recovery = new PlanRevisionRecovery({ generation: 1,
+        ownership: async () => {
+          if (!spent && !restoring && rig.epochs[0]!.disposed() > 0 &&
+              (entry === "retry" || (entry === "beforeTurn" && replacement && ++replacementProbes === 2) ||
+                (entry === "owner tick" && afterTick))) {
+            if (work === "source") { spent = true; t.mock.timers.tick(1000); }
+            else if (work === "restoration" || work === "restore unavailable") { restoring = true; status = "running"; }
+            else { spent = true; proofUnavailable = true; }
+          }
+          if (proofUnavailable) {
+            failedProbes++;
+            t.mock.timers.tick(100);
+            if (work === "unavailable") throw new RequestError("GET", "/ownership", 503, "unavailable");
+            return { status }; // Missing generation/release evidence is not ownership.
+          }
+          return { status, claim_generation: 1, gate_revision: 1, claim_released: false };
+        }, signal: () => new AbortController().signal,
+        checkControl: () => {
+          if (failedProbes >= 4) throw new Error("ownership retries exceeded the wall budget");
+        }, notice: async () => {},
+        policy: { redrives: 0, sleep: async (ms, signal) => {
+          if (proofUnavailable || (restoring && work === "restore unavailable")) { t.mock.timers.tick(ms); return; }
+          if (entry === "owner tick" && !afterTick) {
+            assert.equal(ms, 30000);
+            t.mock.timers.tick(ms);
+            afterTick = true;
+            return;
+          }
+          return new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        } },
+        steering: { takeRevisionRecoveryEvent: () => undefined, takeRevisionRecoveryControl: () => undefined,
+          awaitRevisionRecoveryEvent: async (_source, _after, signal) => {
+            waits++;
+            if (entry === "beforeTurn" && waits === 1)
+              return { kind: "revise", inputId: 12, feedback: "replacement", sourceGateRevision: 1 };
+            if (entry === "owner tick" && waits === 1)
+              return new Promise((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+            return { kind: "reject", reason: "test complete", sourceGateRevision: 1 };
+          },
+          retirePersistedRevision: () => assert.fail("pending revision retired"), setGateRevision: () => {} },
+      });
+      recovery.seed({ status: "awaiting_approval", plan_md: "initial", presentation_id: "source" }, 1,
+        async () => {
+          if (restoring && work === "restore unavailable") {
+            spent = true;
+            failedProbes++;
+            t.mock.timers.tick(100);
+            throw new RequestError("POST", "/state", 503, "unavailable");
+          }
+          if (restoring && !spent) { spent = true; t.mock.timers.tick(1000); }
+          status = "awaiting_approval";
+          return { applied: true, status, gateRevision: 1 };
+        });
+      recovery.accept({ kind: "revise", inputId: 11, sourceGateRevision: 1, feedback: "I" });
+      const ctx = revisionContext({
+        // Reflect keeps this regression executable against the old one-argument
+        // hook as well as the new remaining-wall hook for the red/green proof.
+        beforePlanRevisionTurn: async (observer?: (waiting: boolean) => void, remainingWallMs?: () => number) =>
+          Reflect.apply(recovery.beforeTurn, recovery, [observer, remainingWallMs]),
+        retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
+          try { return await recovery.retry(cause, observer, remainingWallMs); }
+          catch (error) {
+            if (error instanceof PlanRevisionReplacedError) replacement = true;
+            throw error;
+          }
+        },
+        parkForWall: async () => {
+          parks++; proofUnavailable = false; restoring = false; status = "awaiting_approval";
+          return extended ? "refused" : "parked";
+        },
+        takeWallParkRefresh: () => ({ totalSeconds: 2, usedSeconds: 1 }),
+      });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+        await tick(); t.mock.timers.tick(100);
+        if (extended) await assert.rejects(running, PlanRejectedError);
+        else assert.equal((await running).walled?.reason, "codex run wall-clock timeout");
+        assert.equal(spent, true);
+        assert.equal(parks, 1, "source work spending the wall takes the wall route before owner waiting");
+        assert.equal(waits, (entry === "retry" ? 0 : 1) + (extended ? 1 : 0),
+          "only existing owner waits are free; extension re-enters the exhausted wait");
+        assert.equal(rig.providerLaunches(), 1, "wall extension must not admit an uncharged reconstruction");
+        assert.equal(rig.client.releaseCalls.length, 1);
+        assert.equal(rig.epochs[0]!.transport.turnStartCount, 2);
+      } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+    });
+
+  it("3466 teardown, backoff and admission consume the same remaining wall", async t => {
+    const rig = silentRevisionRig();
+    rig.deps = { ...rig.deps, wallMs: 1000 };
+    const dispose = rig.epochs[0]!.root.dispose!;
+    rig.epochs[0]!.root.dispose = async (...args) => { await dispose(...args); t.mock.timers.tick(300); };
+    let probed = false, retries = 0, parks = 0;
+    const ctx = revisionContext({ beforePlanRevisionTurn: async () => {
+      if (rig.epochs[0]!.disposed() && !probed) { probed = true; t.mock.timers.tick(300); }
+    }, retryPlanRevisionTurn: async () => { retries++; t.mock.timers.tick(300); },
+    parkForWall: async () => { parks++; return "parked"; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+      await tick(); t.mock.timers.tick(100);
+      const result = await running;
+      assert.equal(result.walled?.reason, "codex run wall-clock timeout");
+      assert.equal(retries, 1);
+      assert.equal(parks, 1);
+      assert.equal(rig.client.releaseCalls.length, 1);
+      assert.equal(rig.providerLaunches(), 1);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("3466 spent wall during failed replacement cleanup precedes retry and owner wait", async t => {
+    const rig = silentRevisionRig();
+    const wire = rig.deps.wireFileop!;
+    const effect = rig.deps.launchEffectRoot!;
+    let wires = 0, effects = 0, retries = 0, parks = 0;
+    rig.deps = { ...rig.deps, wireFileop: (...args) => {
+      if (++wires === 2) throw new CodexCredentialDeferredError();
+      return wire(...args);
+    }, launchEffectRoot: async (...args) => {
+      const handle = await effect(...args);
+      if (++effects === 1) return handle;
+      return { ...handle, dispose: async (...disposeArgs) => {
+        const result = await handle.dispose(...disposeArgs);
+        t.mock.timers.tick(100000);
+        return result;
+      } };
+    } };
+    const ctx = revisionContext({ retryPlanRevisionTurn: async () => { retries++; },
+      parkForWall: async () => { parks++; return "parked"; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+      await tick(); t.mock.timers.tick(100);
+      assert.equal((await running).walled?.reason, "codex run wall-clock timeout");
+      assert.equal(retries, 1, "spent cleanup cannot enter another backoff or owner wait");
+      assert.equal(parks, 1);
+      assert.equal(rig.providerLaunches(), 1);
+      assert.equal(rig.client.releaseCalls.length, 2);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const failure of ["predecessor", "half-built"] as const)
+    it(`3466 unverified ${failure} cleanup is terminal and evicts released credentials`, async t => {
+      const rig = silentRevisionRig();
+      let retries = 0, wires = 0;
+      const diagnostics = recordingLog();
+      if (failure === "predecessor") rig.epochs[0]!.root.dispose = async () => { throw new Error("disposal unverified"); };
+      else {
+        const wire = rig.deps.wireFileop!;
+        const effect = rig.deps.launchEffectRoot!;
+        let effects = 0;
+        rig.deps = { ...rig.deps,
+          launchEffectRoot: async (...args) => {
+            const handle = await effect(...args);
+            if (++effects === 1) return handle;
+            return { ...handle, dispose: async () => ({ clean: false, reason: "fixture cleanup unverified" }) };
+          },
+          wireFileop: (...args) => {
+            if (++wires === 2) throw new CodexCredentialDeferredError();
+            return wire(...args);
+          },
+        };
+      }
+      const ctx = revisionContext({ retryPlanRevisionTurn: async () => { retries++; } });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION), diagnostics.log).run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+        await tick(); t.mock.timers.tick(100);
+        await assert.rejects(running, (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok(error instanceof EpochCleanupUnprovenError);
+          return true;
+        });
+        assert.equal(retries, failure === "predecessor" ? 0 : 1);
+        assert.equal(rig.client.releaseCalls.length, failure === "predecessor" ? 1 : 2);
+        assert.equal(rig.providerLaunches(), 1);
+        assert.ok(diagnostics.added.includes(FRESH_TOKEN));
+        assert.equal(diagnostics.added.filter(token => token === FRESH_TOKEN).length,
+          diagnostics.removed.filter(token => token === FRESH_TOKEN).length, "every released credential is evicted");
+      } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+    });
+
+  it("3466 a human revision with model evidence keeps the terminal idle contract", async t => {
+    const rig = silentRevisionRig();
+    let retries = 0;
+    const ctx = revisionContext({ retryPlanRevisionTurn: async () => { retries++; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+      rig.epochs[0]!.transport.push(agentMessage("Working on your revision"));
+      await tick(); t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+        assert.equal(error.message, "codex run idle timeout");
+        return true;
+      });
+      assert.equal(retries, 0);
+      assert.equal(rig.providerLaunches(), 1);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  // Only these fixtures use a 100 ms idle and a 5 ms runner poll. Keep native,
+  // cancellable handles, but do not let startup latency choose which turn expires.
+  function fixtureIdleScheduler(t: TestContext) {
+    const nativeSetTimeout = globalThis.setTimeout;
+    const nativeClearTimeout = globalThis.clearTimeout;
+    const pending = new Map<ReturnType<typeof setTimeout>, () => void>();
+    const releases = new Set<ReturnType<typeof setImmediate>>();
+    let fired = 0, restored = false;
+    const set = t.mock.method(globalThis, "setTimeout", (callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+      if (ms !== 100) return nativeSetTimeout(callback, ms, ...args);
+      assert.equal(pending.size, 0, "the previous idle deadline was cancelled before rearming");
+      const handle = nativeSetTimeout(() => {}, 0);
+      nativeClearTimeout(handle);
+      pending.set(handle, callback);
+      return handle;
+    });
+    const clear = t.mock.method(globalThis, "clearTimeout", (handle: ReturnType<typeof setTimeout> | undefined) => {
+      if (handle !== undefined) pending.delete(handle);
+      nativeClearTimeout(handle);
+    });
+    return {
+      expireAfterTurnStart: () => {
+        // One immediate per silent turn; let queued thread/start frames re-arm idle
+        // first. Productive turns instead complete and cancel their own deadline.
+        const immediate = setImmediate(() => {
+          releases.delete(immediate);
+          assert.equal(pending.size, 1, "one idle deadline after the silent turn/start");
+          const [handle, callback] = pending.entries().next().value!;
+          pending.delete(handle);
+          fired++;
+          callback();
+        });
+        releases.add(immediate);
+      },
+      assertSettled: (expected: number) => {
+        assert.equal(fired, expected);
+        assert.equal(pending.size, 0, "initial, productive and replacement deadlines cancelled");
+        assert.equal(releases.size, 0, "no queued deadline releases");
+      },
+      restore: () => {
+        if (restored) return;
+        restored = true;
+        for (const immediate of releases) clearImmediate(immediate);
+        releases.clear();
+        pending.clear();
+        set.mock.restore();
+        clear.mock.restore();
+      },
+    };
+  }
+
+  it("3466 real idle expires while startup source admission is held", async t => {
+    const rig = silentRevisionRig();
+    const nativeSetTimeout = globalThis.setTimeout;
+    const scheduler = fixtureIdleScheduler(t);
+    rig.epochs[0]!.transport.requestOverride = c => {
+      if (c.method === "turn/start" && c.turnStartCount === 2) scheduler.expireAfterTurnStart();
+      return undefined;
+    };
+    let release!: () => void, entered!: () => void, expired!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const sourceEntered = new Promise<void>(resolve => { entered = resolve; });
+    const idleExpired = new Promise<void>(resolve => { expired = resolve; });
+    let holdSource = false, sourceHeld = false, retries = 0, realIdleTrips = 0;
+    let terminalRoots = -1, terminalCredentials = -1;
+    const adopt = rig.deps.sessionStore!.adopt;
+    rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!,
+      adopt: async (...args) => {
+        const result = await adopt(...args);
+        if (rig.epochs[0]!.disposed() > 0) holdSource = true;
+        return result;
+      },
+    } };
+    const ctx = revisionContext({
+      beforePlanRevisionTurn: async () => {
+        if (!holdSource) return;
+        sourceHeld = true;
+        entered();
+        try { await withTimeout(held, 3000, "held startup source admission"); }
+        finally { sourceHeld = false; }
+      },
+      retryPlanRevisionTurn: async cause => {
+        assert.ok(cause instanceof TransientRecoveryError && cause.idleStallKind === "zero_evidence");
+        if (++retries > 1) {
+          terminalRoots = rig.providerLaunches();
+          terminalCredentials = rig.client.releaseCalls.length;
+          throw cause.originalIdle!;
+        }
+        scheduler.assertSettled(1);
+        scheduler.restore();
+        // The recreated turn uses the genuine 100 ms timer, including startup.
+        t.mock.method(globalThis, "setTimeout", (callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) =>
+          nativeSetTimeout(ms === 100 ? () => {
+            callback();
+            realIdleTrips++;
+            assert.equal(sourceHeld, true, "real idle expires before source admission returns");
+            expired();
+          } : callback, ms, ...args));
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    const settled = running.catch(error => error);
+    try {
+      await withTimeout(sourceEntered, 3000, "startup source admission entered");
+      await withTimeout(idleExpired, 3000, "real startup idle expiry");
+      assert.equal(rig.providerLaunches(), 1, "held source has not admitted a replacement root");
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+      release();
+      const error = await withTimeout(settled, 3000, "startup idle terminal");
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "codex run idle timeout");
+      assert.equal(realIdleTrips, 1);
+      assert.equal(retries, 2, "second idle is terminal, with no further redrive");
+      await tick();
+      assert.equal(rig.providerLaunches(), terminalRoots, "no root after terminal decision");
+      assert.equal(rig.client.releaseCalls.length, terminalCredentials, "no credential after terminal decision");
+      assert.ok(rig.epochs.slice(0, terminalRoots).every(epoch => epoch.disposed() > 0), "all launched roots disposed");
+      assert.deepEqual(rig.epochs.map(epoch => epoch.transport.turnStartCount), [2, 0]);
+    } finally {
+      release();
+      for (const epoch of rig.epochs) epoch.transport.end();
+      try { await withTimeout(settled, 3000, "startup idle cleanup"); }
+      finally { scheduler.restore(); t.mock.restoreAll(); }
+    }
+  });
+
+  for (const mode of ["redrive", "replacement", "cancel", "reject", "unnegotiated"] as const)
+    it(`3466 real runner revision silence ${mode} preserves the negotiated source and receipts`, async t => {
+    const api = new FakeApi("revision-idle-worker");
+    api.planRevisionRetries = true;
+    api.gateRevisions = true;
+    api.strictReceiptGenerations = true;
+    api.stampInputCreatedAt = true;
+    api.stampGateBindings = true;
+    const url = await api.listen();
+    const fx = makeFixture();
+    const diagnostics = recordingLog();
+    const scheduler = fixtureIdleScheduler(t);
+    const rig = makeMultiEpochRig([c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted())
+          .push(toolCall(1, "submit_plan", { plan_md: "# Initial plan" }, "th-1", "tn-1", "plan"))
+          .push(turnCompleted("completed"));
+        else scheduler.expireAfterTurnStart();
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    }, ...(mode === "redrive" ? [] : Array.from({ length: 3 }, () => epochResponder("th-1", "tn-1", () => scheduler.expireAfterTurnStart()))),
+    epochResponder("th-1", "tn-1", transport => transport
+      .push(toolCall(2, "submit_plan", { plan_md: "# Revised plan" }, "th-1", "tn-1", "revised"))
+      .push(turnCompleted("completed")))]);
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000, deferRegistryTeardown: true };
+    const client = new WorkerClient(url, "revision-idle-worker", "test", diagnostics.log, {
+      sleep: async () => {}, terminalRetrySchedule: [1, 1],
+    });
+    client.protocolFeatures = ["claim_generation_fence", "gate_revision_v1",
+      ...(mode === "unnegotiated" ? [] : ["plan_revision_retry_v1"])];
+    const claim = makeClaim({
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      claim_generation: 1, auto_approve: false, plan_approved: false, config: { plan_max_revisions: 1 },
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+    });
+    api.setInputClaimGeneration(claim.run_id, 1);
+    api.onState(claim.run_id, body => {
+      if (body.status !== "awaiting_approval") return;
+      if (body.plan_md === "# Initial plan") api.setInputs(claim.run_id,
+        [{ id: 1, kind: "revise_plan", body: "tighten the scope" }]);
+      if (body.plan_md === "# Revised plan") api.setInputs(claim.run_id,
+        [{ id: 3, kind: "reject_plan", body: "test complete" }]);
+    });
+    let revisions = 0, retries = 0, expired = 0;
+    const waits: number[] = [];
+    const feedback: unknown[] = [], notices: string[] = [];
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const run = executor.run.bind(executor);
+    executor.run = async ctx => {
+      const gate = ctx.gatePlan!;
+      const retry = ctx.retryPlanRevisionTurn!;
+      const postMessages = client.postMessages.bind(client);
+      client.postMessages = async (...args) => {
+        await postMessages(...args);
+        for (const message of args[1]) {
+          if (message.kind === "plan_feedback") feedback.push(rec(message.payload).feedback);
+          if (message.kind === "status") notices.push(String(rec(message.payload).text));
+          if (message.kind !== "status" || !String(rec(message.payload).text).includes("retry allowance exhausted")) continue;
+          expired++;
+          assert.equal(api.isApplied(claim.run_id, 1), false);
+          assert.ok(rig.epochs[0]!.disposed() > 0, "exhausted gate is offered only after disposal");
+          assert.equal(rig.providerLaunches(), 4);
+          assert.ok(rig.epochs.slice(0, 4).every(epoch => epoch.disposed() > 0), "all silent epochs disposed");
+          api.setInputs(claim.run_id, [{ id: 2,
+            kind: mode === "replacement" ? "revise_plan" : mode === "reject" ? "reject_plan" : "cancel",
+            body: mode === "replacement" ? "replacement J" : "stop" }]);
+        }
+      };
+      ctx.gatePlan = async (...args) => {
+        const verdict = await gate(...args);
+        if (verdict.kind === "revise") {
+          assert.equal(verdict.feedback, "tighten the scope");
+          revisions++;
+        }
+        return verdict;
+      };
+      ctx.retryPlanRevisionTurn = async (cause, observer, remainingWallMs) => {
+        assert.ok(cause instanceof TransientRecoveryError && cause.idleStallKind === "zero_evidence" && !cause.providerOrigin);
+        retries++; await retry(cause, observer, remainingWallMs);
+      };
+      return run(ctx);
+    };
+    try {
+      const git = new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions());
+      const runner = new RunRunner(client, git, () => ({ executor }), diagnostics.log, 20, undefined, {
+        pollMs: 5,
+        planRevisionRetryPolicy: { redrives: 3, random: () => 0,
+          sleep: async (ms, signal) => {
+            signal.throwIfAborted(); waits.push(ms);
+            if (ms === 30000) await new Promise<void>((resolve, reject) => {
+              const timer = setTimeout(resolve, ms);
+              signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+            });
+          } },
+        quiesceRun: async () => ({
+          process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+          docker: { state: "not_wired", removed: [], detail: "not wired" },
+        }),
+      });
+      const stop = () => runner.shutdown();
+      t.signal.addEventListener("abort", stop, { once: true });
+      const running = runner.execute(claim);
+      try {
+        await withTimeout(running, 8000, `revision silence ${mode}`);
+      } catch (error) {
+        t.diagnostic(diagnostics.lines.join("\n"));
+        throw error;
+      } finally {
+        stop();
+        t.signal.removeEventListener("abort", stop);
+        for (const epoch of rig.epochs) epoch.transport.end();
+        await withTimeout(running, 3000, "revision runner teardown");
+      }
+      scheduler.assertSettled(mode === "redrive" || mode === "unnegotiated" ? 1 : 4);
+      const states = api.states.filter(s => s.runId === claim.run_id).map(s => s.body);
+      const revised = states.find(s => s.plan_md === "# Revised plan");
+      const publishes = mode === "redrive" || mode === "replacement";
+      if (mode === "unnegotiated") {
+        assert.equal(retries, 1);
+        assert.equal(expired, 0);
+        assert.equal(rig.providerLaunches(), 1);
+        assert.equal(rig.client.releaseCalls.length, 1);
+        assert.ok(rig.sessionOps.persist > 0);
+        assert.ok(rig.epochs[0]!.disposed() > 0);
+        assert.equal(api.isApplied(claim.run_id, 1), false);
+        assert.equal(states.filter(state => state.status === "awaiting_approval").length, 1);
+        assert.equal(states.filter(state => state.status === "failed").length, 1);
+        assert.equal(states.at(-1)?.status, "failed", "terminal report closes the source gate");
+        assert.equal(states.at(-1)?.failure_reason, "codex run idle timeout");
+        assert.ok(!states.some(state => state.status === "recovery_wait"));
+        return;
+      }
+      const failed = rig.epochs[0]!.transport.requests.filter(r => r.method === "turn/start").at(-1)!;
+      if (mode !== "redrive") {
+        for (const epoch of rig.epochs.slice(1, 4)) {
+          const turns = epoch.transport.requests.filter(r => r.method === "turn/start");
+          assert.equal(turns.length, 1);
+          assert.deepEqual(turns[0]!.params, failed.params, "each silent redrive retains the exact prompt");
+        }
+        assert.equal(waits.filter(ms => ms !== 30000).reduce((sum, ms) => sum + ms, 0), 35000);
+      }
+      assert.deepEqual(feedback, mode === "replacement" ? ["tighten the scope", "replacement J"] : ["tighten the scope"]);
+      assert.equal(notices.filter(text => text.includes("re-driving the failed turn")).length,
+        mode === "redrive" ? 1 : mode === "replacement" ? 4 : 3);
+      assert.equal(revisions, 1);
+      assert.equal(retries, mode === "redrive" ? 1 : 4, diagnostics.lines.join("\n"));
+      assert.equal(expired, mode === "redrive" ? 0 : 1, diagnostics.lines.join("\n"));
+      assert.equal(rig.providerLaunches(), mode === "redrive" ? 2 : mode === "replacement" ? 5 : 4,
+        diagnostics.lines.join("\n"));
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 2);
+      assert.equal(states.filter(s => s.status === "awaiting_approval").length, publishes ? 2 : 1);
+      assert.equal(Boolean(revised), publishes, diagnostics.lines.join("\n"));
+      assert.equal(api.isApplied(claim.run_id, 1), publishes);
+      if (!publishes) assert.equal(api.isInputSuperseded(claim.run_id, 1), false);
+      if (revised) {
+        assert.equal(revised.revision_input_id, mode === "replacement" ? 2 : 1);
+        assert.equal(revised.expected_gate_revision, 1);
+        assert.deepEqual(revised.superseded_revision_input_ids, mode === "replacement" ? [1] : []);
+        assert.equal(api.isInputSuperseded(claim.run_id, 1), mode === "replacement");
+        const retried = rig.epochs[mode === "redrive" ? 1 : 4]!.transport.requests.find(r => r.method === "turn/start")!;
+        if (mode === "redrive") {
+          assert.deepEqual(retried.params, failed.params);
+          assert.equal(waits.reduce((sum, ms) => sum + ms, 0), 5000);
+        } else {
+          assert.match(JSON.stringify(retried.params), /replacement J/);
+          assert.doesNotMatch(JSON.stringify(retried.params), /tighten the scope/);
+          assert.equal(api.isApplied(claim.run_id, 2), true);
+        }
+      }
+      assert.ok(!states.some(s => s.status === "recovery_wait"));
+      assert.ok(!states.some(s => s.failure_reason === "codex run idle timeout"));
+    } finally {
+      scheduler.restore();
+      for (const epoch of rig.epochs) epoch.transport.end();
+      await api.close(); fx.cleanup();
+    }
+  });
+
+  it("3462 a plain idle-message Error has unknown evidence and cannot recover", async () => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") throw new Error("codex run idle timeout");
+      return {};
+    } });
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), (error: unknown) => {
+      assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+      assert.equal(error.message, "codex run idle timeout"); return true;
+    });
+    assert.equal(rig.transport.turnStartCount, 1);
+  });
+});
+
 describe("CodexExecutor: transient provider retry (issue #2099)", () => {
   /** A failed `turn/completed` carrying a terminal `turn.error.codexErrorInfo`. */
   function turnCompletedWithError(codexErrorInfo: unknown, threadId = "th-1", turnId = "tn-1"): CodexNotification {
@@ -17910,33 +20323,116 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(retryNotices(emitted).length, 2);
   });
 
-  it("rateLimitExceeded exhaustion from the real executor reaches the runner typed provider_outage park", async () => {
+  for (const mode of ["provider retry silence", "provider", "legacy zero", "typed zero", "initial", "automatic", "implement"] as const) it(`real runner M2 ${mode} captures and resumes the persisted session`, async t => {
+    const silence = mode !== "provider";
+    const typed = silence && mode !== "legacy zero";
+    const retrySilence = mode === "provider retry silence";
+    const productive = typed && mode !== "typed zero" && !retrySilence;
+    const planning = mode === "initial" || mode === "automatic";
+    const parkedId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const api = new FakeApi("rate-limit-worker");
     const url = await api.listen();
     const fx = makeFixture();
     const diagnostics = recordingLog();
-    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "rateLimitExceeded") });
-    tinyBackoff(rig, { deferRegistryTeardown: true });
+    const rig = makeRig({ responder: silence ? c => {
+      if (c.method === "thread/start") return { thread: { id: parkedId } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted(parkedId));
+        if (mode === "automatic" && c.turnStartCount === 1)
+          c.transport.push(toolCall(1, "submit_plan", { plan_md: "initial" }, parkedId, "tn-1", "plan"))
+            .push(turnCompleted("completed", parkedId));
+        else if (productive) c.transport.push(agentMessage("partial output", parkedId));
+        else if (retrySilence) c.transport.push({ kind: "codex_error", method: "error", threadId: parkedId, turnId: "tn-1", willRetry: true,
+          params: { error: { codexErrorInfo: "rateLimitExceeded", message: "untrusted retry text" } } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } : failingThenDone(Number.MAX_SAFE_INTEGER, "rateLimitExceeded") });
+    tinyBackoff(rig, { deferRegistryTeardown: true, ...(silence ? { idleMs: typed ? 100 : 30 } : {}) });
+    const launchCapture = rig.deps.launchEffectRoot!;
+    const captureGitLaunches: CodexEffectLaunchSpec[] = [];
+    rig.deps = { ...rig.deps, launchEffectRoot: async (spec, deadline) => {
+      const handle = await launchCapture(spec, deadline);
+      const forwarded = forwardCredentialFreeGitRoot(spec, deadline, handle);
+      if (forwarded !== handle) captureGitLaunches.push(spec);
+      return forwarded;
+    } };
     const client = new WorkerClient(url, "rate-limit-worker", "test", diagnostics.log, {
       sleep: async () => {}, terminalRetrySchedule: [1, 1],
     });
     client.protocolFeatures = ["claim_generation_fence", "recovery_cause_provider_outage"];
+    if (silence) {
+      client.protocolFeatures = [...client.protocolFeatures, "run_checkpoint_durability"];
+      client.publishCheckpoint = async (_runId, _tip, pack) => {
+        for await (const _chunk of pack) { /* Drain the supervised capture's real pack. */ }
+        return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/test" } };
+      };
+    }
+    if (typed) {
+      client.protocolFeatures = [...client.protocolFeatures, "recovery_cause_codex_idle_stall_v1"];
+      api.stateAckWire = (body, run) => body.recovery_cause === "codex_idle_stall"
+        ? { status: 200, body: { run: { ...run, recovery_wait_cause: "codex_idle_stall", recovery_retry_not_before: "2026-10-28T00:00:00Z" } } }
+        : undefined;
+    }
     api.recoveryWaitRequiresRunning = true;
     const claim = makeClaim({
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
       claim_generation: 3,
-      plan_approved: true, plan_source: "agent", plan_md: "approved plan",
+      plan_approved: !planning, plan_source: "agent", plan_md: planning ? undefined : "approved plan",
+      ...(planning ? { auto_approve: true } : {}),
       secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
     });
+    const git = new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions());
+    const barePath = git.barePathFor(claim.repo.clone_url);
+    let parkedClone: Awaited<ReturnType<GitCache["createOrAttachRunnerClone"]>> | undefined;
+    const createClone = git.createOrAttachRunnerClone.bind(git);
+    git.createOrAttachRunnerClone = async (...args) => {
+      parkedClone = await createClone(...args);
+      return parkedClone;
+    };
     const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
     const homeDir = path.join(fx.dataDir, "rate-limit-home");
     let produced: unknown;
+    let clonePath: string | undefined;
     const run = executor.run.bind(executor);
     executor.run = async ctx => {
-      try { return await run(ctx); } catch (error) { produced = error; throw error; }
+      clonePath = ctx.worktreePath;
+      if (silence) {
+        const source = path.join(fx.dataDir, "session-source");
+        await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+        await fs.mkdir(homeDir, { recursive: true });
+        await fs.writeFile(path.join(source, "sessions", `rollout-${parkedId}.jsonl`),
+          JSON.stringify({ type: "session_meta", payload: { id: parkedId, cwd: ctx.worktreePath } }) + "\n");
+        await CodexSessionStore.persist(source, path.join(homeDir, "codex-session-store"));
+      }
+      // Read the fixture's actual refs without launching an extra unsupervised Git child.
+      const readFixtureHead = async (gitdir: string): Promise<string> => {
+        const head = (await fs.readFile(path.join(gitdir, "HEAD"), "utf8")).trim();
+        if (!head.startsWith("ref: ")) return head;
+        const ref = head.slice(5);
+        try { return (await fs.readFile(path.join(gitdir, ref), "utf8")).trim(); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          const packed = await fs.readFile(path.join(gitdir, "packed-refs"), "utf8");
+          const entry = packed.split("\n").find(line => line.slice(41) === ref);
+          assert.ok(entry, `fixture HEAD ref ${ref} must exist`);
+          return entry.slice(0, 40);
+        }
+      };
+      const cloneHead = await readFixtureHead(path.join(ctx.worktreePath, ".git"));
+      assert.match(cloneHead, /^[0-9a-f]{40}$/);
+      assert.equal(await readFixtureHead(barePath), cloneHead, "worker bare and runner clone start at the same real HEAD");
+      if (mode === "automatic") ctx.gatePlan = async () => ({ kind: "revise", automatic: true, round: 1, feedback: "revise" });
+      if (productive) await fs.writeFile(path.join(ctx.worktreePath, "PARTIAL.txt"), "partial edit before stall\n");
+      try { return await run(ctx); } catch (error) {
+        produced = error;
+        assert.equal(rig.client.refreshCalls.length, 0, "provider retries do not refresh credentials");
+        throw error;
+      }
     };
     try {
-      await new RunRunner(client, new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions()),
+      if (typed) t.mock.timers.enable({ apis: ["setTimeout"] });
+      const executing = new RunRunner(client, git,
         () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
           pollMs: 5, recoveryRetryMs: 5, codexBoundaryDeadlineMs: 200,
           quiesceRun: async () => ({
@@ -17944,16 +20440,134 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
             docker: { state: "not_wired", removed: [], detail: "not wired" },
           }),
         }).execute(claim);
+      let executionError: unknown;
+      void executing.catch(error => { executionError = error; });
+      if (typed) {
+        const deadline = performance.now() + 10000;
+        const target = mode === "automatic" ? 2 : 1;
+        while (rig.transport.turnStartCount < target && executionError === undefined && performance.now() < deadline) await tick();
+        assert.ifError(executionError);
+        assert.equal(rig.transport.turnStartCount, target, diagnostics.lines.join("\n"));
+        for (let i = 0; i < 5; i++) await tick();
+        t.mock.timers.tick(100);
+        t.mock.timers.reset();
+      }
+      await executing;
       assert.ok(produced instanceof TransientRecoveryError, diagnostics.lines.join("\n"));
-      assert.equal(produced.providerOrigin, true);
-      assert.equal(rig.transport.turnStartCount, 3, "the real producer spent exactly two retries");
+      assert.equal(produced.idleStallKind, typed ? productive ? "productive" : "zero_evidence" : undefined);
+      assert.equal(produced.providerOrigin, !silence || retrySilence);
+      assert.ok(captureGitLaunches.some(spec => spec.identity === "worker_pat" && spec.cwd === barePath),
+        "capture uses real supervised Git in the trusted worker bare");
+      assert.ok(captureGitLaunches.some(spec => spec.identity === "command" && spec.cwd === clonePath),
+        "capture uses real supervised Git in the runner clone");
+      assert.equal(rig.transport.turnStartCount, silence ? mode === "automatic" ? 2 : 1 : 3, "idle parks directly; classified errors spend two retries");
       const reports = api.states.filter(s => s.runId === claim.run_id && s.body.status === "recovery_wait");
       assert.equal(reports.length, 1, diagnostics.lines.join("\n"));
-      assert.equal(reports[0]!.body.recovery_cause, "provider_outage");
-      assert.equal(reports[0]!.body.productive_turns, 0, "failed rate-limit attempts are not productive");
+      assert.equal(reports[0]!.body.recovery_cause, retrySilence ? "provider_outage" : typed ? "codex_idle_stall" : silence ? undefined : "provider_outage");
+      assert.equal(reports[0]!.body.provider_progress_turns, typed && !retrySilence ? mode === "automatic" ? 1 : 0 : undefined);
+      assert.equal(reports[0]!.body.productive_turns, silence && !retrySilence ? undefined : 0);
       assert.equal(reports[0]!.body.claim_generation, 3);
+      assert.equal(rig.client.refreshCalls.length, 1, "only the held recovery boundary reconciles credentials");
       assert.ok(!api.states.some(s => s.body.status === "failed" || s.body.status === "limit_wait"));
-    } finally { await api.close(); fx.cleanup(); }
+      if (productive) {
+        assert.equal(await fs.readFile(path.join(clonePath!, "PARTIAL.txt"), "utf8"), "partial edit before stall\n");
+        assert.ok(captureGitLaunches.some(spec => spec.identity === "command" && spec.args?.includes("commit")),
+          "partial edit is committed by verified WIP capture");
+      }
+      if (silence) {
+        assert.equal(reports[0]!.body.session_id, parkedId);
+        assert.equal(await CodexSessionStore.inspect(path.join(homeDir, "codex-session-store")), "present");
+        const resumedPlan = `recovered ${mode} plan`;
+        let implementationSawStoredPlan = !planning;
+        const resumed = makeRig({ responder: c => {
+          if (c.method === "thread/resume") return { thread: { id: parkedId } };
+          if (c.method === "turn/start") {
+            const turnId = `tn-resumed-${c.turnStartCount}`;
+            c.transport.push(threadStarted(parkedId));
+            if (planning && c.turnStartCount === 1) {
+              c.transport.push(toolCall(1701, "submit_plan", { plan_md: resumedPlan }, parkedId, turnId, "resumed-plan"));
+            } else {
+              implementationSawStoredPlan = !planning || api.states.some(s => s.runId === claim.run_id &&
+                s.body.claim_generation === 4 && s.body.status === "running" && s.body.plan_md === resumedPlan);
+              c.transport.push(signalDone(parkedId, turnId, 1702));
+            }
+            c.transport.push(turnCompleted("completed", parkedId, turnId));
+            return { turn: { id: turnId } };
+          }
+          return {};
+        } });
+        resumed.deps = { ...resumed.deps, deferRegistryTeardown: true,
+          launchEffectRoot: rig.deps.launchEffectRoot,
+          sessionStore: { ...resumed.deps.sessionStore!, inspect: async () => "present" },
+        };
+        const resumeExecutor = makeExecutor(resumed, bindingOf(SUBSCRIPTION));
+        const resumeRun = resumeExecutor.run.bind(resumeExecutor);
+        resumeExecutor.run = async ctx => {
+          assert.equal(ctx.sessionId, parkedId);
+          assert.equal(ctx.claimGeneration, 4, "the next claim advances its generation");
+          assert.equal(ctx.planApproved, !planning, "planning stalls resume unapproved and must submit a plan before implementation");
+          const head = commitInTree(ctx.worktreePath, "RESUMED.txt", "recovered work\n");
+          assert.equal((await fs.readFile(path.join(ctx.worktreePath, ".git", "refs", "heads", ctx.branch), "utf8")).trim(), head,
+            "the resumed work is committed on the runner branch before supervised capture");
+          return resumeRun(ctx);
+        };
+        // Pin the resolvable-path fixture: retained-source successor selection has its
+        // own tests and intentionally changes cwd. This leg exercises the real runner's
+        // session adoption and transport resume when that path remains resolvable.
+        assert.ok(parkedClone);
+        git.discoverRetainedRecovery = async () => undefined;
+        git.recoveryAttemptMode = async () => false;
+        git.createOrAttachRunnerClone = async () => parkedClone!;
+        const resumeGeneration = 4;
+        if (typed) {
+          api.registerNonce = "m2-idle-registration";
+          api.setRegisterProtocolFeatures(client.protocolFeatures);
+          await client.register("m2-idle-fixture");
+          const identity = client.interruptedCallsRegistration!;
+          const observation = m3Calls();
+          api.interruptedCallsResponse = { status: 200, body: { ...observation,
+            run_id: claim.run_id, worker_id: identity.workerId, register_nonce: identity.nonce,
+            claim_generation: resumeGeneration, source_generation: mode === "initial" ? 3 : null,
+            inspected_count: mode === "initial" ? 1 : 0,
+            entries: mode === "initial" ? observation.entries.map(entry => ({ ...entry, source_generation: 3 })) : [],
+          } };
+        }
+        api.setOwnershipStatus(claim.run_id, "running", resumeGeneration);
+        api.setInputClaimGeneration(claim.run_id, resumeGeneration);
+        await new RunRunner(client, git, () => ({ executor: resumeExecutor, homeDir }), diagnostics.log, 20, undefined, {
+          gitlab: fakeGitlab().gitlab, pollMs: 5,
+          quiesceRun: async () => ({
+            process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+            docker: { state: "not_wired", removed: [], detail: "not wired" },
+          }),
+        }).execute({ ...claim, plan_approved: !planning,
+          plan_md: planning ? mode === "automatic" ? "initial" : undefined : "approved plan",
+          session_id: parkedId, claim_generation: resumeGeneration, last_seq: 1000 });
+        // Planning recovery must persist a new plan through the real runner gate before
+        // its approval creates the fresh implementation epoch. The stale automatic plan
+        // above is not approval of either the interrupted or recovered planning turn.
+        assert.equal(implementationSawStoredPlan, true, "implementation waits for durable recovered-plan storage");
+        const resumedTurns = resumed.transport.requests.filter(r => r.method === "turn/start");
+        assert.equal(resumedTurns.length, planning ? 2 : 1);
+        assert.deepEqual(resumed.transport.requests.filter(r => r.method === "thread/resume").map(r => rec(r.params).threadId),
+          Array(planning ? 2 : 1).fill(parkedId), diagnostics.lines.join("\n"));
+        assert.equal(resumed.transport.requests.filter(r => r.method === "thread/start").length, 0);
+        const implementationPrompt = JSON.stringify(resumedTurns.at(-1)!.params);
+        if (planning) {
+          assert.match(JSON.stringify(resumedTurns[0]!.params), /Produce a plan for this work and submit it for approval/);
+          assert.ok(implementationPrompt.includes(resumedPlan), "implementation uses the recovered plan, not the stale claim plan");
+        }
+        // Interrupted-call notes are composed at the implementation boundary, after
+        // the recovered read-only planning turn and its durable approval, if needed.
+        if (mode === "initial") {
+          assert.match(implementationPrompt, /interrupted_calls_/);
+          assert.match(implementationPrompt, /printf interrupted-observation/);
+        } else if (typed) assert.doesNotMatch(JSON.stringify(resumedTurns), /interrupted_calls_/);
+        assert.equal(api.states.at(-1)?.body.status, "completed", diagnostics.lines.join("\n"));
+        assert.equal(api.states.at(-1)?.body.claim_generation, 4);
+        assert.equal(api.states.filter(s => s.body.status === "recovery_wait").length, 1);
+      }
+    } finally { if (typed) t.mock.timers.reset(); await api.close(); fx.cleanup(); }
   });
 
   for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(b1) the exhausted transient park is marked providerOrigin (PRD #1733) [${info}]`, async () => {
@@ -19316,36 +21930,41 @@ describe("Codex dependency provisioning M2", () => {
     assert.ok(emitted.some((m) => JSON.stringify(m).includes("web: cancelled")));
   });
 
-  it("installer gets the full scrubbed allowlist, per-run HOME, PATH/TMPDIR fallbacks and TLS/locale precedence", async () => {
-    const keys = ["PATH", "UZI_RUNNER_PATH", "TMPDIR", "UZI_RUNNER_TMPDIR", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE",
-      "GITLAB_TOKEN", "GITHUB_TOKEN", "UZI_WORKER_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NODE_OPTIONS", "M2_ARBITRARY"];
-    const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-    try {
-      Object.assign(process.env, { PATH: "/source/bin", UZI_RUNNER_PATH: "/runner/bin", TMPDIR: "/source/tmp", UZI_RUNNER_TMPDIR: "/runner/tmp",
-        NIX_SSL_CERT_FILE: "/source/nix.pem", SSL_CERT_FILE: "/source/ssl.pem", LOCALE_ARCHIVE: "/source/locale",
-        GITLAB_TOKEN: "fixture-pat", GITHUB_TOKEN: "fixture-pat", UZI_WORKER_TOKEN: "fixture-join", OPENAI_API_KEY: "fixture-provider",
-        ANTHROPIC_API_KEY: "fixture-provider", NODE_OPTIONS: "fixture-options", M2_ARBITRARY: "fixture-arbitrary" });
-      for (const fallback of [false, true]) {
-        if (fallback) { delete process.env.UZI_RUNNER_PATH; delete process.env.UZI_RUNNER_TMPDIR; }
-        const rig = makeRig({ responder: doneResponder });
-        const seen: NodeJS.ProcessEnv[] = [];
-        rig.deps = { ...rig.deps, provisionRunTools: async () => ({ toolEnv: fallback ? {} as Record<string, string> : {
-          PATH: "/provision/bin", NIX_SSL_CERT_FILE: "/provision/nix.pem", LOCALE_ARCHIVE: "/provision/locale",
-          HOME: "/wrong/home", TMPDIR: "/wrong/tmp", NODE_OPTIONS: "wrong-options", GITLAB_TOKEN: "wrong-pat", M2_ARBITRARY: "wrong",
-        } }), installDeps: async (cwd, env) => {
-          assert.equal(cwd, WORKSPACE); seen.push(env); return empty;
-        } };
-        await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
-        assert.deepEqual(seen, [{
-          PATH: fallback ? "/source/bin" : "/provision/bin", HOME: "/data/agent-home/run-1", GIT_TERMINAL_PROMPT: "0",
-          TMPDIR: fallback ? "/source/tmp" : "/runner/tmp", NIX_SSL_CERT_FILE: fallback ? "/source/nix.pem" : "/provision/nix.pem",
-          SSL_CERT_FILE: "/source/ssl.pem", LOCALE_ARCHIVE: fallback ? "/source/locale" : "/provision/locale",
-        }]);
+  for (const sqlcDir of [undefined, "/synthetic/uzi-sqlc-cache"]) {
+    it(`installer gets the full scrubbed allowlist, per-run HOME, PATH/TMPDIR fallbacks and TLS/locale precedence (UZI_SQLC_DIR ${sqlcDir === undefined ? "absent" : "present"})`, async () => {
+      const keys = ["UZI_SQLC_DIR", "PATH", "UZI_RUNNER_PATH", "TMPDIR", "UZI_RUNNER_TMPDIR", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE",
+        "GITLAB_TOKEN", "GITHUB_TOKEN", "UZI_WORKER_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NODE_OPTIONS", "M2_ARBITRARY"];
+      const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+      try {
+        if (sqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = sqlcDir;
+        Object.assign(process.env, { PATH: "/source/bin", UZI_RUNNER_PATH: "/runner/bin", TMPDIR: "/source/tmp", UZI_RUNNER_TMPDIR: "/runner/tmp",
+          NIX_SSL_CERT_FILE: "/source/nix.pem", SSL_CERT_FILE: "/source/ssl.pem", LOCALE_ARCHIVE: "/source/locale",
+          GITLAB_TOKEN: "fixture-pat", GITHUB_TOKEN: "fixture-pat", UZI_WORKER_TOKEN: "fixture-join", OPENAI_API_KEY: "fixture-provider",
+          ANTHROPIC_API_KEY: "fixture-provider", NODE_OPTIONS: "fixture-options", M2_ARBITRARY: "fixture-arbitrary" });
+        for (const fallback of [false, true]) {
+          if (fallback) { delete process.env.UZI_RUNNER_PATH; delete process.env.UZI_RUNNER_TMPDIR; }
+          const rig = makeRig({ responder: doneResponder });
+          const seen: NodeJS.ProcessEnv[] = [];
+          rig.deps = { ...rig.deps, provisionRunTools: async () => ({ toolEnv: fallback ? {} as Record<string, string> : {
+            PATH: "/provision/bin", NIX_SSL_CERT_FILE: "/provision/nix.pem", LOCALE_ARCHIVE: "/provision/locale",
+            HOME: "/wrong/home", TMPDIR: "/wrong/tmp", NODE_OPTIONS: "wrong-options", GITLAB_TOKEN: "wrong-pat", M2_ARBITRARY: "wrong",
+          } }), installDeps: async (cwd, env) => {
+            assert.equal(cwd, WORKSPACE); seen.push(env); return empty;
+          } };
+          await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
+          assert.deepEqual(seen, [{
+            PATH: fallback ? "/source/bin" : "/provision/bin", HOME: "/data/agent-home/run-1", GIT_TERMINAL_PROMPT: "0",
+            TMPDIR: fallback ? "/source/tmp" : "/runner/tmp", NIX_SSL_CERT_FILE: fallback ? "/source/nix.pem" : "/provision/nix.pem",
+            SSL_CERT_FILE: "/source/ssl.pem", LOCALE_ARCHIVE: fallback ? "/source/locale" : "/provision/locale",
+            ...(sqlcDir === undefined ? {} : { UZI_SQLC_DIR: sqlcDir }),
+          }]);
+        }
+      } finally {
+        for (const key of keys) { const value = saved[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; }
       }
-    } finally {
-      for (const key of keys) { const value = saved[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; }
-    }
-  });
+    });
+  }
 });
 
 // issue #2213 — a quarantined worker starts no new Codex provider turn. Layer: CodexExecutor.run over
@@ -22520,6 +25139,7 @@ describe("A capture lifecycle public run", () => {
       assert.equal((await withTimeout(exec.run(ctx), 5000, "unclean old epoch run")).branch, ctx.branch);
       assert.ok(oldDisposals > 0, "the real abandoned epoch attempted helper teardown");
       assert.equal(fx.rig.providerLaunches(), 2);
+      await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {});
       const disposed = await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
       assert.equal(disposed.kind, unclean ? "incomplete" : "disposed");
       if (disposed.kind === "incomplete") assert.match(JSON.stringify(disposed.errors), /terminal cleanup hook failed/);
@@ -22836,41 +25456,46 @@ describe("#2852 default installer binding", () => {
     });
   }
 
-  it("#2852 all manager requests preserve canonical argv and scrubbed per-run environment", async () => {
-    const keys = ["UZI_RUNNER_TMPDIR", "TMPDIR", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE"];
-    const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
-    Object.assign(process.env, { UZI_RUNNER_TMPDIR: "/fixture/tmp", TMPDIR: "/ambient/tmp",
-      NIX_SSL_CERT_FILE: "/fixture/nix.pem", SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale" });
-    try {
-      for (const [manager, lockfile, args] of [
-        ["npm", "package-lock.json", ["ci", "--ignore-scripts"]],
-        ["pnpm", "pnpm-lock.yaml", ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile", "--config.manage-package-manager-versions=false"]],
-        ["yarn", "yarn.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
-        ["bun", "bun.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
-      ] as const) {
-        const fx = await fixture("clean", done, undefined, { lockfile });
-        try {
-          await withTimeout(fx.native.disposing, 3000, `canonical ${manager} root`);
-          const call = fx.native.calls[0]!;
-          assert.deepEqual(call.args.slice(-(args.length + 5)),
-            ["--expect-uid", "10002", "--", "/usr/bin/env", manager, ...args]);
-          assert.deepEqual(call.options.env, {
-            HOME: path.join(path.dirname(fx.ctx.worktreePath), "home"), PATH: "/fixture/bin",
-            TMPDIR: "/fixture/tmp", GIT_TERMINAL_PROMPT: "0", NIX_SSL_CERT_FILE: "/fixture/nix.pem",
-            SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale",
-            ...(manager === "yarn" ? { YARN_IGNORE_PATH: "1" } : {}),
-          });
-          fx.native.release();
-          assert.equal((await withTimeout(fx.run, 5000, `canonical ${manager} completion`)).error, undefined);
-        } finally { await fx.cleanup(); }
+  for (const sqlcDir of [undefined, "/synthetic/uzi-sqlc-cache"]) {
+    it(`#2852 all manager requests preserve canonical argv and scrubbed per-run environment (UZI_SQLC_DIR ${sqlcDir === undefined ? "absent" : "present"})`, async () => {
+      const keys = ["UZI_SQLC_DIR", "UZI_RUNNER_TMPDIR", "TMPDIR", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE"];
+      const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+      Object.assign(process.env, { UZI_RUNNER_TMPDIR: "/fixture/tmp", TMPDIR: "/ambient/tmp",
+        NIX_SSL_CERT_FILE: "/fixture/nix.pem", SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale" });
+      try {
+        if (sqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = sqlcDir;
+        for (const [manager, lockfile, args] of [
+          ["npm", "package-lock.json", ["ci", "--ignore-scripts"]],
+          ["pnpm", "pnpm-lock.yaml", ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile", "--config.manage-package-manager-versions=false"]],
+          ["yarn", "yarn.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
+          ["bun", "bun.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
+        ] as const) {
+          const fx = await fixture("clean", done, undefined, { lockfile });
+          try {
+            await withTimeout(fx.native.disposing, 3000, `canonical ${manager} root`);
+            const call = fx.native.calls[0]!;
+            assert.deepEqual(call.args.slice(-(args.length + 5)),
+              ["--expect-uid", "10002", "--", "/usr/bin/env", manager, ...args]);
+            assert.deepEqual(call.options.env, {
+              HOME: path.join(path.dirname(fx.ctx.worktreePath), "home"), PATH: "/fixture/bin",
+              TMPDIR: "/fixture/tmp", GIT_TERMINAL_PROMPT: "0", NIX_SSL_CERT_FILE: "/fixture/nix.pem",
+              SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale",
+              ...(sqlcDir === undefined ? {} : { UZI_SQLC_DIR: sqlcDir }),
+              ...(manager === "yarn" ? { YARN_IGNORE_PATH: "1" } : {}),
+            });
+            fx.native.release();
+            assert.equal((await withTimeout(fx.run, 5000, `canonical ${manager} completion`)).error, undefined);
+          } finally { await fx.cleanup(); }
+        }
+      } finally {
+        for (const key of keys) {
+          const value = saved[key];
+          if (value === undefined) delete process.env[key]; else process.env[key] = value;
+        }
       }
-    } finally {
-      for (const key of keys) {
-        const value = saved[key];
-        if (value === undefined) delete process.env[key]; else process.env[key] = value;
-      }
-    }
-  });
+    });
+  }
 });
 
 describe("#2852 default provision binding", () => {
@@ -23419,7 +26044,7 @@ describe("3282 Codex historical completion wall routing", () => {
 
 
 describe("3282 historical boundary regressions", () => {
-  it("3282 historical-only idle remains an idle error without hold or wall park", async () => {
+  it("3282 historical-only zero-evidence idle recovers without hold or wall park", async () => {
     const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", () => {})]);
     rig.deps = { ...rig.deps, idleMs: 20, wallMs: 5000 };
     let holds = 0, parks = 0;
@@ -23428,7 +26053,7 @@ describe("3282 historical boundary regressions", () => {
       enterCompletionHold: async () => { holds++; return true; },
       parkForWall: async () => { parks++; return "parked"; },
     });
-    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "historical idle"), /codex run idle timeout/);
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "historical idle"), isRecovery);
     assert.equal(holds, 0); assert.equal(parks, 0);
     assert.equal(rig.providerLaunches(), 1);
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
@@ -23852,5 +26477,1264 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
       assert.notEqual(r.result?.completionHeld?.reason, REASON_COMPLETION_STALL);
       assert.deepEqual(r.fixture.holds, [ITER_REASON]);
     });
+  });
+});
+
+// Kept self-contained so main can copy this suite alone to the base for red/green proof.
+describe("issue3472 M1 Codex repository instruction snapshot", () => {
+  const payload = "REPO-3472-SNAPSHOT-ORIGINAL — café";
+  const changed = "REPO-3472-LATER-BYTES";
+  type Script = (th: string, tn: string) => CodexNotification[];
+  const done: Script = (th, tn) => [signalDone(th, tn)];
+  const script = (th: string, turns: Script[]): Responder => c => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "turn/start") {
+      const tn = `tn-${c.turnStartCount}`;
+      if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      const next = turns[c.turnStartCount - 1];
+      assert.ok(next, "no unexpected extra model turn");
+      for (const frame of next(th, tn)) c.transport.push(frame);
+      c.transport.push(turnCompleted("completed", th, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  const approve: Awaited<ReturnType<NonNullable<RunContext["gatePlan"]>>> = {
+    kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } },
+  };
+  const routes = (t: FakeTransport) => t.requests.filter(r => r.method === "thread/start" || r.method === "thread/resume");
+  const instructions = (t: FakeTransport) => routes(t).map(r => String(rec(r.params).developerInstructions));
+  const statuses = (messages: EmittedMessage[]) => messages
+    .filter(m => m.kind === "status" && m.agent === "worker")
+    .map(m => String(m.payload.text ?? "")).filter(s => s.startsWith("repo instructions:"));
+  const block = (text: string) => {
+    const match = text.match(/\n(<untrusted_repo_instructions_([a-f0-9]+)>\n[\s\S]*\n<\/untrusted_repo_instructions_\2>)$/);
+    assert.ok(match, "the nonce-fenced repository body is last");
+    return match[1]!;
+  };
+  async function fixture(run: (root: string, file: string) => Promise<void>) {
+    const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
+    const root = await fs.mkdtemp(path.join(scratch, "repo3472-"));
+    try { await run(root, path.join(root, "CLAUDE.md")); }
+    finally { await fs.rm(root, { recursive: true, force: true }); }
+  }
+  async function observe(run: (requests: Parameters<CodexHarness["startTurn"]>[0][]) => Promise<void>) {
+    const requests: Parameters<CodexHarness["startTurn"]>[0][] = [];
+    const original = CodexHarness.prototype.startTurn;
+    const spy = mock.method(CodexHarness.prototype, "startTurn", function (this: CodexHarness, ...args: Parameters<typeof original>) {
+      requests.push(args[0]);
+      return original.apply(this, args);
+    });
+    try { await run(requests); } finally { spy.mock.restore(); }
+  }
+
+  it("core regression: snapshots before provisioning and install, retains one nonce through approval, replacement and continuation", async () => {
+    await fixture(async (root, file) => {
+      await fs.writeFile(file, payload);
+      await observe(async requests => {
+        const plan: Script = (th, tn) => [toolCall(34720, "submit_plan", { plan_md: "Approved work" }, th, tn, "plan")];
+        const checkpoint: Script = (th, tn) => [toolCall(34721, "checkpoint", {}, th, tn, "checkpoint")];
+        const rig = makeMultiEpochRig([
+          script("th-3472", [plan]),
+          script("th-3472", [checkpoint]),
+          script("th-3472", [th => [agentMessage("working", th)], done]),
+        ]);
+        let provisioned = 0, installed = 0, approved = 0, replaced = 0;
+        rig.deps = { ...rig.deps,
+          provisionRunTools: async () => { provisioned++; await fs.writeFile(file, changed + "-provision"); return { toolEnv: {} }; },
+          installDeps: async () => { installed++; await fs.writeFile(file, changed + "-install"); return { results: [], truncated: false }; },
+        };
+        const { ctx, emitted } = makeCtx({
+          worktreePath: root, repoClaudemdEnabled: true, planApproved: false, approvedPlan: undefined,
+          config: { max_iterations: 5 },
+          gatePlan: async () => { approved++; await fs.writeFile(file, changed + "-approval"); return approve; },
+          checkpoint: async () => { replaced++; await fs.writeFile(file, changed + "-replacement"); },
+        });
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "3472 snapshot");
+        assert.deepEqual([provisioned, installed, approved, replaced], [1, 1, 1, 2]); // cooperative and terminal checkpoints
+        assert.deepEqual(requests.map(r => r.phase), ["plan", "implement", "implement", "implement"]);
+        const snapshot = block(requests[0]!.systemPrompt!);
+        assert.ok(snapshot.includes(payload));
+        for (const request of requests) {
+          assert.equal(block(request.systemPrompt!), snapshot);
+          assert.ok(!request.systemPrompt!.includes(changed));
+          assert.ok(!request.prompt.includes(payload));
+        }
+        assert.equal(rig.providerLaunches(), 3);
+        for (const epoch of rig.epochs) {
+          assert.equal(instructions(epoch.transport).length, 1);
+          assert.equal(block(instructions(epoch.transport)[0]!), snapshot);
+        }
+        assert.deepEqual(rig.epochs.map(e => routes(e.transport).map(r => r.method)),
+          [["thread/start"], ["thread/resume"], ["thread/resume"]]);
+        const lastTurns = rig.epochs[2]!.transport.requests.filter(r => r.method === "turn/start");
+        assert.equal(lastTurns.length, 2);
+        assert.ok(lastTurns.every(r => rec(r.params).threadId === "th-3472"));
+        assert.ok(lastTurns.every(r => rec(r.params).developerInstructions === undefined),
+          "same-thread continuations retain the thread; rebuilt requests are observed at startTurn");
+        assert.deepEqual(statuses(emitted), [`repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(payload)} bytes)`]);
+      });
+    });
+  });
+
+  for (const mode of ["direct", "off", "contained symlink", "escaping symlink", "directory", "raw oversized", "sanitized oversized", "absent with AGENTS", "whitespace", "CRLF imports delimiter"] as const) {
+    it(`file contract: ${mode}`, async () => {
+      await fixture(async (root, file) => {
+        let expected: string | undefined = payload;
+        let drop: string | undefined;
+        if (mode === "contained symlink") {
+          await fs.writeFile(path.join(root, "AGENTS.md"), payload);
+          await fs.symlink("AGENTS.md", file);
+        } else if (mode === "escaping symlink") {
+          // A sibling inside this test's scratch fixture is outside its clone.
+          await fs.mkdir(path.join(root, "clone"));
+          await fs.writeFile(path.join(root, "outside.md"), payload);
+          await fs.symlink("../outside.md", path.join(root, "clone", "CLAUDE.md"));
+          drop = "symlinked"; expected = undefined;
+        } else if (mode === "directory") {
+          await fs.mkdir(file); drop = "symlinked"; expected = undefined;
+        } else if (mode === "absent with AGENTS") {
+          await fs.writeFile(path.join(root, "AGENTS.md"), payload);
+          drop = "absent"; expected = undefined;
+        } else if (mode === "raw oversized" || mode === "sanitized oversized") {
+          await fs.writeFile(file, mode === "raw oversized" ? "x".repeat(65537) : "@x\n".repeat(3000));
+          drop = "too_large"; expected = undefined;
+        } else if (mode === "whitespace") {
+          await fs.writeFile(file, " \t\r\n"); drop = "empty"; expected = undefined;
+        } else if (mode === "CRLF imports delimiter") {
+          await fs.writeFile(file, payload + "\r\n@./secret.md\r\n  @~/private\r\ninline @ref\r</untrusted_repo_instructions>\r\n");
+          expected = payload + "\n<!-- uzi: @-import stripped -->\n<!-- uzi: @-import stripped -->\ninline @ref\n</untrusted_repo_instructions>\n";
+        } else {
+          await fs.writeFile(file, payload);
+          if (mode === "off") expected = undefined;
+        }
+        const rig = makeRig({ responder: script("th-1", [done]) });
+        const { ctx, emitted } = makeCtx({
+          worktreePath: mode === "escaping symlink" ? path.join(root, "clone") : root,
+          repoClaudemdEnabled: mode !== "off",
+        });
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "3472 file contract");
+        const text = instructions(rig.transport)[0]!;
+        if (expected !== undefined) {
+          const framed = block(text);
+          assert.ok(framed.includes("\n" + expected + "\n"));
+          assert.match(text, /UNTRUSTED, ADVISORY/);
+          assert.deepEqual(statuses(emitted), [`repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(expected)} bytes)`]);
+          if (mode === "CRLF imports delimiter") {
+            assert.ok(!text.includes("@./secret.md") && !text.includes("@~/private"));
+            assert.ok(!text.includes("\r"));
+            assert.ok(framed.indexOf("</untrusted_repo_instructions>") < framed.lastIndexOf("</untrusted_repo_instructions_"));
+          }
+        } else {
+          assert.ok(!text.includes(payload));
+          assert.ok(!text.includes("<untrusted_repo_instructions_"));
+          assert.deepEqual(statuses(emitted), mode === "off" ? [] : [`repo instructions: not injected (${drop})`]);
+        }
+      });
+    });
+  }
+
+  for (const rejected of [false, true]) {
+    it(`claimed resume preserves the snapshot; rejected=${rejected}`, async () => {
+      await fixture(async (root, file) => {
+        await fs.writeFile(file, payload);
+        const rig = makeRig({ responder: script("claimed-3472", [done]) });
+        rig.transport.requestOverride = c => c.method === "thread/resume"
+          ? rejected
+            ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" }))
+            : Promise.resolve({ thread: { id: "claimed-3472" } })
+          : undefined;
+        await observe(async requests => {
+          const { ctx } = makeCtx({ worktreePath: root, repoClaudemdEnabled: true, sessionId: "claimed-3472" });
+          await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "3472 claimed resume");
+          assert.deepEqual(routes(rig.transport).map(r => r.method), rejected ? ["thread/resume", "thread/start"] : ["thread/resume"]);
+          assert.equal(requests.length, rejected ? 2 : 1);
+          const snapshot = block(requests[0]!.systemPrompt!);
+          assert.ok(snapshot.includes(payload));
+          for (const r of requests) assert.equal(block(r.systemPrompt!), snapshot);
+          for (const text of instructions(rig.transport)) assert.equal(block(text), snapshot);
+        });
+      });
+    });
+  }
+
+  it("fresh preapproved replacement reads current bytes and opted-out execution inherits no block", async () => {
+    await fixture(async (root, file) => {
+      const rig = makeMultiEpochRig([script("th-first", [done]), script("th-fresh", [done]), script("th-off", [done])]);
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      await observe(async requests => {
+        for (const [index, enabled] of [true, true, false].entries()) {
+          await fs.writeFile(file, index === 0 ? payload : changed);
+          const { ctx, emitted } = makeCtx({
+            worktreePath: root, repoClaudemdEnabled: enabled, sessionId: null,
+            reviewedPlanResume: true, wipRecovered: true, seeded: false,
+            gatePlan: async () => { throw new Error("preapproved replacement must not replan"); },
+          });
+          await withTimeout(executor.run(ctx), 5000, "3472 fresh execution");
+          assert.equal(routes(rig.epochs[index]!.transport)[0]!.method, "thread/start");
+          assert.equal(statuses(emitted).length, enabled ? 1 : 0);
+        }
+        assert.equal(requests.length, 3);
+        const first = block(requests[0]!.systemPrompt!), fresh = block(requests[1]!.systemPrompt!);
+        assert.ok(first.includes(payload) && !first.includes(changed));
+        assert.ok(fresh.includes(changed) && !fresh.includes(payload));
+        assert.notEqual(first.match(/instructions_([a-f0-9]+)>/)![1], fresh.match(/instructions_([a-f0-9]+)>/)![1]);
+        assert.ok(!requests[2]!.systemPrompt!.includes("<untrusted_repo_instructions_"));
+        assert.ok(!instructions(rig.epochs[2]!.transport)[0]!.includes(changed));
+      });
+    });
+  });
+
+  it("completion recheck uses the execution snapshot after owner answer changes the file", async () => {
+    await fixture(async (root, file) => {
+      await fs.writeFile(file, payload);
+      const first: Script = (th, tn) => [toolCall(34722, "signal_done", { owner_decision_requested: { reason: "Need decision" } }, th, tn, "first")];
+      const rig = makeMultiEpochRig([script("th-3472", [first]), script("th-3472", [done])]);
+      let attempts = 0, answers = 0;
+      const { ctx } = makeCtx({
+        worktreePath: root, repoClaudemdEnabled: true, kind: "issue", interactive: false,
+        completionInterlock: true, frozenMilestones: [{ id: "m2", title: "Unmet" }],
+        checkpoint: async () => {},
+        recordCompletionAttempt: async () => ({ unmet: ++attempts === 1 ? ["m2"] : [], attemptCount: attempts }),
+        askCompletionQuestion: async () => { answers++; await fs.writeFile(file, changed); return { outcome: "continue" }; },
+      });
+      await observe(async requests => {
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "3472 completion recheck");
+        assert.equal(answers, 1);
+        assert.equal(requests.length, 2);
+        assert.match(requests[1]!.prompt, /Worker instruction: call `signal_done` again/);
+        const snapshot = block(requests[0]!.systemPrompt!);
+        assert.ok(snapshot.includes(payload));
+        assert.equal(block(requests[1]!.systemPrompt!), snapshot);
+        for (const epoch of rig.epochs) assert.equal(block(instructions(epoch.transport)[0]!), snapshot);
+      });
+    });
+  });
+
+  it("child developerInstructions and task input exclude the root payload and fence, retaining static repo guidance", async () => {
+    await fixture(async (root, file) => {
+      await fs.writeFile(file, payload);
+      const responder: Responder = c => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) {
+            c.transport.push(threadStarted()).push(toolCall(34723, "spawn_agent", { role: "coder", prompt: "Do the child work" }, "th-1", "tn-1", "spawn"));
+            return { turn: { id: "tn-1" } };
+          }
+          c.transport.push(turnCompleted("completed", "th-child", "tn-child"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      };
+      const rig = makeRig({ responder });
+      const { ctx } = makeCtx({
+        worktreePath: root, repoClaudemdEnabled: true,
+        agents: [{ name: "coder", description: "coder", prompt_body: "Child body", tools: null, skills: [] }],
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      await waitFor(() => rig.transport.responses.some(r => r.requestId === 34723), "3472 child settled");
+      rig.transport.push(signalDone()).push(turnCompleted()).end();
+      await withTimeout(running, 5000, "3472 delegation");
+      const starts = routes(rig.transport);
+      assert.equal(starts.length, 2);
+      assert.ok(block(String(rec(starts[0]!.params).developerInstructions)).includes(payload));
+      const childInstructions = String(rec(starts[1]!.params).developerInstructions);
+      const childTurn = rig.transport.requests.filter(r => r.method === "turn/start")[1]!;
+      const childInput = JSON.stringify(rec(childTurn.params).input);
+      for (const text of [childInstructions, childInput]) {
+        assert.ok(!text.includes(payload));
+        assert.ok(!text.includes("<untrusted_repo_instructions_"));
+      }
+      const { CODEX_REPO_INSTRUCTIONS_APPEND } = await import("../src/prompt.js");
+      assert.ok(childInstructions.includes(CODEX_REPO_INSTRUCTIONS_APPEND));
+      assert.ok(childInput.includes("Do the child work"));
+    });
+  });
+});
+
+
+describe("M2 lazy root operation admission", () => {
+  const ready = async (check: () => boolean): Promise<void> => {
+    for (let n = 0; n < 1000; n++) { if (check()) return; await tick(); }
+    assert.fail("M2 event barrier did not settle");
+  };
+
+  for (const fallback of [false, true]) it(`gates after thread setup, idle stays disarmed, fresh fallback=${fallback}`, async t => {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, idleMs: 10, wallMs: 10000 };
+    if (fallback) rig.transport.requestOverride = c => c.method === "thread/resume"
+      ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" })) : undefined;
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    let release!: () => void;
+    let admissions = 0, evidence = 0;
+    const { ctx } = makeCtx({ sessionId: fallback ? "old-session" : undefined,
+      onModelTurnSettled: async () => { evidence++; },
+      prepareCodexRootDispatch: async (_signal, check) => {
+        admissions++;
+        assert.ok(rig.transport.requests.some(r => r.method === "thread/start"));
+        await new Promise<void>(resolve => { release = resolve; });
+        check();
+        return check;
+      },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await ready(() => admissions === 1);
+      assert.equal(rig.transport.turnStartCount, 0);
+      t.mock.timers.tick(1000);
+      await tick();
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.equal(evidence, 0);
+      release();
+      await running;
+      assert.equal(rig.transport.turnStartCount, 1);
+      assert.equal(admissions, 1, "failed resume dispatched no operation; fresh fallback got its own admit");
+      assert.equal(evidence, 1);
+    } finally { release?.(); rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const control of ["cancel", "pause", "wall"] as const)
+    it(`waiting remains owned by ${control} and never looks idle/productive`, async t => {
+      const rig = makeRig();
+      rig.deps = { ...rig.deps, idleMs: 10, wallMs: 1000, timeoutNow: () => Date.now() };
+      const abort = new AbortController();
+      let admission = false, parks = 0, evidence = 0;
+      let mode: "now" | "wall" | null = null;
+      const { ctx, emitted } = makeCtx({ signal: abort.signal,
+        pauseModeRequested: () => mode,
+        parkForPause: async () => { parks++; return true; },
+        parkForWall: async () => { parks++; return "parked"; },
+        onModelTurnSettled: async () => { evidence++; },
+        prepareCodexRootDispatch: async (signal) => {
+          admission = true;
+          await new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+          return () => {};
+        },
+      });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      let settled = false;
+      const result = running.then(value => { settled = true; return value; },
+        error => { settled = true; return error; });
+      try {
+        await ready(() => admission);
+        t.mock.timers.tick(control === "wall" ? 1000 : 100);
+        if (control !== "wall") {
+          mode = control === "pause" ? "now" : null;
+          abort.abort(control === "pause" ? new PauseNowSignal() : new Error("cancel"));
+          if (control === "cancel") t.mock.timers.tick(1000); // cancel remains first even if wall also expires
+        }
+        await ready(() => settled);
+        const outcome = await result;
+        if (control === "cancel") assert.match(outcome.message, /cancel/);
+        else assert.ok(control === "wall" ? outcome.walled : outcome.pausedAt);
+        assert.equal(parks, control === "cancel" ? 0 : 1);
+        assert.equal(rig.transport.turnStartCount, 0);
+        assert.equal(evidence, 0);
+        assert.equal(emitted.some(m => /idle/i.test(JSON.stringify(m.payload))), false);
+      } finally { abort.abort(); rig.transport.end(); await result; t.mock.timers.reset(); }
+    });
+
+  it("M2 HTTP cooldown and source proof debit the wall exactly once across turns", async t => {
+    const { CodexOperationController } = await import("../src/codex-operation-controller.js");
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "m2-wall" } };
+      if (c.method === "turn/start") {
+        c.transport.push(toolCall(c.turnStartCount, "submit_plan", { plan_md: "wall plan" }, "m2-wall", "tn-wall", "wall-plan"))
+          .push(turnCompleted("completed", "m2-wall", "tn-wall"));
+        return { turn: { id: "tn-wall" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, wallMs: 2000, idleMs: 10, timeoutNow: () => Date.now() };
+    let releaseHTTP!: () => void, releaseProof!: () => void;
+    let reads = 0, proofs = 0, operations = 0, parks = 0, evidence = 0;
+    let sleeping = false;
+    const controller = new CodexOperationController(7, {
+      supported: () => true, negotiation: () => 1, engage: () => {},
+      now: () => Date.now(), waiting: () => () => {},
+      sleep: (ms, signal) => {
+        sleeping = true;
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, ms);
+          signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+        });
+      },
+      read: async request => {
+        if (++reads === 1) {
+          await new Promise<void>(resolve => { releaseHTTP = resolve; });
+          return { ...request, decision: "wait", class: "overload",
+            episode_id: "00000000-0000-4000-8000-000000000092",
+            server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() };
+        }
+        return { decision: "admit", operation_id: request.operation_id, claim_generation: 7 };
+      },
+    });
+    const abort = new AbortController();
+    const { ctx, emitted } = makeCtx({
+      signal: abort.signal, planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "revise", automatic: true, round: 1, feedback: "continue same wall" }),
+      parkForWall: async () => { parks++; return "parked"; },
+      onModelTurnSettled: async () => { evidence++; },
+      prepareCodexRootDispatch: async (signal, check) => {
+        if (++operations === 1) await controller.admit({
+          kind: "root", operation_id: "00000000-0000-4000-8000-000000000093",
+        }, signal, check, async () => {
+          if (++proofs === 1) await new Promise<void>(resolve => { releaseProof = resolve; });
+          check();
+        });
+        else await new Promise<never>((_, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+        check(); return check;
+      },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await ready(() => !!releaseHTTP);
+      t.mock.timers.tick(137); releaseHTTP();
+      await ready(() => !!releaseProof);
+      t.mock.timers.tick(89); releaseProof();
+      await ready(() => sleeping);
+      // Source proof is inside the completion-relative cooldown, not added to it.
+      t.mock.timers.tick(910);
+      await tick();
+      assert.equal(reads, 1);
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.equal(evidence, 0);
+      t.mock.timers.tick(1);
+      await ready(() => operations === 2);
+      assert.equal(Date.now(), 1137);
+      assert.equal(rig.transport.turnStartCount, 1);
+      assert.equal(parks, 0);
+      t.mock.timers.tick(862);
+      await tick();
+      assert.equal(parks, 0, "no double debit: one millisecond still remains at 1999");
+      t.mock.timers.tick(1);
+      assert.ok((await running).walled);
+      assert.equal(parks, 1, "HTTP sleep and proof all spend the original 2000ms wall");
+      assert.equal(rig.transport.turnStartCount, 1);
+      assert.equal(evidence, 1, "held admission creates no model receipt");
+      assert.equal(emitted.some(m => /idle timeout/i.test(JSON.stringify(m.payload))), false);
+    } finally {
+      releaseHTTP?.(); releaseProof?.(); abort.abort(); rig.transport.end();
+      await running.catch(() => undefined); t.mock.timers.reset();
+    }
+  });
+
+  it("automatic revision receives a separate fresh admit without replaying feedback", async () => {
+    const plan: Responder = c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "m2-plan" } };
+      if (c.method === "turn/start") {
+        const tn = `m2-turn-${c.turnStartCount}`;
+        c.transport.push(toolCall(c.turnStartCount, "submit_plan", { plan_md: "M2 plan" }, "m2-plan", tn, tn))
+          .push(turnCompleted("completed", "m2-plan", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([plan, epochResponder("m2-implement", "m2-done", (tr, th, tn) =>
+      { tr.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn)); })]);
+    let admissions = 0, gates = 0;
+    let release!: () => void;
+    const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ++gates === 1
+        ? { kind: "revise", automatic: true, round: 1, feedback: "M2 automated feedback" }
+        : { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } },
+      prepareCodexRootDispatch: async (_signal, check) => {
+        if (++admissions === 2) await new Promise<void>(resolve => { release = resolve; });
+        check(); return check;
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await ready(() => admissions === 2);
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+      release(); await running;
+      assert.equal(admissions, 3);
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 2);
+      assert.equal(emitted.filter(m => m.kind === "plan_feedback").length, 1);
+    } finally { release?.(); for (const epoch of rig.epochs) epoch.transport.end(); }
+  });
+
+  it("capture completes while admission is held; late admit cannot send into the captured epoch", async () => {
+    const rig = makeRig();
+    let entered = false, release!: () => void;
+    const { ctx } = makeCtx({ prepareCodexRootDispatch: async (_signal, check) => {
+      entered = true; await new Promise<void>(resolve => { release = resolve; }); check(); return check;
+    } });
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const running = executor.run(ctx);
+    const stopped = assert.rejects(running, /capture|admission|closed/);
+    try {
+      await ready(() => entered);
+      let action = false;
+      const captured = await executor.withCredentialFreeCapture(1000, async () => { action = true; return "physical capture"; });
+      assert.equal(captured.kind, "observed_empty");
+      assert.equal(action, true);
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.ok(rig.reaped() > 0);
+      release(); await stopped;
+      assert.equal(rig.transport.turnStartCount, 0);
+    } finally { release?.(); rig.transport.end(); }
+  });
+
+  it("M2 refused wall extension during admission keeps one wall debit and gets fresh admission", async t => {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, idleMs: 10, wallMs: 1000, redriveAllowanceMs: 1, timeoutNow: () => Date.now() };
+    let admissions = 0, parks = 0, receipts = 0;
+    const { ctx } = makeCtx({
+      parkForWall: async () => ++parks === 1 ? "refused" : "parked",
+      takeWallParkRefresh: () => ({ totalSeconds: 2, usedSeconds: 1 }),
+      onModelTurnSettled: async () => { receipts++; },
+      prepareCodexRootDispatch: async signal => {
+        admissions++;
+        await new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        return () => {};
+      },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await ready(() => admissions === 1);
+      t.mock.timers.tick(1000);
+      await ready(() => admissions === 2);
+      assert.equal(parks, 1);
+      assert.equal(rig.transport.turnStartCount, 0);
+      t.mock.timers.tick(999);
+      await tick();
+      assert.equal(parks, 1, "the extension is debited once");
+      t.mock.timers.tick(1);
+      assert.ok((await running).walled);
+      assert.equal(parks, 2);
+      assert.equal(admissions, 2);
+      assert.equal(receipts, 0);
+      assert.equal(rig.transport.turnStartCount, 0);
+    } finally { rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("M2 repeated refused pauses rearm admission with the spent shared signal", async () => {
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-1", tr => {
+      tr.push(signalDone()).push(turnCompleted());
+    }) });
+    let admissions = 0, parks = 0, release!: () => void;
+    const abort = new AbortController();
+    let mode: "now" | null = null;
+    let interrupt: (() => void) | undefined;
+    const pause = (): void => {
+      mode = "now";
+      if (!abort.signal.aborted) abort.abort(new PauseNowSignal());
+      interrupt?.();
+    };
+    const { ctx } = makeCtx({
+      signal: abort.signal,
+      pauseModeRequested: () => mode,
+      onPauseNow: cb => { interrupt = cb; },
+      parkForPause: async () => { parks++; return false; },
+      prepareCodexRootDispatch: async (signal, check) => {
+        admissions++;
+        await new Promise<void>((resolve, reject) => {
+          release = resolve;
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+        check(); return check;
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await ready(() => admissions === 1);
+      pause();
+      await ready(() => admissions === 2);
+      pause();
+      await ready(() => admissions === 3);
+      assert.equal(ctx.signal?.aborted, true);
+      assert.equal(parks, 2);
+      assert.equal(rig.transport.turnStartCount, 0);
+      release(); await running;
+      assert.equal(rig.transport.turnStartCount, 1);
+    } finally { release?.(); rig.transport.end(); await running.catch(() => undefined); }
+  });
+
+  it("M2 vault latch during admission uses the credential deferral route without a provider retry", async () => {
+    const rig = makeRig();
+    rig.client.refreshCodex = async () => { throw vaultLocked409("refresh"); };
+    let waiting = false, receipts = 0;
+    const { ctx } = makeCtx({ onModelTurnSettled: async () => { receipts++; },
+      prepareCodexRootDispatch: async signal => {
+        waiting = true;
+        await new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        return () => {};
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    const stopped = assert.rejects(running, CodexCredentialDeferredError);
+    try {
+      await ready(() => waiting);
+      rig.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
+        params: { reason: "unauthorized", previousAccountId: null } });
+      await stopped;
+      assert.equal(rig.providerLaunches(), 1);
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.equal(rig.client.releaseCalls.length, 1);
+      assert.equal(receipts, 0);
+    } finally { rig.transport.end(); await running.catch(() => undefined); }
+  });
+
+  it("M2 capture with unproven reap blocks custody and a late admission cannot launch a fresh root", async () => {
+    const rig = makeRig();
+    rig.root.reap = async () => ({ ok: false, error: { category: "tool", message: "M2 reap unproven" } });
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    let entered = false, release!: () => void;
+    const { ctx } = makeCtx({ prepareCodexRootDispatch: async (_signal, check) => {
+      entered = true; await new Promise<void>(resolve => { release = resolve; }); check(); return check;
+    } });
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const running = executor.run(ctx);
+    const stopped = assert.rejects(running);
+    try {
+      await ready(() => entered);
+      let custody = false;
+      const outcome = await executor.withCredentialFreeCapture(1000, async () => { custody = true; });
+      assert.equal(outcome.kind, "incomplete");
+      assert.equal(custody, false, "unproven reap supplies no capture custody");
+      release(); await stopped;
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.equal(rig.providerLaunches(), 1);
+      assert.equal((await executor.settleForCredentialFreeCapture(1000)).kind, "incomplete");
+    } finally { release?.(); rig.transport.end(); await running.catch(() => undefined); }
+  });
+
+  it("M2 an already dispatched stream survives a cooldown update and the next boundary reads fresh", async () => {
+    const { CodexOperationController } = await import("../src/codex-operation-controller.js");
+    const { AdmissionClock, flushUntil } = await import("./operation-admission-clock.js");
+    const clock = new AdmissionClock();
+    const rig = makeMultiEpochRig([
+      c => c.method === "thread/start" ? { thread: { id: "th-live" } }
+        : c.method === "turn/start" ? { turn: { id: "tn-live" } } : {},
+      epochResponder("th-impl", "tn-impl", (tr, th, tn) => { tr.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn)); }),
+    ]);
+    let reads = 0, operations = 0, receipts = 0;
+    const controller = new CodexOperationController(7, {
+      supported: () => true, negotiation: () => 1, engage: () => {}, waiting: () => () => {},
+      now: () => clock.now, sleep: clock.sleep,
+      read: async request => ++reads === 2 ? { ...request, decision: "wait", class: "overload",
+        episode_id: "00000000-0000-4000-8000-000000000096",
+        server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() }
+        : { decision: "admit", operation_id: request.operation_id, claim_generation: 7 },
+    });
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } }),
+      onModelTurnSettled: async () => { receipts++; },
+      prepareCodexRootDispatch: async (signal, check) => {
+        await controller.admit({ kind: "root", operation_id: `00000000-0000-4000-8000-${String(++operations).padStart(12, "0")}` },
+          signal, check, async () => { check(); });
+        return check;
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    const abort = new AbortController();
+    let sibling: Promise<() => boolean> | undefined;
+    try {
+      await ready(() => rig.epochs[0]!.transport.turnStartCount === 1);
+      sibling = controller.admit({ kind: "root", operation_id: "00000000-0000-4000-8000-000000000099" },
+        abort.signal, () => {}, async () => {});
+      const cancelled = assert.rejects(sibling);
+      await flushUntil(() => clock.sleepers.size === 1);
+      abort.abort(); await cancelled;
+      rig.epochs[0]!.transport.push(toolCall(1, "submit_plan", { plan_md: "live stream continued" }, "th-live", "tn-live", "live-plan"))
+        .push(turnCompleted("completed", "th-live", "tn-live"));
+      await ready(() => operations === 2 && clock.sleepers.size === 1);
+      assert.equal(receipts, 1, "the running stream completed under the changed policy");
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+      assert.equal(reads, 2);
+      clock.advance(999);
+      assert.equal(reads, 2);
+      clock.advance(1);
+      await running;
+      assert.equal(reads, 3);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+      assert.equal(receipts, 2);
+    } finally {
+      abort.abort(); clock.advance(15000);
+      for (const epoch of rig.epochs) epoch.transport.end();
+      await sibling?.catch(() => undefined); await running.catch(() => undefined);
+    }
+  });
+
+});
+
+it("M3 actual child send retries final permits and leaves the root demux running during its independent wait", async () => {
+  const rig = makeRig({ responder: c => {
+    if (c.method === "turn/start" && c.turnStartCount > 1) {
+      c.transport.push(turnCompleted("completed", "th-child", "tn-child"));
+    }
+    return defaultResponder(c);
+  } });
+  const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+  let release!: () => void;
+  let preparations = 0;
+  const { ctx } = makeCtx({ agents: [
+    { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+    { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+  ], prepareCodexRootDispatch: async (signal, check, kind) => {
+    if (kind !== "child") return () => true;
+    const n = ++preparations;
+    if (n === 1) await new Promise<void>(resolve => { release = resolve; });
+    signal.throwIfAborted(); check();
+    return () => n > 1;
+  } });
+  rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "work" }, "th-1", "tn-1", "m3-delegate"));
+  const done = executor.run(ctx);
+  await waitFor(() => !!release, "child admission wait");
+  assert.equal(rig.transport.requests.filter(r => r.method === "turn/start").length, 1);
+  rig.transport.push(toolCall(2, "uzi_bash", { command: "echo demux" }, "th-1", "tn-1", "m3-root-shell"));
+  await waitFor(() => rig.transport.responses.some(r => r.requestId === 2), "root callback while child waits");
+  release();
+  await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "child settles");
+  rig.transport.push(signalDone()).push(turnCompleted()).end();
+  await withTimeout(done, 3000, "M3 child dispatch");
+  assert.equal(preparations, 2);
+  assert.equal(rig.transport.requests.filter(r => r.method === "turn/start").length, 2);
+});
+
+for (const stop of ["deadline", "parent terminal", "parent cancel"] as const) {
+  it(`M3 child admission settles on ${stop} without sending its turn`, async () => {
+    const rig = makeRig();
+    const executor = makeExecutor({ ...rig, deps: { ...rig.deps, childTurnDeadlineMs: stop === "deadline" ? 30 : 5000 } }, bindingOf(SUBSCRIPTION));
+    const owner = new AbortController();
+    let waiting = false;
+    const { ctx } = makeCtx({ signal: owner.signal, agents: [
+      { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+      { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+    ], prepareCodexRootDispatch: async (signal, _check, kind) => {
+      if (kind !== "child") return () => true;
+      waiting = true;
+      await new Promise<void>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      throw new Error("unreachable");
+    } });
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "work" }, "th-1", "tn-1", "m3-delegate"));
+    const done = executor.run(ctx);
+    const settled = stop === "parent cancel" ? assert.rejects(done, /run cancelled/) : done;
+    await waitFor(() => waiting, "child waits before send");
+    if (stop === "parent cancel") owner.abort();
+    else if (stop === "parent terminal") rig.transport.push(signalDone()).push(turnCompleted()).end();
+    else {
+      await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "child deadline reply");
+      rig.transport.push(signalDone()).push(turnCompleted()).end();
+    }
+    await withTimeout(settled.then(() => undefined), 3000, `M3 child ${stop}`);
+    assert.equal(rig.transport.requests.filter(r => r.method === "turn/start").length, 1);
+  });
+}
+describe("3404 terminal executor lifetime", () => {
+  const done = epochResponder("th-1", "tn-1", t => { t.push(signalDone()).push(turnCompleted()); });
+  function barrier() {
+    let resolve!: () => void;
+    const promise = new Promise<void>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+
+  it("3404 seals a real completed provider/provision incarnation and rejects runtime fakes and foreign seals", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const { ctx } = makeCtx();
+    await executor.run(ctx);
+    assert.ok(rig.providerLaunches() > 0);
+    assert.ok(rig.disposed() > 0);
+    const source = Object.freeze({ runId: ctx.runId });
+    const result = await executor.sealLifetime(source);
+    assert.equal(result.kind, "sealed");
+    if (result.kind !== "sealed") return;
+    assert.equal(executor.acceptsLifetimeSeal(result.seal, source), true);
+    assert.equal(executor.acceptsLifetimeSeal({}, source), false);
+    assert.equal(executor.acceptsLifetimeSeal(JSON.parse(JSON.stringify(result.seal)), source), false);
+    assert.equal(executor.acceptsLifetimeSeal(result.seal, { runId: ctx.runId }), false);
+    const material = terminalSealMaterial(result.seal)!;
+    assert.equal(material.sourceUse, source);
+    assert.ok(material.incarnations.length >= 2, "provision and provider registries are both inventoried");
+    assert.equal(new Set(material.incarnations.map(entry => entry.registry)).size, material.incarnations.length);
+    const foreign = makeExecutor(makeRig(), bindingOf(API_KEY));
+    assert.equal(foreign.acceptsLifetimeSeal(result.seal, source), false);
+    const launches = rig.providerLaunches(), credentials = rig.client.releaseCalls.length;
+    await assert.rejects(executor.run(ctx), /lifetime closed/);
+    await assert.rejects(executor.withCredentialFreeCapture(100, async () => {}), /lifetime closed/);
+    await assert.rejects(executor.settleForCredentialFreeCapture(100), /lifetime closed/);
+    assert.equal(rig.providerLaunches(), launches);
+    assert.equal(rig.client.releaseCalls.length, credentials);
+    assert.equal((await executor.sealLifetime(source)), result);
+  });
+
+  it("3404 closes synchronously and joins a retained progress observer without failing the completed run", async () => {
+    const entered = barrier(), release = barrier();
+    const responder = epochResponder("th-1", "tn-1", t => {
+      t.push(toolCall(11, "report_progress", { in_progress: ["m1"] }, "th-1", "tn-1", "c-p1"))
+        .push(signalDone()).push(turnCompleted());
+    });
+    const rig = makeRig({ responder });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const { ctx } = makeCtx({ frozenMilestones: [{ id: "m1", title: "one" }],
+      reportProgress: async () => { entered.resolve(); await release.promise; } });
+    const result = await executor.run(ctx);
+    await entered.promise;
+    let sealed = false;
+    const sealing = executor.sealLifetime({}).then(value => { sealed = true; return value; });
+    try {
+      await assert.rejects(executor.run(ctx), /lifetime closed/);
+      await tick();
+      assert.equal(sealed, false, "the discarded reportProgress tail is owned by the lifetime");
+      release.resolve();
+      assert.equal((await sealing).kind, "sealed");
+      assert.equal(result.branch, ctx.branch);
+    } finally { release.resolve(); await sealing; }
+  });
+
+  for (const failure of ["reap", "dispose", "fileop"] as const) {
+    it(`3404 ${failure} cleanup uncertainty never seals or retries model work`, async () => {
+      const rig = makeRig({ responder: done });
+      if (failure === "reap") rig.root.reap = async () => ({ ok: false, error: { category: "tool", message: "no ECHILD" } });
+      if (failure === "dispose") rig.root.dispose = async () => { throw new Error("cleanup unconfirmed"); };
+      if (failure === "fileop") rig.deps = { ...rig.deps, wireFileop: () => ({ client: { op: async () => ({ ok: true }) },
+        dispose: async () => { throw new Error("fileop closure failed"); } }) };
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const { ctx } = makeCtx();
+      const completed = await executor.run(ctx);
+      const launches = rig.providerLaunches();
+      assert.equal((await executor.sealLifetime({})).kind, "unproven");
+      assert.equal(completed.branch, ctx.branch);
+      assert.equal(rig.providerLaunches(), launches);
+      assert.equal((await executor.sealLifetime({})).kind, "unproven", "permanently unproven, never re-sealed");
+    });
+  }
+
+  it("3404 a delayed provider factory is joined by the seal and a late run is refused before it", async () => {
+    const entered = barrier(), release = barrier();
+    const rig = makeRig({ responder: done });
+    const launch = rig.deps.launchProviderRoot!;
+    let factoryCalls = 0;
+    rig.deps = { ...rig.deps, launchProviderRoot: async (...args) => {
+      factoryCalls++; entered.resolve(); await release.promise; return launch(...args);
+    } };
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const running = executor.run(makeCtx().ctx).catch(() => undefined);
+    await entered.promise;
+    let settled = false;
+    const sealing = executor.sealLifetime({}).then(value => { settled = true; return value; });
+    try {
+      await tick();
+      assert.equal(settled, false, "the in-flight factory call is an owned producer");
+      release.resolve();
+      await running;
+      assert.equal((await sealing).kind, "unproven", "sealed while a run was active");
+      assert.equal((await executor.sealLifetime({})).kind, "unproven");
+      assert.equal(factoryCalls, 1, "closure after the factory call started never started another");
+    } finally { release.resolve(); await running; await sealing; }
+  });
+
+  it("3404 delayed cache removal keeps original settlement in the lifetime after pending delivery", async () => {
+    const raw = barrier();
+    const rig = makeRig({ responder: done });
+    rig.deps = { ...rig.deps,
+      startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
+        release: async () => ({ state: "error", reason: "unused" }) }),
+      removeCommandCache: async () => ({ state: "pending", reason: "",
+        settlement: raw.promise.then(() => ({ state: "removed", reason: "" })) }),
+    };
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    let settled = false;
+    const sealing = executor.sealLifetime({}).then(value => { settled = true; return value; });
+    try {
+      await tick(); assert.equal(settled, false);
+      raw.resolve(); assert.equal((await sealing).kind, "sealed");
+    } finally { raw.resolve(); await sealing; }
+  });
+
+  it("3404 a cache removal that settles unclean, or that only reports a bounded pending answer, never seals", async () => {
+    for (const mode of ["unsettled-answer", "retained"] as const) {
+      const rig = makeRig({ responder: done });
+      rig.deps = { ...rig.deps,
+        startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
+          release: async () => ({ state: "error", reason: "unused" }) }),
+        removeCommandCache: async () => mode === "retained"
+          ? { state: "pending", reason: "", settlement: Promise.resolve({ state: "retained", reason: "busy" }) }
+          : { state: "pending", reason: "" },
+      };
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      await executor.run(makeCtx().ctx);
+      assert.equal((await executor.sealLifetime({})).kind, "unproven", mode);
+    }
+  });
+
+  for (const sealed of [false, true]) {
+    it(`3404 owner abort mid-turn still cancels and interrupts after a lifetime seal (${sealed ? "sealed" : "control"})`, async () => {
+      const controller = new AbortController();
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+        return {};
+      } });
+      rig.transport.push(threadStarted());
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const running = executor.run(makeCtx({ signal: controller.signal }).ctx);
+      await waitFor(() => rig.transport.requests.some(r => r.method === "turn/start"), "turn started");
+      let sealing: Promise<{ kind: string }> | undefined;
+      if (sealed) sealing = executor.sealLifetime({});
+      controller.abort();
+      await assert.rejects(withTimeout(running, 3000, "cancel after seal"), /run cancelled/);
+      assert.ok(rig.transport.requests.some(r => r.method === "turn/interrupt"), "the stop request was delivered");
+      if (sealing) assert.equal((await sealing).kind, "unproven", "a run that was active at seal time stays unproven");
+    });
+  }
+
+  it("3404 a seal is refused while any epoch registry is still unverified", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    (executor as unknown as { unverifiedEpochRegistries: Set<object> }).unverifiedEpochRegistries.add({});
+    assert.equal((await executor.sealLifetime({})).kind, "unproven");
+  });
+
+  it("3404 after a seal a retained refresh bridge is refused before the real refresh", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    assert.equal((await executor.sealLifetime({})).kind, "sealed");
+    const internals = executor as unknown as {
+      lifetimeBoundRefreshBridge(bridge: { refresh(request: unknown): Promise<unknown> }): { refresh(request: unknown): Promise<unknown> };
+    };
+    let refreshed = 0;
+    const bridge = internals.lifetimeBoundRefreshBridge({ refresh: async () => { refreshed++; return {}; } });
+    await assert.rejects(bridge.refresh({}), /lifetime closed/);
+    assert.equal(refreshed, 0, "refused before the underlying bridge.refresh");
+  });
+
+  describe("deferred final registry (deferRegistryTeardown)", () => {
+    type DeferredInternals = {
+      unverifiedEpochRegistries: Set<{ poison(error: unknown): void }>;
+      deferredFinal?: { registry: { poison(error: unknown): void } };
+    };
+    async function sinkThenDispose(executor: CodexExecutor) {
+      // The runner's durability sinks reap the provider root through a boundary before the dispose.
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      return executor.safety!.dispose({ boundary: "terminal", deadlineMs: 2000 });
+    }
+    async function deferredRun(mutate?: (rig: ReturnType<typeof makeRig>) => void) {
+      const rig = makeRig({ responder: done });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+      mutate?.(rig);
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const { ctx } = makeCtx();
+      await executor.run(ctx);
+      return { rig, executor, source: Object.freeze({ runId: ctx.runId }) };
+    }
+
+    it("3404 seals after the runner's terminal safety.dispose proved the deferred final registry", async () => {
+      const { executor, source } = await deferredRun();
+      const disposal = await sinkThenDispose(executor);
+      assert.equal(disposal.kind, "disposed");
+      const result = await executor.sealLifetime(source);
+      assert.equal(result.kind, "sealed");
+      if (result.kind === "sealed") assert.equal(executor.acceptsLifetimeSeal(result.seal, source), true);
+    });
+
+    it("3404 a deferred final registry is unproven before the terminal dispose", async () => {
+      const { executor, source } = await deferredRun();
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a rejected terminal dispose leaves the deferred final registry unproven", async () => {
+      const { executor, source } = await deferredRun(rig => {
+        rig.root.dispose = async () => { throw new Error("cleanup unconfirmed"); };
+      });
+      await sinkThenDispose(executor).catch(() => undefined);
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a throwing terminal hook (installer cleanup proof unavailable) is incomplete and leaves the seal unproven", async () => {
+      // An exhausted terminal deadline: the hook's installState.settle cannot prove the installer
+      // cleanup inside it and throws "installer cleanup proof unavailable".
+      const { executor, source } = await deferredRun();
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      const disposal = await executor.safety!.dispose({ boundary: "terminal", deadlineMs: 0 });
+      assert.equal(disposal.kind, "incomplete");
+      assert.ok(disposal.kind === "incomplete" &&
+        disposal.errors.some(error => /terminal cleanup hook failed/.test(error.message)));
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a disposal that bypasses safety.dispose and its hook leaves the seal unproven", async () => {
+      const { executor, source } = await deferredRun();
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      const registry = (executor as unknown as DeferredInternals).deferredFinal!.registry as unknown as
+        { disposeTools(deadlineMs: number): Promise<{ kind: string }> };
+      assert.equal((await registry.disposeTools(2000)).kind, "disposed");
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a seal retires only the final registry bookkeeping and repeats identically", async () => {
+      const { executor, source } = await deferredRun();
+      await sinkThenDispose(executor);
+      const internals = executor as unknown as DeferredInternals;
+      const registry = internals.deferredFinal!.registry;
+      assert.equal(internals.unverifiedEpochRegistries.has(registry), true);
+      const first = await executor.sealLifetime(source);
+      assert.equal(first.kind, "sealed");
+      assert.equal(internals.unverifiedEpochRegistries.has(registry), false);
+      assert.equal(await executor.sealLifetime(source), first);
+    });
+
+    it("3404 an unsettled command-cache removal leaves the deferred final registry unproven", async () => {
+      const { executor, source } = await deferredRun(rig => {
+        rig.deps = { ...rig.deps,
+          startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
+            release: async () => ({ state: "error", reason: "unused" }) }),
+          removeCommandCache: async () => ({ state: "pending", reason: "",
+            settlement: Promise.resolve({ state: "retained", reason: "busy" }) }),
+        };
+      });
+      await sinkThenDispose(executor).catch(() => undefined);
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 poisoning the registry after an accepted terminal dispose revokes the proof", async () => {
+      const { executor, source } = await deferredRun();
+      const disposal = await sinkThenDispose(executor);
+      assert.equal(disposal.kind, "disposed");
+      const registry = (executor as unknown as DeferredInternals).deferredFinal!.registry;
+      registry.poison({ category: "tool", message: "late poison" });
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 an unverified prior-epoch registry keeps the deferred final seal unproven", async () => {
+      const { executor, source } = await deferredRun();
+      await sinkThenDispose(executor);
+      (executor as unknown as DeferredInternals).unverifiedEpochRegistries.add({ poison() {} });
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+  });
+
+  it("3404 structural source strings confer no authority", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    assert.equal((await executor.sealLifetime("run-1" as never)).kind, "unproven");
+  });
+});
+
+// ================================================================================
+describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
+  const ACTIVE = {
+    default_model: "gpt-6-astra", default_model_source: "user_default" as const,
+    default_effort: "high" as const, default_effort_source: "user_default" as const,
+  };
+  const approve = { kind: "approve", selection: { status: "absent" } } as never;
+
+  /** A real reporter over a recording client: the rows the executor makes it post. */
+  const reporterRig = (config: ClaimConfig | null) => {
+    const posts: LeadConfigReportBody[] = [];
+    const reporter = new LeadConfigReporter({
+      client: { async recordLeadConfig(_runId, body) { posts.push(body); return { kind: "ok" }; } },
+      runId: "run-1", claimGeneration: 5, active: leadConfigActive(config), logger: noopLog,
+    });
+    return { posts, reporter, rows: () => posts.map((p) => `${p.phase}#${p.phase_entry}/${p.seq}`) };
+  };
+  const doneFrames = (t: FakeTransport, th: string, tn: string) => {
+    t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+  };
+
+  /** Add the thread's resolved model / reasoning effort to every thread/start and thread/resume answer. */
+  const reporting = (responder: Responder, fields: () => Record<string, unknown>): Responder => (c) => {
+    const out = responder(c);
+    return c.method === "thread/start" || c.method === "thread/resume" ? { ...rec(out), ...fields() } : out;
+  };
+  const reported = (model: string, reasoningEffort: unknown) => () => ({ model, reasoningEffort, cwd: "/ignored" });
+  const observed = (p: LeadConfigReportBody) =>
+    [p.observed_model, p.observed_model_evidence, p.observed_effort, p.observed_effort_evidence];
+  const idle: Responder = (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+    if (c.method === "turn/start") { c.transport.push(threadStarted("th-1")); return { turn: { id: "tn-1" } }; }
+    return {};
+  };
+  const waitForRows = (posts: unknown[], n: number) => waitFor(() => posts.length >= n, `${n} lead-config rows`);
+
+  it("a pre-approved run records the requested row, then the runtime row, matching what was sent", async () => {
+    const { posts, reporter, rows } = reporterRig(ACTIVE);
+    const rig = makeRig({ responder: reporting(defaultResponder, reported("gpt-6-astra", "low")) });
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ config: ACTIVE, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "pre-approved lead-config run");
+    await waitForRows(posts, 2);
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
+    const sent = rig.transport.requests.find((r) => r.method === "turn/start");
+    assert.equal(rec(sent?.params).model, posts[0]!.requested_model);
+    assert.equal(rec(sent?.params).effort, posts[0]!.requested_effort);
+    assert.equal(posts[0]!.requested_model_source, "user_default");
+    assert.equal(posts[0]!.requested_effort_source, "user_default");
+    assert.equal(posts[0]!.requested_effort_mode, "explicit");
+    assert.equal(posts[0]!.claim_generation, 5);
+    assert.deepEqual(observed(posts[0]!), [null, null, null, null]);
+    // Effort was sent on turn/start, so the thread's own "low" is not what is reported.
+    assert.deepEqual(observed(posts[1]!), ["gpt-6-astra", "codex_thread_response", "high", "codex_sent"]);
+  });
+
+  it("acceptance example 2 (Codex schedule pin, user effort high): requested and runtime lines on the posted rows", async () => {
+    const config = {
+      default_model: "gpt-6-astra", default_model_source: "schedule_pin" as const,
+      default_effort: "high" as const, default_effort_source: "user_default" as const,
+    };
+    const { posts, reporter } = reporterRig(config);
+    const rig = makeRig({ responder: reporting(defaultResponder, reported("gpt-6-astra", "high")) });
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ config, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "schedule-pin lead-config run");
+    await waitForRows(posts, 2);
+    const last = posts[posts.length - 1]!;
+    assert.equal(last.requested_model, "gpt-6-astra");
+    assert.equal(last.requested_model_source, "schedule_pin");
+    assert.equal(last.requested_effort, "high");
+    assert.equal(last.requested_effort_source, "user_default");
+    assert.deepEqual(observed(last), ["gpt-6-astra", "codex_thread_response", "high", "codex_sent"]);
+  });
+
+  it("a runtime-default effort run reports the thread's configured effort as codex_runtime_default", async () => {
+    const config = { default_effort_source: "builtin" as const };
+    const { posts, reporter } = reporterRig(config);
+    const rig = makeRig({ responder: reporting(defaultResponder, reported(provider.model, "persistent")) });
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ config, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "provider-default lead-config run");
+    await waitForRows(posts, 2);
+    assert.equal(posts[0]!.requested_model, provider.model);
+    assert.equal(posts[0]!.requested_model_source, "builtin");
+    assert.equal(posts[0]!.requested_effort, null);
+    assert.equal(posts[0]!.requested_effort_mode, "runtime_default");
+    assert.deepEqual(observed(posts[1]!), [provider.model, "codex_thread_response", "other", "codex_runtime_default"]);
+  });
+
+  it("plan, revise, approve, implement: one plan entry (revise re-drives it) then one implement entry, each with its own runtime row", async () => {
+    const { posts, reporter, rows } = reporterRig(ACTIVE);
+    const planEpoch: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const tn = `tn-plan-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+        c.transport
+          .push(toolCall(c.turnStartCount, "submit_plan", { plan_md: `PLAN ${c.turnStartCount}` }, "th-plan", tn, `c-plan-${c.turnStartCount}`))
+          .push(turnCompleted("completed", "th-plan", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const fields = reported("gpt-6-astra", "high");
+    const rig = makeMultiEpochRig([
+      reporting(planEpoch, fields),
+      reporting(resumedEpochResponder("th-plan", "tn-impl", doneFrames), fields),
+    ]);
+    let gates = 0;
+    const { ctx } = makeCtx({
+      config: { ...ACTIVE, plan_max_revisions: 2 }, leadConfig: reporter,
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => (++gates === 1 ? { kind: "revise", feedback: "tighten it" } : approve),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "gated lead-config run");
+    await waitForRows(posts, 4);
+    assert.equal(gates, 2);
+    assert.deepEqual(rows(), ["plan#1/1", "plan#1/2", "implement#1/1", "implement#1/2"]);
+    assert.equal(posts[1]!.observed_model_evidence, "codex_thread_response");
+    assert.equal(posts[3]!.observed_effort_evidence, "codex_sent");
+  });
+
+  /** One implement entry, interrupted into a recreated epoch (the issue #1782 refused-wall-park path). */
+  async function recreatedEpoch(config: ClaimConfig, first: () => Record<string, unknown>, second: () => Record<string, unknown>) {
+    const { posts, reporter, rows } = reporterRig(config);
+    const controller = new AbortController();
+    const rig = makeMultiEpochRig([
+      reporting(idle, first),
+      reporting(resumedEpochResponder("th-1", "tn-2", doneFrames), second),
+    ]);
+    let exec!: CodexExecutor;
+    let mode: "wall" | null = null;
+    const { ctx } = makeCtx({
+      config, leadConfig: reporter, signal: controller.signal,
+      pauseModeRequested: () => mode,
+      clearWallMode: () => { mode = null; },
+      parkForWall: async () => {
+        await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+        return "refused";
+      },
+    });
+    exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const running = exec.run(ctx);
+    await waitFor(() => rig.epochs[0]?.transport.turnStartCount === 1, "implement turn started");
+    mode = "wall";
+    controller.abort(new PauseNowSignal());
+    await withTimeout(running, 5000, "lead-config recreated epoch");
+    assert.equal(rig.providerLaunches(), 2, "the epoch was recreated");
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the re-drive ran on the fresh epoch");
+    return { posts, rows, rig };
+  }
+
+  it("a recreated epoch reporting a changed configured effort posts one more row on the same entry (issue #1782 path)", async () => {
+    const config = { default_model: "gpt-6-astra", default_model_source: "user_default" as const, default_effort_source: "builtin" as const };
+    let calls = 0;
+    const { posts, rows, rig } = await recreatedEpoch(config, () => {
+      calls++;
+      return { model: "gpt-6-astra", reasoningEffort: "medium" };
+    }, () => ({ model: "gpt-6-astra", reasoningEffort: "high" }));
+    await waitForRows(posts, 3);
+    assert.equal(calls, 1);
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2", "implement#1/3"], "one reporter, one entry, seq continuing across the recreate");
+    assert.deepEqual(observed(posts[1]!), ["gpt-6-astra", "codex_thread_response", "medium", "codex_runtime_default"]);
+    assert.deepEqual(observed(posts[2]!), ["gpt-6-astra", "codex_thread_response", "high", "codex_runtime_default"]);
+    // What each epoch actually sent is what the requested side says.
+    for (const e of rig.epochs) {
+      const sent = e.transport.requests.find((r) => r.method === "turn/start");
+      assert.equal(rec(sent?.params).model, posts[0]!.requested_model);
+      assert.equal(rec(sent?.params).effort, undefined, "runtime default sends no effort");
+    }
+  });
+
+  it("a recreated epoch reporting the same thing posts nothing more (per-entry dedupe)", async () => {
+    const same = () => ({ model: "gpt-6-astra", reasoningEffort: "high" });
+    const { posts, rows } = await recreatedEpoch(ACTIVE, same, same);
+    await waitForRows(posts, 2);
+    for (let i = 0; i < 5; i++) await tick();
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
+  });
+
+  it("a recreated epoch whose thread effort changed posts nothing when the sent effort is the evidence on both", async () => {
+    const { posts, rows } = await recreatedEpoch(
+      ACTIVE,
+      () => ({ model: "gpt-6-astra", reasoningEffort: "high" }),
+      () => ({ model: "gpt-6-astra", reasoningEffort: "low" }),
+    );
+    await waitForRows(posts, 2);
+    for (let i = 0; i < 5; i++) await tick();
+    // The sent effort is the evidence on both epochs, so a changed thread effort is not a change.
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
+  });
+
+  it("posts nothing without the activation signal", async () => {
+    const config = { default_model: "gpt-6-astra", default_effort: "high" as const };
+    const { posts, reporter } = reporterRig(config);
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    assert.equal(reporter.enabled, false);
+    let entered = 0;
+    let observedCalls = 0;
+    const enterPhase = reporter.enterPhase.bind(reporter);
+    const observe = reporter.observe.bind(reporter);
+    reporter.enterPhase = (...args) => { entered++; return enterPhase(...args); };
+    reporter.observe = (...args) => { observedCalls++; return observe(...args); };
+    const { ctx } = makeCtx({ config, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "inactive lead-config run");
+    assert.equal(posts.length, 0);
+    // An inactive reporter gets no entry and the harness gets no runtime-config callback.
+    assert.equal(entered, 0);
+    assert.equal(observedCalls, 0);
   });
 });

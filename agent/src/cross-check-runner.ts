@@ -1,4 +1,6 @@
+import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 import fs from "node:fs/promises";
+import { collectCodeInventory, normalizeCodeCoverage, type CodeInventory } from "./code-cross-check-coverage.js";
 import { decodeCrossCheckClaim, decodeCodeSnapshotCleanup } from "./code-cross-check-contract.js";
 import os from "node:os";
 import path from "node:path";
@@ -8,7 +10,7 @@ import type { GitCache, CodeSnapshotBootCandidate } from "./git.js";
 import type { Logger } from "./log.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { Outbox } from "./outbox.js";
-import { CodexCrossCheck, CrossCheckMalformedError, validateCodeFindings } from "./codex/cross-check.js";
+import { CodexCrossCheck, CrossCheckMalformedError, validateCodeVerdict } from "./codex/cross-check.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { ClaudeCrossCheck } from "./claude-cross-check.js";
 import { SECRET_PATH_PREFIXES } from "./guardrails.js";
@@ -194,6 +196,7 @@ export class CrossCheckRunner {
     let nativeCleanupConfirmed = false;
     let readersClean = true;
     let snapshotOwned = false;
+    let inventory: CodeInventory | undefined;
     const code = claim.cross_check?.stage === "code" ? claim.cross_check : undefined;
     const custodyLost = async (): Promise<boolean> => {
       try {
@@ -202,7 +205,14 @@ export class CrossCheckRunner {
       } catch (err) { return isStaleClaimRefusal(err); }
     };
     let reason: "malformed" | "model_error" | "model_timeout" | "checker_unavailable" | "confinement_failed" = "checker_unavailable";
-    this.opts.activeRuns?.add(runId, generation);
+    const registration = this.opts.activeRuns?.add(runId, generation);
+    const operation = claim.secrets.codex?.auth_mode === "subscription"
+      ? acquireCodexOperationScope(this.client, runId, generation, {}, op => {
+        if (registration === undefined || op.kind !== "checker") return undefined;
+        const token = this.opts.activeRuns?.setAccountCooldown(runId, generation, op, registration);
+        return token === undefined ? undefined : () => this.opts.activeRuns?.clearAccountCooldown(runId, generation, token);
+      }, ["checker"], this.log) : undefined;
+    operation?.own();
     try {
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
       if (ack?.staleClaim) return;
@@ -255,6 +265,10 @@ export class CrossCheckRunner {
         // Only the existing local bare and exact lead ref admit a code reader. No origin fetch.
         checkout = await this.git.runnerCloneAtCommit(bare, code.head_commit, runId, code.lead_run_id, generation);
         snapshotOwned = true;
+        inventory = await collectCodeInventory(this.git, bare, code.base_commit, code.head_commit,
+          { timeoutMs: Math.max(1, Math.min(30_000, deadline - Date.now())), signal: cancel.signal });
+        code.code_inventory = inventory;
+        cancel.signal.throwIfAborted();
         const diff = await this.git.readBare(bare,
           ["diff", "--no-ext-diff", "--no-textconv", "--no-color", `${code.base_commit}...${code.head_commit}`],
           { maxBytes: 1024 * 1024, signal: cancel.signal });
@@ -292,11 +306,18 @@ export class CrossCheckRunner {
       reason = "malformed";
       if (code) {
         if (!nativeCleanupConfirmed) throw new CrossCheckConfinementError("cleanup_callback_missing");
-        const findings = validateCodeFindings(text);
+        const verdict = validateCodeVerdict(text);
+        const findings = verdict.findings;
+        const activity = rec.coverageEvidence();
+        const captureDelivered = !b.isTripped() && b.undeliveredFromSeq() === undefined
+          && !b.tombstonedSeqs().overflow && b.tombstonedSeqs().seqs.size === 0
+          && !b.journalOnlySeqs().overflow && b.journalOnlySeqs().seqs.size === 0;
+        const coverage = normalizeCodeCoverage(inventory ?? { paths: [], inventory_incomplete: true, omitted_paths: 0,
+          omitted_count_exact: false, reasons: ["inventory_failed"] }, verdict.coverage, captureDelivered ? activity.reads : new Set(), activity.complete && captureDelivered);
         const probe = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation }, cancel.signal);
         cancel.signal.throwIfAborted();
         if (probe?.staleClaim || steering.claimLost()) return;
-        await this.client.reportCodeCrossCheckVerdict(runId, generation, { outcome: "completed", findings }, cancel.signal);
+        await this.client.reportCodeCrossCheckVerdict(runId, generation, { outcome: "completed", findings, ...(code.coverage_supported === true ? { coverage } : {}) }, cancel.signal);
         verdictDelivered = true;
         await postTerminalState(this.terminalDeps, this.client, {
           runId, claimGeneration: generation, phase: "running", messagesThroughSeq: fence(),
@@ -333,6 +354,17 @@ export class CrossCheckRunner {
       if (timer) clearTimeout(timer);
       timer = undefined;
       await finishTelemetry();
+      if (reason === "malformed") {
+        this.log.warn("cross-check verdict malformed", { run_id: runId, stage: code ? "code" : "plan",
+          ...(err instanceof CrossCheckMalformedError ? { subreason: err.subreason ?? "unknown" } : {
+            subreason: "unclassified_error",
+            error_name: err instanceof Error && err.constructor === SyntaxError ? "SyntaxError"
+              : err instanceof Error && err.constructor === TypeError ? "TypeError"
+              : err instanceof Error && err.constructor === RangeError ? "RangeError"
+              : err instanceof Error && err.constructor === Error ? "Error" : "unknown",
+          }),
+        });
+      }
       if (err instanceof CrossCheckConfinementError || reason === "confinement_failed") {
         // The Claude token has already left the secret registry. Do not log errMessage(err).
         this.log.warn("cross-check confinement refused", { run_id: runId, stage: code ? "code" : "plan",
@@ -406,6 +438,7 @@ export class CrossCheckRunner {
           this.log.warn("code snapshot retained after cleanup error", { error: errMessage(err) });
         }
       }
+      operation?.close();
       this.opts.activeRuns?.remove(runId);
     }
   }

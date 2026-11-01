@@ -1,6 +1,6 @@
 # ADR-1225: a structural completion contract, a non-bypassable claim clause, and an exact-head permit close the #1220 hole
 
-**Status**: Accepted (implemented, epic #1225, first child issue #1226, M1–M6)
+**Status**: Accepted (implemented, epic #1225, first child issue #1226, M1–M6). Epic #1225 delivered the structural interlock only; semantic completion auditing did not ship (#1231 and #1233 closed not planned 2026-10-23). See the Semantic amendment and the Close-out addendum below.
 **Date**: 2026-09-12
 **PRD**: [prds/done/1226-structural-completion-interlock.md](../prds/done/1226-structural-completion-interlock.md) — carries the full milestone breakdown, code anchors and Decision Log D1–D8; this ADR restates the negative-space invariants a future edit to a claim clause, a hold's park order or a status list would break silently. ADR-1225 is created by #1226, the epic's first child, per the epic's own numbering convention.
 **Related**: reuses [ADR-1190](1190-run-pause-invariants.md)'s `paused`-status discipline for the dedicated hold transition, [ADR-628](0628-cross-worker-resume-durability.md)'s worker-affinity ceiling for the honest `same_worker_only` limitation, and [ADR-1197](1197-transient-recovery-park.md)'s verified-capture-before-park template for `captureHoldContext`.
@@ -103,15 +103,15 @@ Continue grants no extra wall budget. After a time-limit completion hold, Contin
 
 The live window itself is time-boxed by `completion_hold_window_seconds` (claim-delivered, default 900s, `agent/src/runner.ts`'s `askCompletionQuestion`) — **deliberately separate** from `question_timeout_seconds` and from the `#88` `questionDeadlines`/`questionCounts` bookkeeping, and its expiry **resolves** `{outcome: "expired"}` rather than rejecting — this window has no fail-closed path and must never throw `REASON_QUESTION_TIMEOUT`; expiry always routes to the verified hold (I6), never to `failed`.
 
-**Every one of these mechanisms works only on the current worker.** `captureHoldContext` returns an explicit `mode: "same_worker_only"` result, and #1226 does not claim otherwise: a same-worker resume recovers the verified local restore point and the retained SDK session; a resume that lands on a *different* worker (once the existing `WORKER_AFFINITY_CEILING`, default 2h, expires — the same ceiling [ADR-628](0628-cross-worker-resume-durability.md) already governs, not a new one this child invents) recovers only what the best-effort remote publish actually reached. The wire/UI/CLI surfaces render `hold_context = "unavailable(same_worker_only)"` and D8's copy states the limitation plainly rather than presenting the hold as durable cross-worker recovery. Durable cross-worker context export is #1228's job (#1229 is not planned), not this child's, and the honesty of that gap is itself an acceptance criterion, not an implementation detail to quietly outgrow.
+**Every one of these mechanisms works only on the current worker.** `captureHoldContext` returns an explicit `mode: "same_worker_only"` result, and #1226 does not claim otherwise: a same-worker resume recovers the verified local restore point and the retained SDK session; a resume that lands on a *different* worker (once the existing `WORKER_AFFINITY_CEILING`, default 2h, expires — the same ceiling [ADR-628](0628-cross-worker-resume-durability.md) already governs, not a new one this child invents) recovers only what the best-effort remote publish actually reached. The wire/UI/CLI surfaces render `hold_context = "unavailable(same_worker_only)"` and D8's copy states the limitation plainly rather than presenting the hold as durable cross-worker recovery. Durable cross-worker context export is not this child's job: #1228 is detached and parked; this epic plans no durable cross-worker context, and #1229 is not planned. The honesty of that gap is itself an acceptance criterion, not an implementation detail to quietly outgrow.
 
 ## Consequences
 
 - A future ninth completion-decision kind (#1227's `partial`/`accept`) reuses the **same** `run_user_inputs.kind='completion_decision'` value and the **same** endpoint — it must not spawn a second control plane, per D7.
-- A future semantic-completion child (#1230/#1231) fills the reserved `audit`/`finding_ids` slots the contract and permit wire shapes already carry; it must not need a second protocol.
+- (Historical; #1231 is not planned, see the Semantic amendment below.) A future semantic-completion child (#1230/#1231) fills the reserved `audit`/`finding_ids` slots the contract and permit wire shapes already carry; it must not need a second protocol.
 - Widening the hard `ClaimRun` clause's vocabulary (a `completion_interlock_v2`) is additive to `workers.protocol_capabilities`, but the clause's *position* — outside `required_capabilities`/`ClearRunRequiredCapabilities`/`capability_aware` — must not move; that positioning is the whole point of I2.
 - The park order in I6 is a checklist for the next hold-adjacent feature the same way ADR-1190's six status lists are: a later child changing capture, publish or the ACK contract should re-verify against this ADR, not re-derive the ordering from scratch.
-- Cross-worker completion-context durability (I8's honest gap) remains an accepted gap: #1229 was closed as not planned (2026-10-15) and #1228 stays a separate open primitive. The UI/CLI copy in [docs/run-completion-hold.md](../docs/run-completion-hold.md) is the correct statement of what a hold actually recovers.
+- Cross-worker completion-context durability (I8's honest gap) remains an accepted gap: #1229 was closed as not planned (2026-10-15) and #1228 is detached and parked. The UI/CLI copy in [docs/run-completion-hold.md](../docs/run-completion-hold.md) is the correct statement of what a hold actually recovers.
 - The rollout switch (`completion_interlock_rollout`) is **on by default** for a newly created, unseeded `issue` run on either Claude or Codex; no `app_settings` row resolving to that new default is required, only an explicit `false` row turns it back off, as an admin kill-switch (Admin → Instance settings → **Completion check**). A run created before this default flipped is unaffected — the switch is read once, at `CreateRun`, never retroactively against an existing row. A seeded-plan run (PRD #209, `--plan-file`) is likewise never stamped: it never sends the plan-bearing report the stamp's contract-freeze depends on, so an interlocked seeded run would hold at finalize on every completion. This ADR describes the mechanism; it is not the place to look for whether a *specific* run was interlocked — read that run's own `completion_contract_version`.
 
 ## Addendum — Codex completion attempts (2026-09-25, #1627)
@@ -130,7 +130,9 @@ prior-attempt admission requirement. User recovery steps live in
 ### Scope authority and honest delivery
 
 Plans should isolate owner/deployment acceptance in a final acceptance-only
-milestone. Implementation, docs, tests, mandatory gates, security and review
+milestone (superseded for new plans by the
+[#3721 addendum](#addendum--owner-acceptance-outside-the-milestones-2026-10-31-3721)
+below). Implementation, docs, tests, mandatory gates, security and review
 remain worker obligations. Plan approval and auto-approval do not waive them.
 An ordinary answer and a `non_closing` declaration supply no scope authority.
 Formal owner partial records the exact kept/deferred milestone IDs and reason;
@@ -256,12 +258,14 @@ request IID and published head atomically with successful issue completion.
 Legacy non-interlocked issue runs are supported. This evidence is independent
 of recovery-inventory and completion-permit negotiation, grants no custody
 release, and has no pre-push writer. A rejected or rolled-back initial
-completion creates no stamp. A lost commit acknowledgement can leave completion and the stamp
-durable; exact terminal replay validates that paired outcome.
-Without affirmative restriction evidence, missing proof yields unknown even
-after a successful push. Historical affirmative non-closing evidence can
-restrict without a stamp; absence cannot authorize closing. No historical
-backfill is performed.
+completion creates no stamp and leaves the source non-completed. A lost commit
+acknowledgement can leave completion and the stamp durable; exact terminal
+replay validates that paired outcome.
+Missing proof never establishes closing authority. A non-completed source
+without affirmative restriction evidence yields unknown even after a
+successful push, and refuses. A completed source without a stamp refreshes
+as non-closing (#3420 addendum below). Historical affirmative non-closing
+evidence can restrict without a stamp. No historical backfill is performed.
 
 The worker resolves initially and again at each exact-candidate push attempt,
 including network retries and alignment/bridge candidates. Immutable source
@@ -317,7 +321,7 @@ Already-published history cannot be unpushed; an already-open PR may merge
 before a resumed guard runs. Claim loss accepted between ACK and push also
 remains: there is no API fence around the Git push itself.
 
-#1230 D4 and #1231 remain open. This change introduces no plan-time
+(Historical, as of that change: #1230 D4 and #1231 were open. #1231 has since been closed not planned; #1230 is merged and dormant.) This change introduces no plan-time
 preauthorization or semantic activation. Live deployment acceptance has not
 been performed; mocked tests and PR existence establish neither that
 acceptance nor full end-to-end coverage.
@@ -382,19 +386,97 @@ Another source of a completion attempt joins the lead's `signal_done`, the permi
 
 User-facing behavior is described in [Completion holds](../docs/run-completion-hold.md).
 
-## Semantic default-on amendment (2026-10-17, #1230/#1231; status updated 2026-10-20)
+## Addendum — completed unstamped sources refresh as non-closing (2026-10-29, #3420)
 
-Two statuses are kept apart here. **Dormant-implemented by #1230** means the code is implemented by #1230 and is exercised only by tests that inject the path; production enrollment is off, no production code writes a `semantic_planning` row, and a real run stays structural or legacy. **Still planned (#1231)** means nothing in that list exists yet. The accepted structural invariants above stay in force except where this amendment names a supersession; current user docs remain the runtime authority.
+Compatibility-policy change to the #3120 resolver. Missing proof still never
+establishes closing authority, but it no longer always yields unknown. An
+issue source that is completed and not report-only, with validated identity,
+ancestry and contract authority and no stamp or affirmative restriction,
+resolves `non_closing` with `source_publication: null`: the same wire shape as
+an affirmative-restriction non-closing result. Rework and CI fix of such a
+source proceed with the non-closing commit-history scan.
+
+- **Still refused.** Unrestricted non-completed sources (failed, running,
+  cancelled, including rejected or rolled-back completions) and unresolved or
+  invalid authority without independently sufficient affirmative restriction
+  evidence. Existing affirmative restrictions keep their path; valid stamped
+  closing and non-closing results and malformed or inconsistent stamp
+  semantics are unchanged.
+- **Keyed on "completed without a stamp", never on age.** This covers sources
+  completed by an old worker during a mixed rollout and any other writer that
+  completes without a stamp. Age is never inferred from a null stamp.
+- **Commit history still refuses.** An old PR whose branch history
+  (default-branch..candidate, including already-published commits) contains
+  `Closes #N` or an equivalent for the source issue is refused even on a
+  no-change rework. The owner must remediate those directives outside the
+  worker; the guard does not rewrite history.
+- **Body text is a separate boundary.** A refresh neither adds nor strips a
+  pre-existing `Closes #N` in PR body text outside uzi's owned region, so
+  merging such a PR can still close the issue.
+- **No retroactive proof.** No backfill, history rewrite, migration or proof of
+  completion is added, and this does not make every historical PR reworkable.
+- **Observability.** Each successful fallback resolution is logged at Info as
+  `publication_context_unstamped_fallback` (run and source run IDs), after
+  forge verification and the final snapshot recheck. The worker refusal
+  diagnostic now names the validated reason from an allowlisted enum, for
+  example `(publication_unproven)`; transport, malformed, unrecognized-reason
+  and identity-change failures carry no parenthetical.
+- **Negotiation unchanged.** A new worker against an old API still refuses
+  affected refreshes; old workers keep their earlier behavior.
+
+## Addendum — owner acceptance outside the milestones (2026-10-31, #3721)
+
+Planning-guidance change, recorded in
+[PRD #3721](../prds/done/3721-owner-acceptance-outside-milestones.md). For new,
+unfrozen plans it supersedes the #3090 addendum's acceptance-only final
+milestone. The structural contract freezes one criterion per milestone, so an
+item a worker inherently cannot perform made the run park at completion for a
+partial decision the owner had usually already seen in the plan.
+
+- **Plan sections, not milestones.** Checks that inherently need the PR/merge
+  environment (for example exact-head PR CI), or an already-authorized
+  issue-specific landing fallback, go in a "Landing obligations" section.
+  Live, hosted or human-judgment acceptance goes in an "Owner acceptance"
+  section naming what remains, why the worker cannot do it, the actor and the
+  steps. Implementation, docs, tests, mandatory gates, security and review
+  remain worker obligations and never move to either section.
+- **Honest non-closing delivery.** With owner-acceptance items the lead
+  declares `non_closing` (honored since #2172) with a reason naming the
+  pending items, and lists each as a `deferred` `pr_summary` scope note. The
+  reason is rendered in the worker-owned completion block as "Issue remains
+  open", and the #3090 closing-commit guards engage on it. Landing obligations
+  alone keep a closing delivery.
+- **Doubt at planning.** Consequential classification doubt goes to
+  `ask_user` before the final `submit_plan` only where it reaches a human. On
+  an auto-approved run `ask_user` is auto-answered, so the item stays a
+  required milestone and the plan records the uncertainty (owner decision
+  2026-10-31, PRD D5).
+- **Mechanism: guidance only.** The shared lead guidance on both harnesses
+  carries these rules. The interlock, permit and freeze are unchanged and the
+  structural contract still enforces milestones only (PRD D2). Frozen criteria
+  keep the owner partial, accept and reconciliation paths; unfinished worker
+  work still parks at completion (PRD D4).
+- **Accepted residual (PRD D3).** The owner-acceptance list is lead prose and
+  non-closing depends on the lead declaring it; nothing structural records it.
+  The plan gate, the plan cross-check and the lander's pre-merge check are the
+  guards. Scope notes are capped, so the submitted plan keeps the complete
+  acceptance text.
+
+## Semantic default-on amendment: semantic auditing did not ship (2026-10-17, #1230/#1231; status updated 2026-10-24)
+
+Semantic completion auditing did not ship. #1231 and #1233 were closed not planned on 2026-10-23 because no supported credential path gives an enforceable whole-call bound for subscription credentials. The text below is the historical design of 2026-10-17 to 2026-10-21, kept for its rationale; where it says "planned", read "not planned".
+
+Two statuses are kept apart here. **Dormant-implemented by #1230** means the code is implemented by #1230 and is exercised only by tests that inject the path; production enrollment is off, no production code writes a `semantic_planning` row, and a real run stays structural or legacy. **Not shipped (#1231)** means nothing in that list exists. The accepted structural invariants above stay in force except where this amendment names a supersession; current user docs remain the runtime authority.
 
 ### Coverage transport limitation
 
-Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. #1231 must establish enforceable bounds before activation.
+Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. Any future semantic activation must establish enforceable bounds before activation.
 
 Mechanism: `reviewPlanContract` (`agent/src/plan-contract-review.ts`) runs only through an explicit `BoundedCoverageTestTransport` (`kind: "bounded-test"`), which a test injects and no shipped worker path supplies. Without one the review returns `coverage_unavailable` before any model call, and an input whose conservative upper bound reaches the 40,000-token allowance returns `coverage_exhausted` before any call. Both settle as coverage-unavailable at the human gate (see [Autopilot](../docs/autopilot.md#semantic-runs-park-instead-of-auto-approving-dormant)).
 
 ### Owner transport limitation (AI-synced 2026-10-21)
 
-Maximum-size owner semantic transport is not production-readiness proof. An owner semantic gate can approach 80 MiB before the ordinary run fields, while the production API listener has 15-second read and write timeouts. A four-core worker reported about 11 seconds of server CPU for a maximum-size owner decision and timeouts in the race-instrumented maximum-size LiveDB proofs. CPU time is not request wall time, and those reports do not establish a safe production margin. The race fixtures use two-minute client budgets and omit the production listener deadlines; the non-race fixtures retain them. #1231 must verify maximum-size owner reads and decisions against production transport deadlines before activation.
+Maximum-size owner semantic transport is not production-readiness proof. An owner semantic gate can approach 80 MiB before the ordinary run fields, while the production API listener has 15-second read and write timeouts. A four-core worker reported about 11 seconds of server CPU for a maximum-size owner decision and timeouts in the race-instrumented maximum-size LiveDB proofs. CPU time is not request wall time, and those reports do not establish a safe production margin. The race fixtures use two-minute client budgets and omit the production listener deadlines; the non-race fixtures retain them. Any future semantic activation must verify maximum-size owner reads and decisions against production transport deadlines before activation.
 
 The 17 MiB nginx allowance for exact owner input/decision routes buffers requests before API authentication, as the existing bounded file-upload route does. Buffering remains enabled and the API retains its ordinary 1 MiB input limit and exact owner authority. This is a live, bounded pre-auth buffering cost, not a dormant resource cost or an authorization bypass.
 
@@ -406,14 +488,26 @@ The 17 MiB nginx allowance for exact owner input/decision routes buffers request
 - **Maintainer outstanding proof (D4).** Only owner-approved maintainer criteria are excluded from worker requirements, and approval authorizes only the IDs and conditions shown. `completion_pending` (`version`, `contract_revision`, `criteria`) rides the claim, the state ACK and the permit; it feeds the existing early and exact-tip closing-commit guards as one more non-closing source without touching the legacy deferred-milestone set. The publication ACK projection must equal the permit's or publication holds; a missing API feature holds and so does the capped-empty path. Nothing marks a criterion satisfied.
 - **Drift (D5) as a detector.** The server re-reads the current issue through the authorized forge seam and hashes it like the frozen source (for a composed scheduled run, it compares the current raw body with the raw body saved at creation); a PRD link added or removed counts as a contradiction; the worker hashes frozen PRD sources at the exact SHA through trusted bare git. Outcomes are unchanged, changed, or unknown with a reason, with at most 32 observations kept and the dropped count recorded. Drift never holds, refuses, revises or satisfies anything.
 
-### Still planned (#1231); none of this is implemented
+### Not shipped (#1231, closed not planned 2026-10-23)
+
+None of the following is implemented, and none is planned. The list below is the historical design. Reactivation needs a new approved design, which must first establish enforceable bounds for the credential paths in use.
 
 - #1231 activates coverage and final audit together for new eligible unseeded issue runs on both harnesses. Instance `semantic_completion_rollout` defaults on; an explicit admin disable affects future runs only. Model/cost ceilings are instance-admin configured and frozen per run; repo overrides are deferred.
 - Enrollment freezes inside the run-creation transaction, before the first claim, independent of the later detailed contract freeze. Semantic claims require `completion_audit_v1` plus existing structural/Codex/harness predicates outside ordinary overrides. Missing compatible capacity queues the semantic run and names the protocol; no fleet-based downgrade. Existing structural/legacy/seeded runs retain their declared enrollment, and an explicit structural disable remains respected.
 - Both rollout keys use one settings snapshot; a failed refresh uses both cached values where valid. Without a valid cache, an unreadable snapshot refuses new unseeded issue creation retriably with zero writes; seeded/non-issue paths stay unchanged. This supersedes, for unseeded issue runs, the cold-read-as-off fallback recorded in I1 and the Codex addendum once #1231 ships. Supported rollback retains semantic-aware profile/claim/permit enforcement and changes only future enrollment. A pre-semantic API downgrade with semantic authority present is unsupported/prohibited; an old binary cannot enforce it. Preserve schema/data, never strip contracts, and pair activating API/worker releases with tested protocol evidence rather than mere tag existence.
-- The semantic completion audit and permit-level enforcement of semantic verdicts, and the enforceable coverage-transport bounds above, are #1231's. Coverage and audit budgets stay independently bounded (default coverage 120k normalized tokens/three reviews, audit 100k/two verdict-bearing passes). Exhaustion/outage never certifies uncertain work. #1232 proves integrated rollout/rollback; it does not retire the admin kill-switch or promise unimplemented cross-worker provider-context portability (#1229 remains not planned).
+- The semantic completion audit and permit-level enforcement of semantic verdicts, and the enforceable coverage-transport bounds above, are #1231's. Coverage and audit budgets stay independently bounded (default coverage 120k normalized tokens/three reviews, audit 100k/two verdict-bearing passes). Exhaustion/outage never certifies uncertain work. (Historical: this bullet originally said #1232 would prove integrated semantic rollout and rollback. It does not: no semantic path was activated. The structural admin kill-switch from #1626 is retained, and no cross-worker provider-context portability is promised; #1229 is not planned.)
 
 Nothing here is live deployment evidence: no live setting, run profile or dispatch changed, and the injected-path tests establish neither hosted behavior nor model quality. Exact-diff peer and independent architecture review is pending.
+
+## Close-out (#1232, 2026-10-24)
+
+Epic #1225 delivered the structural interlock only, on by default on both harnesses: the contract, hard claim clause, exact-head permit, same-lead rework and completion hold (#1226), owner continue/partial/accept (#1227), default-on enrollment with an admin kill-switch and same-branch guard (#1626), and the Codex harness (#1627). Semantic completion auditing did not ship. #1230's semantic contract is merged and dormant (no production enrollment). #1228 is detached and parked and #1229 is not planned.
+
+#1232 added integration proof, not new behavior:
+
+- **M1, lifecycle tests.** `TestCompletionLifecycleContinueLiveDB`, `TestCompletionLifecyclePartialLiveDB`, `TestCompletionLifecycleAcceptLiveDB`, `TestCompletionLifecycleCodexParityLiveDB`, `TestCompletionLifecycleKillSwitchAfterCreateLiveDB` and `TestCompletionLifecycleAuthorizeMaintainerRefusedLiveDB` in `api/internal/workersvc/completion_lifecycle_livedb_test.go`.
+- **M2, wire and Codex arm.** `TestCompletionWireFixtures`, `TestWorkerRunCompletionHoldHTTPMapping`, `agent/test/client-completion-wire.test.ts`, the Codex `b0ffd0ea` arm in `agent/test/codex-executor.test.ts`, and the shared fixtures in `fixtures/completion-wire/`.
+- **M3, mutation audit.** Every D4 guard (G1 to G12; G2, G6, G7 and G8 each proven as two halves) was disabled by one mutation in an isolated export, and a named focused test failed on the intended assertion while passing on the unmodified source. One mutation survived: with `DecideCompletion`'s pre-transaction owner check disabled, a lock-time re-check still hid the run, but a foreign caller sending an invalid decision got a validation error that reveals the run exists. A test-only subtest of `TestDecideCompletionNonOwnerHiddenLiveDB` now kills it. Two mutants are recorded as equivalent: deleting G12's profile check, and the continue path's second owner check alone (equivalent for sequential callers only; no test pins it). No production code changed. The final unmodified LiveDB sweep passed with 0 skips (split across two commands by the 60-minute limit). The #1232 PRD Decision Log has the per-guard table.
 
 ## Linked from ARCHITECTURE.md
 

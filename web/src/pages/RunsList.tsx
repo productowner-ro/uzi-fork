@@ -15,7 +15,7 @@
 // not a failure" nuance: isStoppedRun collapses cancelled / stop_kind-stamped-
 // failed runs (PRD #33) to a calm "stopped" pill, not "failed".
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useOutletContext, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, preferForgeUrl, type AdminWorker, type RunSummaryItem, type RunUsage } from "../lib/api";
@@ -25,8 +25,10 @@ import { ActivityIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
+import { ForgeOriginStatus } from "../components/ForgeOriginStatus";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import {
+  isAccountCooldownWaiting,
   effectiveRunStatus,
   firstInProgressMilestoneId,
   isStoppedRun,
@@ -186,12 +188,17 @@ export function RunsLayout() {
   // Refresh rows and credential counts independently every 10s while visible,
   // catching up on focus. Each endpoint keeps its last-good state on failure;
   // polls never re-flash the skeleton or show an error banner.
+  const pollAliveRef = useRef(false);
+  useEffect(() => {
+    pollAliveRef.current = true;
+    return () => { pollAliveRef.current = false; };
+  }, []);
   const poll = useCallback(async () => {
     await Promise.all([
-      api.listRuns({ view: "summary" }).then(({ runs }) => setRuns(runs)).catch(() => {
+      api.listRuns({ view: "summary" }).then(({ runs }) => { if (pollAliveRef.current) setRuns(runs); }).catch(() => {
         // keep the last-good rows
       }),
-      refreshCredentialCounts(),
+      refreshCredentialCounts(() => pollAliveRef.current),
     ]);
   }, [refreshCredentialCounts]);
   usePollWhileVisible(poll, 10000);
@@ -321,7 +328,7 @@ export function RunRow({
   // current_activity DTO field; hidden when null or terminal, so a pre-feature run and a
   // finished run read exactly as before (D5). Untrusted fields render escaped.
   const activity = run.current_activity;
-  const showNow = activity != null && !isTerminalRun(run.status);
+  const showNow = activity != null && !isAccountCooldownWaiting(run) && !isTerminalRun(run.status);
   const age = showNow && activity ? activityAge(activity.at, now) : "";
   const nowMilestone = firstInProgressMilestoneId(run);
   // Issue #256 M3: a live, per-state duration token ("running 1h 30m", "ran 42m", …);
@@ -507,14 +514,15 @@ export function RunRow({
               {/* The health flag (PRD #47) sits beside the status pill; hidden here
                   when waitingForVault already explains a locked queued run, and when
                   the progress cell's stalled flag already shows the stall. */}
-              {!progressShowsStall(run) && <RunHealthBadge run={run} />}
+              {!progressShowsStall(run) && <RunHealthBadge run={run} nowMs={now} />}
               {/* The judge verdict (PRD #98 M4) sits with the other per-run pills;
                   absent entirely on an unjudged run. */}
               <JudgeRunBadge run={run} />
               {/* PRD #320 M6: the queue-priority pill (Deprioritized/Expedited/Restored),
                   self-hiding on a normal or non-queued run. */}
               <RunPriorityBadge priority={run.priority} status={run.status} />
-              <StatusPill status={pillStatus} progress={run.progress} />
+              <StatusPill health={run.health} status={pillStatus} progress={run.progress} recovery_wait_cause={run.recovery_wait_cause} recovery_retry_not_before={run.recovery_retry_not_before} />
+              <ForgeOriginStatus cooldown={run.forge_origin_cooldown} />
               {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It is
                   raised above the card's stretched-link overlay (relative z-10, issue #485
                   NB1) so the click hits the button rather than the run-details Link; it
@@ -557,7 +565,7 @@ export function RunRow({
 // them and the layout must stay role-agnostic.
 export function RunsList() {
   const demo = useDemoMode();
-  const { user, vaultUnlocked } = useAuth();
+  const { user, vaultUnlocked, vaultMode } = useAuth();
   const isAdmin = !!user?.is_admin;
   // Issue #256 M3: a 1s tick drives the live duration token on every row; the 10s
   // data poll (PRD #518) refreshes the rows but does not re-derive the token between
@@ -651,7 +659,7 @@ export function RunsList() {
                       key={r.id}
                       run={r}
                       now={now}
-                      waitingForVault={!vaultUnlocked && r.status === "queued"}
+                      waitingForVault={vaultMode !== "unprotected" && !vaultUnlocked && r.status === "queued"}
                       showCredential={showsRunAccounts(credentialCounts)}
                       credentialCount={credentialCounts[r.harness]}
                       // The personal Active list is all the viewer's own runs, so the

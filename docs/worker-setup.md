@@ -10,6 +10,23 @@ A **worker** is the `uzi-agent` container: it connects to your uzi server, claim
 
 On a k8s deployment where an admin has turned hosting on, you can skip this whole page: provision a worker from **Settings → Workers** instead, on the **Add a worker** tab, and the cluster runs the container for you. See [Hosted workers](./hosted-workers.md).
 
+## Online does not mean forge-reachable
+
+**Online** reports heartbeat contact with the uzi API. A worker can be online
+while its direct Git clone/fetch path is unavailable. The owner/worker/Git-origin
+cooldown blocks claims before due, then permits one reserved ordinary attempt;
+a timer is not a success signal. Human/model waits retain that reservation,
+while stopped flights release it without marking the origin healthy.
+Legacy workers without direct success telemetry can serialize that origin
+for the active flight; upgrading enables earlier verified clearing.
+
+Distinguish this cooldown from a run's timed `recovery_wait` retry, its
+NULL-retry owner hold, and source custody. Local-only or unverified work still
+needs protection; moving to a sibling requires the complete guarded history
+check. Owner Resume queues an attempt and can still be blocked by admission.
+See [Forge unreachable at clone](./run-recovery-wait.md#forge-unreachable-at-clone)
+for the cap, safe placement and mixed-version behavior.
+
 ## 1. Generate a join token
 
 In uzi, open **Settings → Workers**, then the **Add a worker** tab, and use the **Register your own worker** card to register a worker (give it a name, e.g. `laptop`). The join token is shown **once**: copy it now, since only its hash is stored server-side (register a new worker if you lose it).
@@ -49,6 +66,8 @@ docker run -d -e UZI_API_URL=https://uzi.example.com \
 
 The five capabilities support the root startup window; the entrypoint then drops to the unprivileged worker with only SETUID/SETGID, so it can launch agents under a separate runner UID. Keep the token bind mount writable: startup re-owns the mounted file to UID/GID 10001 and sets its mode to 0400. This changes the backing host file's permissions and, on Linux, its ownership; desktop container runtimes may map ownership differently. A generic read-only bind mount refuses to start because the entrypoint cannot enforce that token posture. File delivery keeps the join token out of the worker's environment.
 
+To cap Go build and runtime parallelism for the commands a worker runs, add `-e WORKER_GO_BUILD_PARALLELISM=2 -e WORKER_GO_MAXPROCS=2` to the `docker run` above, or set the same two variables in the compose `.env`. Both are optional and unset by default; see [Worker Go concurrency defaults](./configuration.md#worker-go-concurrency-defaults) for accepted values and limits.
+
 Put a TLS-terminating proxy in front of a worker reached over an untrusted network: `api` itself listens plain HTTP.
 
 ## Worker templates
@@ -57,7 +76,7 @@ A worker image is built from a **template**: a curated, code-reviewed Dockerfile
 
 | Template | What it adds | Use it when |
 |---|---|---|
-| `base` (default) | Node 24 + git + bash + make + the `docker` CLI + go + python3 — the minimal worker | Most repos |
+| `base` (default) | Node 26 + git + bash + make + the `docker` CLI + go + python3 — the minimal worker | Most repos |
 | `jvm` | `base` plus a JDK (`java`/`javac`) | Repos that build or test Java |
 
 Every worker also ships the `docker` CLI and a default go/python3/pip toolchain, baked at build time onto both templates' `PATH` — no per-repo provisioning needed for either. The `docker` CLI alone can't run anything until a daemon is wired up: see [Docker inside a worker](./worker-docker.md). go/python3/pip share the nix store's first-run-only warm cache described under [Tool provisioning](#tool-provisioning) below: they refresh only when `/nix` is deleted and the worker reprovisions, not on every worker image upgrade. The baked set also covers a handful of everyday utilities (`ripgrep`, `opentofu`/`tofu`, and others) beyond go/python3/pip — the shared manifest at `agent/devbox-global/devbox.json` is the canonical list, not this page.
@@ -131,7 +150,7 @@ resources:
 
 **A [docker sidecar](#docker-sidecar) costs more** on top of either number above: budget roughly an extra **1-2 GiB memory / 1 CPU** for the `dind` daemon itself, plus its own storage for pulled images and build cache — a compose `dinddata` volume, or its k8s equivalent. Under compose, `dinddata` only grows: once you don't need what's cached, first run `docker compose -p <project> rm -s -f agent dind`, then `docker volume rm <project>_dinddata`, replacing `<project>` with your actual Compose project name. Recreate the services using `docker compose -p <project> up` with your existing [Docker-sidecar setup](#docker-sidecar), including its Compose profiles and configuration. These steps keep the database (`pgdata`) and the repositories (`agentdata`). On a hosted k8s worker the equivalent is a persistent per-worker PVC (`dind-data`), and a `dind-meter` sidecar samples its fill level and supports automatic cache pruning and, under a stricter terminal-run maintenance gate, DinD PVC recycling under sustained pressure — see [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning) for what that covers and what it doesn't. Expect a real workload — uzi's own e2e suite pulls `postgres:17` and builds `api`/`web`/`agent` through the sidecar — to land in the **5-20 GiB** range.
 
-**On a hosted k8s worker, a per-pod Codex command cache draws on the pod's ephemeral storage, separately from the dind budget above**: it exists only under the uid split. A worker-only emptyDir (`codex-cmd-cache`) holds one directory per run with that run's Codex command build cache (`GOMODCACHE`/`GOCACHE`/npm). It is removed at the end of any run whose command roots have all drained, and via `--remove-cache` after a cache-holder loss; otherwise it is kept on disk until the startup orphan reaper sweeps it. It counts toward `workers.ephemeralRequest`/`workers.docker.ephemeralRequest`, the docker tier's 5Gi default adds provisional headroom for it (issue #1757), unmeasured; the plain tier's 512Mi does not yet, pending a hosted measurement of a Go-heavy Codex run's peak usage.
+**On a hosted k8s worker, a per-pod Codex command cache draws on the pod's ephemeral storage, separately from the dind budget above**: it exists only under the uid split. A worker-only emptyDir (`codex-cmd-cache`) holds one directory per run with that run's Codex command build cache (`GOMODCACHE`/`GOCACHE`/npm). It is removed at the end of a run only when its command roots have all drained, its cache reservations have settled and no measurement is still running, and via `--remove-cache` after a cache-holder loss under the same conditions; otherwise it is kept on disk until the startup orphan reaper sweeps it. While a run is live, its cache is measured after commands and rotated to a fresh generation when a complete measurement reaches or exceeds the per-run budget, or when the measurement is unknown (incomplete, failed or timed out) (`UZI_CODEX_COMMAND_CACHE_RUN_BYTES`, default 4 GiB, `0` turns it off; see [Configuration](./configuration.md)). Rotation is best-effort with no hard size bound, and a command is never refused for cache size. It counts toward `workers.ephemeralRequest`/`workers.docker.ephemeralRequest`, the docker tier's 5Gi default adds provisional headroom for it (issue #1757), unmeasured; the plain tier's 512Mi does not yet, pending a hosted measurement of a Go-heavy Codex run's peak usage.
 
 What the gauges mean:
 
@@ -488,6 +507,12 @@ An api outage — of any length — no longer costs a run its message feed. The 
 
 ## Surviving an api restart mid-run
 
+For Codex subscription flights that negotiated operation admission, an API
+outage blocks the next supported new model dispatch, even without a known
+cooldown. Already dispatched turns and preservation continue under existing
+controls, budgets and deadlines; the restoration semantics below still apply.
+See [operation-admission upgrades](installation.md#codex-account-admission-upgrades).
+
 The message outbox above keeps a run's message feed intact across an api
 outage; this is about the run's own status. On every heartbeat and claim, a
 worker reports which run-lane attempts it's actually executing and in which
@@ -652,12 +677,26 @@ while the original flight still owns settlement, feedback and source custody.
 One monitor shares the worker's cgroup budget across its configured
 concurrency. It can intervene in enrolled **Codex and Claude model shell commands**,
 using the exact registered supervisor and process start ticks; approximate
-tree RSS ranks candidates while total cgroup usage determines pressure.
-It does not subtract file memory. Internal probes,
+tree RSS ranks candidates while the cgroup working set,
+`max(0, memory.current - inactive_file)`, determines pressure. Internal probes,
 provider/credential processes, boundary/checkpoint/capture operations and
 cross-checker authority are outside the delivered adapters' scope. Enrollment
 adds no process authority and changes no concurrency setting; see
 [ADR-2396](../adr/2396-worker-memory-guard.md).
+
+Cgroup memory PSI is optional. The hard path (working set at or above the
+limit minus reserve) fires on PSI-capable and PSI-less hosts alike; early
+intervention also needs real PSI in two consecutive samples, so a host without
+`memory.pressure` (read fails with `ENOENT` or `ENOTSUP`) runs hard-only.
+Other PSI read errors, or malformed PSI, make the sample unavailable and
+inhibit intervention. The worker logs one warning when PSI is unavailable
+("worker memory guard: cgroup memory PSI unavailable; early intervention
+disabled, hard intervention continues on valid core accounting") and one info line when it is restored. The working set is an
+estimate, not an OOM predictor: inactive file pages can be dirty or slow to
+reclaim, so it can underestimate pressure (dirty/writeback validation is
+deferred), and allocation bursts, stalled sampling, node pressure and
+Docker-in-Docker memory remain outside it. See
+[configuration](./configuration.md#worker-memory-guard).
 
 A confirmed command drain, resolved outcome and fresh low-usage dwell are
 required before another intervention/retry. The per-run memory-episode
@@ -683,6 +722,11 @@ disables native `Bash` and `Monitor`. What changes for those runs
   automatic extension. Every call starts at the repository root.
 - At most 8 commands per run may be live; the 9th is refused with a visible
   error.
+- Commands one agent issues together run one after another, not at once (the
+  8-command cap counts all agents on the run), and a command placed after a
+  batch of subagents waits for that batch. To keep the integration gate
+  overlapping the review, the lead delegates the gate to one subagent in the
+  same batch as the reviewers.
 - Inline output is capped at 30000 characters (start and end preview). A
   best-effort spill file under `.uzi/scratch/uzi-cmd/` is capped at 64 MiB and
   truncated beyond that; it is bounded, not a promise of full output.
@@ -697,9 +741,18 @@ disables native `Bash` and `Monitor`. What changes for those runs
   advertising `worker_memory_pressure_v1`, or the worker shuts down), the turn
   is aborted and follows the existing recovery/requeue policy. Restart the
   worker to regain authority, as for Codex: registration runs once at startup,
-  and until then each new run claim on that worker, including a requeued run that
-  lands back on it, fails with "Worker memory enrollment requires the full
-  worker claim and registration" and is reported as a run failure.
+  and until then the API withholds new guard-bound run claims from that worker.
+  An already in-flight claim can still fail enrollment under the existing
+  authority fences.
+- Both harnesses distinguish retired authority, exhausted allowance,
+  lifecycle phase holds and memory-pressure holds. A pressure-held command
+  waits within its original command deadline and remaining run budget for
+  at most one configured quiet dwell plus sample/response margin. It then
+  rechecks the original authority and command restrictions before starting,
+  or returns the current refusal reason. This wait neither releases the
+  guard's latch nor promises a recovery time. Phase holds require finishing
+  the pending answer, approval or follow-up step. Exhausted episodes require
+  owner Resume after the memory-pressure park.
 
 **Startup preflight.** With the guard enabled the worker launches the command
 supervisor with an inert child before registering, and requires it to start,
