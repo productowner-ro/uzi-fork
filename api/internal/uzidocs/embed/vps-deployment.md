@@ -143,6 +143,7 @@ cat > caddy.yaml <<'EOF'
 services:
   caddy:
     image: caddy:2.10
+    restart: unless-stopped
     command: caddy reverse-proxy --from ${FRONTEND_ORIGIN} --to web:8080
     ports:
       - "80:80"
@@ -385,8 +386,8 @@ The evidence below is from the current branch. Compare it with your release: a l
 | Scope | File and line evidence | What to check |
 |---|---|---|
 | Current branch | [scripts/init-env.sh:20](../scripts/init-env.sh#L20), [22](../scripts/init-env.sh#L22), [35](../scripts/init-env.sh#L35), [57](../scripts/init-env.sh#L57), [61](../scripts/init-env.sh#L61), [104](../scripts/init-env.sh#L104) | Downloaded layout, existing-file guard, secret generation, private file creation, and final write. |
-| Current branch | [deploy/compose/compose.yaml:26](../deploy/compose/compose.yaml#L26), [119](../deploy/compose/compose.yaml#L119), [121](../deploy/compose/compose.yaml#L121), [126](../deploy/compose/compose.yaml#L126), [127](../deploy/compose/compose.yaml#L127), [138](../deploy/compose/compose.yaml#L138), [142](../deploy/compose/compose.yaml#L142), [166](../deploy/compose/compose.yaml#L166), [177](../deploy/compose/compose.yaml#L177) | Versioned application images, loopback port, worker profile, sizing, volumes, and secret wiring. |
-| Current branch | [deploy/compose/compose.yaml:33](../deploy/compose/compose.yaml#L33), [80](../deploy/compose/compose.yaml#L80), [88](../deploy/compose/compose.yaml#L88), [.env.example:11](../.env.example#L11) | Origin, public URL, empty trusted proxies, and encryption-key loss warning. |
+| Current branch | [deploy/compose/compose.yaml:27](../deploy/compose/compose.yaml#L27), [28](../deploy/compose/compose.yaml#L28), [121](../deploy/compose/compose.yaml#L121), [124](../deploy/compose/compose.yaml#L124), [129](../deploy/compose/compose.yaml#L129), [131](../deploy/compose/compose.yaml#L131), [142](../deploy/compose/compose.yaml#L142), [146](../deploy/compose/compose.yaml#L146), [170](../deploy/compose/compose.yaml#L170), [181](../deploy/compose/compose.yaml#L181) | Versioned application images, restart policy, loopback port, worker profile, sizing, volumes, and secret wiring. |
+| Current branch | [deploy/compose/compose.yaml:35](../deploy/compose/compose.yaml#L35), [82](../deploy/compose/compose.yaml#L82), [90](../deploy/compose/compose.yaml#L90), [.env.example:11](../.env.example#L11) | Origin, public URL, empty trusted proxies, and encryption-key loss warning. |
 | Current branch | [api/cmd/server/main.go:1982](../api/cmd/server/main.go#L1982), [api/internal/handler/auth.go:96](../api/internal/handler/auth.go#L96), [206](../api/internal/handler/auth.go#L206), [api/internal/config/config.go:1464](../api/internal/config/config.go#L1464) | Create-only seed, registration closure, first-user admin assignment, and Secure-cookie derivation. |
 | Current branch | [api/internal/middleware/ratelimit.go:229](../api/internal/middleware/ratelimit.go#L229), [239](../api/internal/middleware/ratelimit.go#L239), [web/nginx.conf:36](../web/nginx.conf#L36), [45](../web/nginx.conf#L45), [61](../web/nginx.conf#L61), [77](../web/nginx.conf#L77), [107](../web/nginx.conf#L107) | Direct-peer trust boundary, rightmost non-trusted hop, WebSocket route, and packaged forwarding-header overwrites. |
 | Current branch | [api/internal/handler/forge.go:243](../api/internal/handler/forge.go#L243), [api/internal/handler/cli_auth_livedb_test.go:498](../api/internal/handler/cli_auth_livedb_test.go#L498) | The GitLab default for a missing `forge_type`, and the session-only routes for worker creation and forge connection. |
