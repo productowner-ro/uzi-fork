@@ -249,7 +249,7 @@ Wait until the worker shows `online`. In our test this took about a minute:
 api "$URL/api/workers" | jq -r '.workers[] | [.name, .status] | @tsv'
 ```
 
-If it stays `offline`, read `docker compose logs agent`. See [Worker setup](./worker-setup.md) for more help.
+If it stays `offline`, read `docker compose logs agent`. If the log shows `register REJECTED`, uzi refused the token: create a new one with the commands above, then run `docker compose up -d`. Until then the worker restarts about once a minute. See [Worker setup](./worker-setup.md) for more help.
 
 ## Step 7 - Connect the forge, the repository and the model login
 
