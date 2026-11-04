@@ -15,7 +15,7 @@ uzi runs as a Docker Compose stack of four services:
 3. `web` serves the interface and passes API calls to `api`.
 4. `agent` is the worker: it runs the work against your repositories.
 
-Only `web` opens a port, and only on `127.0.0.1`. Your existing reverse proxy brings HTTPS traffic to it.
+Step 3 adds two more services: Caddy, which serves HTTPS and passes the traffic to `web`, and a daily database backup. `api` and `db` open no port.
 
 The stack comes from the [server Compose file](../deploy/compose/compose.yaml) of a release, with signed images of the same release. Its worker has no Docker inside; see [Worker setup](./worker-setup.md) for other workers.
 
@@ -35,7 +35,7 @@ New words such as forge, worker or plan gate are in the [Glossary](./glossary.md
 **The domain and the proxy**
 
 5. A domain whose A record points to your VPS. Replace `your_domain` with it in each command below.
-6. A reverse proxy that ends TLS. If you have none, install [Caddy](https://caddyserver.com/docs/install#debian-ubuntu-raspbian): it gets the certificate by itself. For nginx, see [Other setups](#other-setups).
+6. Ports 80 and 443 free on the VPS and open to the internet: the Caddy of this tutorial needs both to get its certificate. If another proxy already holds them, see [Your own reverse proxy](#your-own-reverse-proxy).
 
 **The accounts**
 
@@ -56,13 +56,13 @@ sudo chown "$USER":"$(id -gn)" /opt/uzi
 cd /opt/uzi
 ```
 
-Choose a release that contains `deploy/compose/compose.yaml` on [GitHub Releases](https://github.com/vtmocanu/uzi/releases). Set its number, with no leading `v`:
+Choose a release on [GitHub Releases](https://github.com/vtmocanu/uzi/releases). Set its number, with no leading `v`:
 
 ```sh
 UZI_VERSION='<release-number-without-v>'
 ```
 
-Download the three files of that release. `set -e` stops the block at the first failed download:
+Download the three files of that release:
 
 ```bash
 set -e
@@ -132,46 +132,77 @@ UZI_WORKER_TOKEN=
 
 **Copy `.env` to your backup now.** It holds `UZI_SECRET_KEY`, which encrypts the forge and model tokens. If you lose this key, uzi cannot read them.
 
-## Step 3 - Start uzi
+## Step 3 - Add Caddy and the backup to the stack
 
-Download the images. The worker image alone is about 10 GB:
+Two small Compose files add HTTPS and a daily database dump to the stack.
 
-```sh
-docker compose --profile agent pull
-```
-
-Start the database, the API and the web service. The worker stays off until Step 6:
+Write `caddy.yaml`. Caddy takes your domain from `FRONTEND_ORIGIN` in `.env`, gets its certificate by itself and sends all traffic to `web`:
 
 ```sh
-docker compose up -d
+cat > caddy.yaml <<'EOF'
+services:
+  caddy:
+    image: caddy:2.10
+    command: caddy reverse-proxy --from ${FRONTEND_ORIGIN} --to web:8080
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+volumes:
+  caddy_data:
+  caddy_config:
+EOF
 ```
 
-Wait until `db` and `api` show `healthy`:
+Write `backup.yaml`. It dumps the database 5 minutes after the start, then once a day, into `/opt/uzi/backups`. It uses [nfrastack/db-backup 5.0.5](https://nfrastack.com/db-backup/container):
 
 ```sh
-docker compose ps
+cat > backup.yaml <<'EOF'
+services:
+  db-backup:
+    image: docker.io/nfrastack/db-backup:5.0.5
+    restart: unless-stopped
+    environment:
+      TIMEZONE: Etc/UTC
+      DB01_TYPE: postgres
+      DB01_HOST: db
+      DB01_USER: ${POSTGRES_USER:-uzi}
+      DB01_PASS: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      DB01_NAME: ${POSTGRES_DB:-uzi}
+      DB01_BACKUP_BEGIN: "+5"
+      DB01_BACKUP_INTERVAL: "1440"
+    volumes:
+      - /opt/uzi/backups:/backup
+    depends_on:
+      db:
+        condition: service_healthy
+EOF
+sudo install -d -m 0700 -o 10000 -g 10000 /opt/uzi/backups
 ```
 
-The API updates the database at each start. If a service fails, read its log with `docker compose logs api`. Never run `docker compose down -v`: it deletes the data.
-
-## Step 4 - Send HTTPS traffic to uzi
-
-Add this site to `/etc/caddy/Caddyfile`. You can keep the default `:80` block of a new Caddy install:
-
-```caddyfile
-your_domain {
-    reverse_proxy 127.0.0.1:8080
-}
-```
-
-Check the file, then reload Caddy:
+Tell Compose to read the three files together:
 
 ```sh
-sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
-sudo systemctl reload caddy
+printf 'COMPOSE_FILE=compose.yaml:caddy.yaml:backup.yaml\n' >> .env
 ```
 
-Open `https://your_domain` and sign in with the email and password of the first admin account. Right after the reload, the first visit can fail with a TLS error while Caddy gets its certificate. Wait a few seconds and try again.
+If you already run a reverse proxy on this VPS, see [Your own reverse proxy](#your-own-reverse-proxy) instead.
+
+## Step 4 - Start uzi
+
+Start the stack. Compose downloads the images, starts them and waits until they are healthy. The worker stays off until Step 6:
+
+```sh
+docker compose up -d --wait
+```
+
+Open `https://your_domain` and sign in with the email and password of the first admin account. The first visit can fail with a TLS error while Caddy gets its certificate. Wait a few seconds and try again.
+
+The API updates the database at each start. If a service fails, read its log, for example with `docker compose logs api`. Never run `docker compose down -v`: it deletes the data.
 
 ## Step 5 - Sign in from the shell
 
@@ -202,11 +233,14 @@ sed -i "s|^UZI_WORKER_TOKEN=.*|UZI_WORKER_TOKEN=$TOKEN|" .env
 unset TOKEN
 ```
 
-Start the worker:
+Turn on the worker profile, then start the worker with the same command as in Step 4:
 
 ```sh
-docker compose --profile agent up -d agent
+printf 'COMPOSE_PROFILES=agent\n' >> .env
+docker compose up -d
 ```
+
+The worker starts only now because it stops at once without a token. A single start for the whole stack needs [vtmocanu/uzi#3760](https://github.com/vtmocanu/uzi/issues/3760).
 
 Wait until the worker shows `online`. In our test this took about a minute:
 
@@ -253,15 +287,14 @@ Your worker can now take an issue from this repository.
 
 A backup needs two things together: a database dump and `.env`. A dump without the `UZI_SECRET_KEY` of its `.env` cannot give back the encrypted tokens.
 
-Write a dump of the database:
+The `db-backup` service of Step 3 writes a dump each day. Make a first dump now, and check that a file appears:
 
 ```sh
-docker compose exec -T db pg_dump -U uzi -Fc uzi > "uzi-$(date +%F).dump"
+docker compose exec db-backup backup-now
+sudo ls -l /opt/uzi/backups
 ```
 
-Copy the dump, `.env` and `compose.yaml` off the VPS with your backup routine. Test a restore away from the live database before you rely on it.
-
-For a backup on a timer, see [A backup container](#a-backup-container).
+Copy `/opt/uzi/backups`, `.env`, `compose.yaml`, `caddy.yaml` and `backup.yaml` off the VPS with your backup routine. Test a restore away from the live database before you rely on it: see the [restore recipe](https://nfrastack.com/db-backup/recipes/restore).
 
 ## Upgrades
 
@@ -271,9 +304,8 @@ For a backup on a timer, see [A backup container](#a-backup-container).
 4. Wait until the worker has no active run. Then pull and restart:
 
 ```sh
-docker compose --profile agent pull
-docker compose up -d
-docker compose --profile agent up -d agent
+docker compose pull
+docker compose up -d --wait
 ```
 
 Check that you can sign in and that the worker shows `online`. Keep the same folder and volumes. The worker keeps its tools in the `agentnix` volume, so a new image does not refresh them; see [Tool provisioning](./worker-setup.md#tool-provisioning) to refresh them. An older image may not run on a database that a newer API updated: read the release notes before you go back.
@@ -282,9 +314,23 @@ Check that you can sign in and that the worker shows `online`. Keep the same fol
 
 These cover the cases that the main path leaves out.
 
-**Port 8080 is in use.** In `compose.yaml`, change the one entry under `services.web.ports` to `"127.0.0.1:18080:8080"`. Then use port `18080` in your proxy.
+### Your own reverse proxy
 
-**nginx instead of Caddy.** Add these locations to the TLS `server` block of `your_domain`. The `/api/ws` location keeps the live updates open:
+If a proxy on the VPS already holds ports 80 and 443, skip `caddy.yaml` and send the traffic to `web` at `127.0.0.1:8080`. In Step 3, write only `backup.yaml`, and use this line instead:
+
+```sh
+printf 'COMPOSE_FILE=compose.yaml:backup.yaml\n' >> .env
+```
+
+**Caddy on the VPS.** Add this site to `/etc/caddy/Caddyfile`, then run `sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile` and `sudo systemctl reload caddy`:
+
+```caddyfile
+your_domain {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+**nginx.** Add these locations to the TLS `server` block of `your_domain`. The `/api/ws` location keeps the live updates open:
 
 ```nginx
 location = /api/ws {
@@ -310,6 +356,10 @@ Check with `sudo nginx -t`, then run `sudo systemctl reload nginx`.
 
 **The proxy runs in a container.** There, `127.0.0.1` is the proxy container, not the VPS. Connect the proxy to the `web` service on a Docker network instead. Keep `api` and `db` without a published port.
 
+**Port 8080 is in use.** In `compose.yaml`, change the one entry under `services.web.ports` to `"127.0.0.1:18080:8080"`. Then use port `18080` in your proxy.
+
+### More cases
+
 **All visitors share one sign-in limit.** With `TRUSTED_PROXIES` empty, the API counts sign-in attempts for all visitors together, so one noisy client can block the others for a minute. This is the safe setting. See [Auth design](./auth-design.md#rate-limiting-and-the-x-forwarded-for-trust-model) before you change it.
 
 **Create the first admin by sign-up instead of `.env`.** Leave the three `UZI_SEED_*` values empty and set `UZI_REGISTRATION_ENABLED=true`. The first account to sign up becomes admin, so keep the site closed to others until you sign up. Then set `UZI_REGISTRATION_ENABLED=false` and run `docker compose up -d --force-recreate api`.
@@ -320,41 +370,13 @@ Check with `sudo nginx -t`, then run `sudo systemctl reload nginx`.
 
 **A run stops for your decision after a failed check.** This can happen when a check fails for a reason outside the change. See [Completion holds](./run-completion-hold.md).
 
-### A backup container
-
-This optional service writes a daily database dump to `/opt/uzi/backups` on the VPS. It uses [nfrastack/db-backup 5.0.5](https://nfrastack.com/db-backup/container). Your backup routine must still copy the dumps off the VPS.
-
-Add it under the existing `services` key of `compose.yaml`, next to `db`:
-
-```yaml
-  db-backup:
-    image: docker.io/nfrastack/db-backup:5.0.5
-    restart: unless-stopped
-    environment:
-      TIMEZONE: Etc/UTC
-      DB01_TYPE: postgres
-      DB01_HOST: db
-      DB01_USER: ${POSTGRES_USER:-uzi}
-      DB01_PASS: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      DB01_NAME: ${POSTGRES_DB:-uzi}
-      DB01_BACKUP_BEGIN: "+5"
-      DB01_BACKUP_INTERVAL: "1440"
-    volumes:
-      - /opt/uzi/backups:/backup
-    depends_on:
-      db:
-        condition: service_healthy
-```
-
-Create the folder for its user `10000`, start the service, and make a first dump at once:
+**A dump by hand, with no backup container.** Leave `backup.yaml` out of `COMPOSE_FILE`, and dump the database from your own routine:
 
 ```sh
-sudo install -d -m 0700 -o 10000 -g 10000 /opt/uzi/backups
-docker compose up -d db-backup
-docker compose exec db-backup backup-now
+docker compose exec -T db pg_dump -U uzi -Fc uzi > "uzi-$(date +%F).dump"
 ```
 
-See the [backup](https://nfrastack.com/db-backup/recipes/backup) and [restore](https://nfrastack.com/db-backup/recipes/restore) recipes for the options.
+See the [backup recipes](https://nfrastack.com/db-backup/recipes/backup) for the options of the backup container.
 
 ## Reference
 
