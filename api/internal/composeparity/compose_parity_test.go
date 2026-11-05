@@ -31,7 +31,7 @@ func parseCompose(data []byte) (map[string]any, error) {
 }
 
 func readCompose(path string) (map[string]any, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: callers pass fixed repo paths or a t.TempDir path.
 	if err != nil {
 		return nil, err
 	}
@@ -79,8 +79,14 @@ func serverFromRoot(root map[string]any) map[string]any {
 	volumes := root["volumes"].(map[string]any)
 	delete(volumes, "dindsock")
 	delete(volumes, "dinddata")
+	// A server comes back after a reboot; the laptop stack stays down.
+	for _, service := range restartServices {
+		services[service].(map[string]any)["restart"] = "unless-stopped"
+	}
 	return root
 }
+
+var restartServices = []string{"db", "api", "web", "agent"}
 
 func parity(root, server map[string]any) error {
 	expected := serverFromRoot(root)
@@ -153,6 +159,11 @@ func invariants(doc map[string]any) error {
 			return fmt.Errorf("%v: got %#v, want %#v", check.path, got, check.want)
 		}
 	}
+	for _, service := range restartServices {
+		if got := at(doc, "services", service, "restart"); got != "unless-stopped" {
+			return fmt.Errorf("%s restart: got %#v, want \"unless-stopped\"", service, got)
+		}
+	}
 	for _, service := range []string{"api", "db"} {
 		config, ok := at(doc, "services", service).(map[string]any)
 		if !ok {
@@ -205,6 +216,7 @@ func TestParityControls(t *testing.T) {
 		"profile":              {[]string{"services", "agent"}, "profiles", nil, true},
 		"resource limit":       {[]string{"services", "agent"}, "mem_limit", nil, true},
 		"hardening":            {[]string{"services", "agent"}, "cap_drop", nil, true},
+		"missing restart":      {[]string{"services", "api"}, "restart", nil, true},
 	}
 	for name, change := range cases {
 		t.Run(name, func(t *testing.T) {
