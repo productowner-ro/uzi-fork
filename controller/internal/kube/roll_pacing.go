@@ -94,6 +94,13 @@ type rollEntry struct {
 	// historyRetireUnknown marks a candidate whose marker retirement write is unconfirmed;
 	// reconcileHibernation writes nothing for it this tick.
 	historyRetireUnknown bool
+	// storageObserved, podsObserved, replicaSetsPending and absenceOwners are absence facts read
+	// only by roll_duplicate_canary.go (see physicallyAbsent). They are deliberately
+	// broader than e.pods, e.claim and e.sets, which keep their narrower meaning.
+	storageObserved    int
+	podsObserved       int
+	replicaSetsPending int
+	absenceOwners      replicaSetOwners
 }
 type rollTick struct {
 	entries   map[string]*rollEntry
@@ -214,7 +221,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 			t.unplanned = append(t.unplanned, unplannedWorker{id: w.ID})
 			continue
 		}
-		spec, err := m.resolver.Resolve(w.Template, w.Size)
+		spec, err := m.resolveWorker(w)
 		if err != nil {
 			t.unplanned = append(t.unplanned, unplannedWorker{id: w.ID, ns: ns, nsKnown: true})
 			continue
@@ -772,6 +779,9 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			}
 		}
 		if !safe {
+			if m.cancelAbsentDuplicateCanary(ctx, t, pool, canaries) {
+				return
+			}
 			for _, e := range pool {
 				e.blocked = "duplicate canary reservations unresolved; explicit recovery required"
 				t.outcomes[e.w.ID].BlockingReason = pacingText(e.blocked)
@@ -1287,7 +1297,7 @@ func (m *Materializer) releasePressureHold(ctx context.Context, t *rollTick, e *
 		e.dep.Spec.Replicas == nil || *e.dep.Spec.Replicas != 1 {
 		return
 	}
-	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	spec, err := m.resolveWorker(w)
 	if err != nil || !e.o.HasNixPVC || e.o.NixPVCSize == nil || e.o.NixPVCSize.Cmp(spec.NixSize) < 0 ||
 		!e.o.HasDataPVC || !e.o.DataPVCLive || (w.Docker && (!e.o.HasDinDDataPVC || !e.o.DinDPVCLive)) {
 		return
@@ -1372,7 +1382,7 @@ func (m *Materializer) maintenanceDespiteBusy(ctx context.Context, w protocol.De
 	if e := rollFrom(ctx, w.ID); e != nil && (e.drift || (e.marker != nil && !e.marker.Completed) || (e.rawReservation && e.marker == nil)) {
 		return false
 	}
-	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	spec, err := m.resolveWorker(w)
 	if err != nil {
 		return false
 	}
@@ -1750,6 +1760,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 	if err != nil {
 		return err
 	}
+	absence := replicaSetOwners{}
 	owners := map[string]types.UID{}
 	for _, dep := range deps {
 		if dep.UID != "" && dep.DeletionTimestamp == nil {
@@ -1763,6 +1774,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 		}
 		for i := range page.Items {
 			rs := &page.Items[i]
+			absence.record(rs)
 			owner := metav1.GetControllerOf(rs)
 			if rs.UID == "" || rs.DeletionTimestamp != nil || owner == nil || owner.APIVersion != "apps/v1" || owner.Kind != "Deployment" ||
 				owner.UID == "" || owners[owner.Name] != owner.UID {
@@ -1784,12 +1796,14 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 	// during a Deployment recycle. No separate journal or new kube object is used.
 	claims := map[string]*corev1.PersistentVolumeClaim{}
 	rawReservations := map[string]bool{}
+	var storage []storageFact
 	err = maintenancePages(ctx, "roll retained claims", func(opt metav1.ListOptions) (int, string, error) {
 		page, err := m.client.CoreV1().PersistentVolumeClaims(ns).List(ctx, opt)
 		if err != nil {
 			return 0, "", err
 		}
 		for _, p := range page.Items {
+			storage = append(storage, storageFact{name: p.Name, workerID: p.Labels[LabelWorkerID]})
 			if id, ours := IsOurs(p.Labels); ours {
 				if _, present := p.Annotations[annotationRoll]; present {
 					rawReservations[id] = true
@@ -1864,7 +1878,13 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 			e.sets = sets[e.dep.UID]
 		}
 		e.volumeRefs = map[string]bool{}
+		e.absenceOwners = absence
+		e.replicaSetsPending = absence.pendingForWorker(e)
+		e.storageObserved = countStorageObserved(e.w.ID, storage)
 		for _, pod := range pods {
+			if podObservedForWorker(e, pod) {
+				e.podsObserved++
+			}
 			for _, volume := range pod.Spec.Volumes {
 				if volume.PersistentVolumeClaim != nil {
 					e.volumeRefs[volume.PersistentVolumeClaim.ClaimName] = true
