@@ -191,10 +191,10 @@ func (s *Service) ResolveCredentialOverrideOn(ctx context.Context, q *store.Quer
 	return validateCredentialOverrideOn(ctx, q, userID, kind, harness, mode, secretID)
 }
 
-// validateCredentialOverride is the pool-bound entry to the ONE validator every override
+// validateCredentialOverride is the pool-bound entry to the validator every Anthropic override
 // write runs through, validateCredentialOverrideOn (PRD #1247 M1) — at run create (which
 // calls validateCredentialOverrideOn directly on its transaction, issue #1626), run approve
-// --token, run set-token, and schedule create/edit (the handlers wire it in M2/M4/M6; M1 provides the function and its
+// --token, Claude run set-token, and schedule create/edit (the handlers wire it in M2/M4/M6; M1 provides the function and its
 // tests). It answers "may this run/schedule carry this override, and what columns does
 // it write?" and returns the resolved *CredentialOverride (nil = inherit ⇒ clear both
 // columns) or one of the typed refusals above.
@@ -232,6 +232,16 @@ func validateCredentialOverrideOn(ctx context.Context, q credentialSecretMetaRea
 	return validateCredentialOverrideCore(ctx, q, userID, kind, harness, mode, secretID, true)
 }
 
+// credentialOverrideLaneRefusal is the lane half of the validator, pure over the run kind: chat,
+// judge, self_improve and job runs follow their own ladders and are not switchable (D10).
+func credentialOverrideLaneRefusal(kind string) error {
+	switch kind {
+	case runkind.Chat, runkind.Judge, runkind.SelfImprove, runkind.Job:
+		return fmt.Errorf("%w: %s", ErrCredentialOverrideLaneNotSwitchable, kind)
+	}
+	return nil
+}
+
 // validateCredentialOverrideCore is the one validator. refuseProvider (create, schedule and
 // effective-settings callers) refuses every non-inherit override for an owner whose Claude source
 // is a model provider (PRD #4320 D8); the live-switch caller (SetRunCredential) passes false and
@@ -240,9 +250,8 @@ func validateCredentialOverrideOn(ctx context.Context, q credentialSecretMetaRea
 func validateCredentialOverrideCore(ctx context.Context, q credentialSecretMetaReader, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID, refuseProvider bool) (*CredentialOverride, error) {
 	// D10: chat, judge and self_improve follow their own ladders and are not switchable; a job
 	// (PRD #1908 D-E) resolves its credential as its owner via the worker-binding ladder, never a pin.
-	switch kind {
-	case runkind.Chat, runkind.Judge, runkind.SelfImprove, runkind.Job:
-		return nil, fmt.Errorf("%w: %s", ErrCredentialOverrideLaneNotSwitchable, kind)
+	if err := credentialOverrideLaneRefusal(kind); err != nil {
+		return nil, err
 	}
 	// D9: a Codex run/schedule cannot carry an Anthropic-only override; the switch keeps
 	// the harness and no cross-harness resume exists (a later PRD lifts this).

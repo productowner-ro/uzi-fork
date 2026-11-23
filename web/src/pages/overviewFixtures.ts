@@ -1,9 +1,8 @@
-// Shared fixtures for the Overview page tests (Dashboard.overviewData.test.tsx and
-// OverviewNext.test.tsx). Mirrors the wire shapes Dashboard.test.tsx builds locally.
+// Shared fixtures for the Overview tests (OverviewNext.test.tsx, useOverviewData.test.tsx).
 
 import { vi } from "vitest";
 import type { useAuth } from "../auth/AuthContext";
-import type { RunListItem, Worker } from "../lib/api";
+import type { RunListItem, RunSummaryItem, Worker } from "../lib/api";
 
 export const aUser = {
   id: "u1",
@@ -26,7 +25,14 @@ export const aUser = {
   last_login: null,
 };
 
-export function aRun(over: Partial<RunListItem> = {}): RunListItem {
+// PRD #4123: overrides may come from a summary row, whose weekly_limit is the compact
+// projection; the Overview reads only the summary fields, so the fixture accepts either shape.
+type RunOverrides = Omit<Partial<RunListItem>, "weekly_limit"> & {
+  weekly_limit?: RunListItem["weekly_limit"] | RunSummaryItem["weekly_limit"];
+};
+
+export function aRun(over: RunOverrides = {}): RunListItem {
+  const { weekly_limit: weeklyLimit, ...rest } = over;
   return {
     harness_decision: null,
     id: "run-1",
@@ -96,7 +102,9 @@ export function aRun(over: Partial<RunListItem> = {}): RunListItem {
     // PRD #98 M4: unjudged by default, so existing assertions are unchanged.
     judge_verdict: null,
     judge_todo_count: 0,
-    ...over,
+    ...rest,
+    // Cast only this one field: the compact shape stands in for the detail block in Overview tests.
+    ...(weeklyLimit ? { weekly_limit: weeklyLimit as RunListItem["weekly_limit"] } : {}),
   };
 }
 

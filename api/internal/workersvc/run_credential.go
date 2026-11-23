@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -13,7 +13,6 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
-	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -175,11 +174,15 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	// (migration 00226), so a persisted run always carries its authoritative harness — frozen
 	// by the D11 resolver inside the create transaction (createRunAtomic) — and needs no
 	// users.default_harness fallback here (the old pre-transaction createRunEffectiveHarness
-	// guesser is gone; see service.go and runs_lifecycle.go). An empty value is defended as
-	// claude, the safe direction (only a codex harness is refused, D9).
+	// guesser is gone; see service.go and runs_lifecycle.go). An empty value keeps the
+	// existing Claude default. Codex uses the active-only switch path below.
 	harness := run.Harness
 	if harness == "" {
 		harness = harnessClaude
+	}
+
+	if harness == harnessCodex {
+		return s.requestCodexCredentialSwitch(ctx, run, mode, secretID)
 	}
 
 	// The ONE validator (D5/D9/D10): lane (409) → harness (422) → mode (404/400). It never
@@ -189,8 +192,8 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	// frozen provider key), whatever the mode, and no switch of a vendor run to `default` while the
 	// owner's Claude source is a provider. Checked before the status dispatch, so nothing is written.
 	// This covers `uzi run set-token` and `uzi approve --token`, which is a client-side SetRunCredential.
-	if providerBoundRun(run) {
-		return SetRunCredentialResult{}, ErrCredentialOverrideProviderSource
+	if rerr := anthropicBoundRefusal(run); rerr != nil {
+		return SetRunCredentialResult{}, rerr
 	}
 	resolved, err := s.validateRunSwitchOverride(ctx, userID, run.Kind, harness, mode, secretID)
 	if err != nil {
@@ -203,16 +206,13 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	}
 
 	// issue #3194: a base-attestation hold never runs again, so no token switch can resume it.
-	if IsBaseAttestationHeld(run) {
-		return SetRunCredentialResult{}, ErrBaseAttestationHeld
+	// PRD #3989 M3 rides the same step: a credentials_reset hold is released only by the promoter, so
+	// ResumePausedRun would refuse it after the override was already written; refuse up front.
+	if rerr := anthropicHoldRefusal(run); rerr != nil {
+		return SetRunCredentialResult{}, rerr
 	}
 	switch run.Status {
 	case "paused":
-		if run.HoldReason.Valid && run.HoldReason.String == holdCredentialsReset {
-			// PRD #3989 M3: only the promoter releases this hold, so ResumePausedRun would refuse
-			// it after the override was already written. Refuse up front, writing nothing.
-			return SetRunCredentialResult{}, ErrCredentialsResetHeld
-		}
 		if run.HoldReason.Valid && run.HoldReason.String == "credential_disabled" {
 			// PRD #1732 D2/D14: the reassignment writes the override and leaves the hold in
 			// the promoter's lock order, so it and a concurrent promotion serialize: exactly
@@ -238,10 +238,12 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		// new hold path: a resume that wins the race is reclaimed and may be held again before this
 		// pre-check's answer is used. The override is the owner's own choice and is spent at the
 		// next reclaim. A hold that settles or whose fence lifts resumes below.
-		if settling, serr := s.runHoldSettling(ctx, runID); serr != nil {
+		settling, serr := s.runHoldSettling(ctx, runID)
+		if serr != nil {
 			return SetRunCredentialResult{}, fmt.Errorf("set run credential: read hold fence: %w", serr)
-		} else if settling {
-			return SetRunCredentialResult{}, ErrRunHoldSettling
+		}
+		if rerr := anthropicStatusRefusal(run, store.Worker{}, switchFacts{Settling: settling}); rerr != nil {
+			return SetRunCredentialResult{}, rerr
 		}
 		// Any other paused run (an owner pause, a completion or wall hold, or the provider
 		// hold): write the override FIRST (idempotent, harmless if the resume then finds 0
@@ -284,8 +286,8 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		// the resolved token), so those states keep the write above. The validator cannot catch this
 		// (it receives only run.Kind='task'), so the guard lives here where review_target_run_id is
 		// visible.
-		if run.ReviewTargetRunID.Valid {
-			return SetRunCredentialResult{}, fmt.Errorf("%w: held-state review (review_target_run_id set)", ErrCredentialOverrideLaneNotSwitchable)
+		if rerr := heldReviewRefusal(run); rerr != nil {
+			return SetRunCredentialResult{}, rerr
 		}
 		// PRD #1247 M5 (D4/D14): the held-state switch. Stamp the switch (override + request)
 		// iff the holding worker advertises the capability; otherwise refuse 409 with nothing
@@ -293,11 +295,10 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		if serr := s.stampHeldStateSwitch(ctx, run, userID, runID, resolved); serr != nil {
 			return SetRunCredentialResult{}, serr
 		}
-	case "claimed":
-		return SetRunCredentialResult{}, ErrCredentialSwitchClaimAssembling
 	default:
-		// completed / failed / cancelled, and any status not otherwise handled.
-		return SetRunCredentialResult{}, ErrCredentialSwitchRunTerminal
+		// claimed (ErrCredentialSwitchClaimAssembling), and completed / failed / cancelled and any
+		// status not otherwise handled (ErrCredentialSwitchRunTerminal): both always refuse.
+		return SetRunCredentialResult{}, anthropicStatusRefusal(run, store.Worker{}, switchFacts{})
 	}
 
 	// D6 warnings (best-effort): computed from the PRE-transition run row —
@@ -338,17 +339,17 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 // single-query fence turns into ErrCredentialSwitchRaced (409) with nothing written.
 func (s *Service) stampHeldStateSwitch(ctx context.Context, run store.Run, userID, runID uuid.UUID, resolved *CredentialOverride) error {
 	if !run.WorkerID.Valid {
-		return ErrCredentialSwitchNoLiveWorker
+		return heldWorkerRefusal(run, store.Worker{})
 	}
 	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrCredentialSwitchNoLiveWorker
+			return heldWorkerRefusal(run, store.Worker{})
 		}
 		return fmt.Errorf("set run credential: load holding worker: %w", err)
 	}
-	if !slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
-		return &CredentialSwitchWorkerUnsupportedError{WorkerID: wkr.ID, WorkerName: wkr.Name}
+	if rerr := heldWorkerRefusal(run, wkr); rerr != nil {
+		return rerr
 	}
 	// One atomic, fenced write (BLOCKING-1 rework): the override columns AND the switch stamp
 	// together, guarded by the held status + worker_id + claim_generation + claim_released_at IS
@@ -410,25 +411,13 @@ func (s *Service) setCredentialAndPromote(ctx context.Context, observed store.Ru
 		// one of the owner's three ways out of that hold, and PromoteRecoveryWaitRunNow admits it. For this
 		// cause the promote also stamps claim_released_at (as ResumeAnthropicSpendLimitHold does), fencing the
 		// old claim so a delayed old-generation failed report cannot overwrite the owner's decision.
-		if locked.Status == "recovery_wait" && locked.RecoveryWaitCause.String == recoveryCauseDataVolumeFull && !locked.RecoveryRetryNotBefore.Valid {
-			return ErrDataVolumeFullHeld
-		}
-		if locked.Status == "recovery_wait" && locked.RecoveryWaitCause.Valid && locked.RecoveryWaitCause.String == "forge_unreachable" && !locked.RecoveryRetryNotBefore.Valid {
-			return ErrForgeUnreachableHeld
-		}
-		if locked.Status == "recovery_wait" && locked.RecoveryWaitCause.String == recoveryCauseCodexIdleStall && locked.RecoveryWaitCause.Valid && !locked.RecoveryRetryNotBefore.Valid {
-			return ErrCodexIdleStallHeld
-		}
-		if locked.Status != observed.Status || locked.ClaimGeneration != observed.ClaimGeneration ||
-			locked.StatusSince.Valid != observed.StatusSince.Valid || !locked.StatusSince.Time.Equal(observed.StatusSince.Time) {
-			return ErrCredentialSwitchRaced
-		}
-		// Deliberately AFTER the observed-row comparison: a run that moved since it was read is a
-		// race (retry), while a row that is still the observed one and owner-held is a specific
-		// refusal. It precedes the override write so nothing is written. A change of cause alone,
-		// leaving status_since, is not detected as a move and so lands here as owner-held.
-		if label, held := recoveryWaitOwnerHold(locked); held {
-			return &RunOwnerHeldError{Label: label}
+		// The three per-cause retry-stamp sentinels, then the observed-row race, then the owner
+		// hold, in that order (see lockedParkRefusal). The owner hold is deliberately AFTER the
+		// race: a run that moved since it was read is a race (retry), while a row that is still
+		// the observed one and owner-held is a specific refusal. All of it precedes the override
+		// write so nothing is written.
+		if rerr := lockedParkRefusal(locked, observed); rerr != nil {
+			return rerr
 		}
 		if _, err := q.SetRunCredentialOverride(ctx, store.SetRunCredentialOverrideParams{
 			Mode:     pgOverrideMode(resolved),
@@ -590,4 +579,101 @@ func (s *Service) credentialSwitchWarning(ctx context.Context, run store.Run, re
 	default:
 		return ""
 	}
+}
+
+// ErrCodexSwitchIneligible refuses queued and parked Codex switching.
+var ErrCodexSwitchIneligible = errors.New("codex credentials can be switched only on an active, worker-held run")
+
+// requestCodexCredentialSwitch writes only a pending target. The live binding
+// remains authoritative until a separately negotiated apply commits.
+func (s *Service) requestCodexCredentialSwitch(ctx context.Context, observed store.Run, mode string, secretID *uuid.UUID) (SetRunCredentialResult, error) {
+	if rerr := codexSwitchRefusal(observed, store.Worker{}, switchFacts{Stage: switchStageObserved}); rerr != nil {
+		return SetRunCredentialResult{}, rerr
+	}
+	if mode != BindModePinned || secretID == nil || *secretID == uuid.Nil {
+		return SetRunCredentialResult{}, ErrCredentialOverridePinnedNeedsSecret
+	}
+	if !observed.WorkerID.Valid || s.txBeginner == nil {
+		return SetRunCredentialResult{}, ErrCredentialSwitchNoLiveWorker
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	defer cancel()
+	child, run, tx, err := s.beginClaimMutation(ctx, store.Worker{ID: uuid.UUID(observed.WorkerID.Bytes)}, observed.ID, &observed.ClaimGeneration)
+	if err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	defer func() {
+		cleanup, done := context.WithTimeout(context.WithoutCancel(ctx), 250*time.Millisecond)
+		defer done()
+		_ = tx.Rollback(cleanup)
+	}()
+	q := store.New(tx)
+	w, err := q.GetWorkerByID(ctx, uuid.UUID(observed.WorkerID.Bytes))
+	if err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	if rerr := codexSwitchRefusal(run, w, switchFacts{Stage: switchStageLocked, Observed: &observed, StaleCutoff: s.staleWorkerCutoff().Time}); rerr != nil {
+		return SetRunCredentialResult{}, rerr
+	}
+	// Lock enablement and alias before writing the stamp. No provider call or
+	// reconcile is permitted in this owner request.
+	disabled, err := q.LockSecretEnablementForShareNowait(ctx, store.LockSecretEnablementForShareNowaitParams{ID: *secretID, UserID: run.UserID})
+	if err != nil {
+		return SetRunCredentialResult{}, ErrCredentialOverrideSecretNotFound
+	}
+	meta, err := q.GetUserSecretMetaByID(ctx, store.GetUserSecretMetaByIDParams{ID: *secretID, UserID: run.UserID})
+	if err != nil {
+		return SetRunCredentialResult{}, ErrCredentialOverrideSecretNotFound
+	}
+	alias, err := q.LockCodexAliasForShareNowait(ctx, store.LockCodexAliasForShareNowaitParams{UserSecretID: *secretID, UserID: run.UserID})
+	if err != nil || disabled || !codexSwitchTargetUsable(meta.Kind, alias.Status, alias.ProviderAccountID.Valid) {
+		return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+	}
+	authMode := codexAuthModeAPIKey
+	var accountKey pgtype.Text
+	var accountRevision pgtype.Int8
+	if alias.ProviderAccountID.Valid {
+		authMode = codexAuthModeSubscription
+		accountID := uuid.UUID(alias.ProviderAccountID.Bytes)
+		if _, err := q.LockCodexAccountForUpdateNowait(ctx, store.LockCodexAccountForUpdateNowaitParams{ID: accountID, UserID: run.UserID}); err != nil {
+			return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+		}
+		acct, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{ID: accountID, UserID: run.UserID})
+		if err != nil {
+			return SetRunCredentialResult{}, err
+		}
+		key, err := codexAccountKey(acct.ProviderUserID, acct.WorkspaceAccountID)
+		if err != nil {
+			return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+		}
+		accountKey = pgtype.Text{String: key, Valid: true}
+		accountRevision = pgtype.Int8{Int64: acct.CredentialRevision, Valid: true}
+	}
+	n, err := q.StampHeldCodexCredentialSwitch(ctx, store.StampHeldCodexCredentialSwitchParams{
+		ID: run.ID, UserID: run.UserID, WorkerID: run.WorkerID, Generation: pgtype.Int8{Int64: run.ClaimGeneration, Valid: true},
+	})
+	if err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	if n != 1 {
+		return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+	}
+	n, err = q.SetPendingCodexSwitchTarget(ctx, store.SetPendingCodexSwitchTargetParams{
+		AuthMode: authMode, MaterialRevision: alias.MaterialRevision, AccountKey: accountKey, AccountRevision: accountRevision,
+		ID: run.ID, UserID: run.UserID, SecretID: pgtype.UUID{Bytes: *secretID, Valid: true}, Generation: pgtype.Int8{Int64: run.ClaimGeneration, Valid: true},
+	})
+	if err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	if n != 1 {
+		return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+	}
+	updated, err := child.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: run.ID, UserID: run.UserID})
+	if err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	return SetRunCredentialResult{Run: updated}, nil
 }

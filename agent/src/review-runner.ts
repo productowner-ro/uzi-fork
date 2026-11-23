@@ -1,4 +1,4 @@
-import { acquireCodexOperationScope } from "./codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "./codex-operation-scope.js";
 // The ReviewRunner (PRD #400 M4b): the WORKER-side executor for a handoff `--review`
 // run. A review run is a `task`-kind claim carrying a non-null `review_target_run_id`
 // (the reviewed target task run's id). Structurally it mirrors JudgeRunner — a slim
@@ -18,6 +18,8 @@ import type { WorkerClient } from "./client.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { GitCache } from "./git.js";
 import type { Logger } from "./log.js";
+import { makeTextRedactor, providerKeyForms } from "./redact.js";
+import { redactStrings } from "./publication-intent.js";
 import type { AdviceUsageSnapshot } from "./harness.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn } from "./sdk-messages.js";
@@ -35,6 +37,7 @@ import { selectCodexBinding } from "./codex/select.js"; // PRD #1429 M3: the pur
 import type { CodexBinding } from "./codex/select.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import { CODEX_TASK_REVIEW_MODEL } from "./codex/task-review-model.js"; // PRD #1551 M2: leaf value import (no runtime dep on the heavy codex-executor)
+import { isHarnessEffort, type HarnessEffort } from "./harness.js";
 import { errMessage } from "./util.js";
 import type { ClaimProviderBinding, ClaimResponse, TaskReviewFinding, TaskReviewRequest } from "./protocol.js";
 
@@ -44,6 +47,14 @@ import type { ClaimProviderBinding, ClaimResponse, TaskReviewFinding, TaskReview
 // the SDK query AND hard-reject the race, so runModel always settles within the budget
 // and review() falls back to a `failed` review.
 const REVIEW_MODEL_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** An error-derived review summary, capped at 500 chars. The claim's provider key is redacted from
+ *  the error text BEFORE the cap, so a key straddling the cut cannot leave a readable prefix. */
+function boundedClaimError(claim: ClaimResponse, prefix: string, err: unknown): string {
+  const credential = claim.secrets?.provider?.credential;
+  const message = credential ? makeTextRedactor(providerKeyForms(credential))(errMessage(err)) : errMessage(err);
+  return `${prefix}${message}`.slice(0, 500);
+}
 
 // The prompt char budget for the diff. The git layer already caps the diff at 512 KiB
 // (REVIEW_DIFF_MAX_BYTES); this is a second, char-domain clamp so a diff of mostly
@@ -142,15 +153,15 @@ export class ReviewRunner {
    *  worker's claim loop keeps going. */
   async execute(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
     const scope = claim.secrets.codex?.auth_mode === "subscription"
-      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log) : undefined;
+      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     scope?.own();
     // PRD #4320: a provider-bound review's gateway key is scrubbed from this worker's log for the claim.
-    const providerKey = claim.secrets?.provider?.credential;
-    if (providerKey) this.log.addSecret(providerKey);
+    const providerKeys = claim.secrets?.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];
+    for (const k of providerKeys) this.log.addSecret(k);
     try { await this.executeClaim(claim, signal); }
     finally {
       scope?.close();
-      if (providerKey) this.log.removeSecret(providerKey);
+      for (const k of providerKeys) this.log.removeSecret(k);
     }
   }
 
@@ -196,7 +207,7 @@ export class ReviewRunner {
         if (registration === undefined || operation.kind !== "advice") return undefined;
         const token = this.activeRuns?.setAccountCooldown(reviewRunId, claim.claim_generation ?? 0, operation, registration);
         return token === undefined ? undefined : () => this.activeRuns?.clearAccountCooldown(reviewRunId, claim.claim_generation ?? 0, token);
-      }, ["advice"], this.log) : undefined;
+      }, ["advice"], this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     // Compute the review. Any failure BEFORE the post falls back to a `failed` review so
     // the reviewed run still receives a (report-only) result rather than nothing.
     let review: TaskReviewRequest;
@@ -278,7 +289,7 @@ export class ReviewRunner {
         run_id: reviewRunId,
         error: errMessage(err),
       });
-      review = { status: "failed", summary: `Review could not be produced: ${errMessage(err)}`.slice(0, 500), findings: [] };
+      review = { status: "failed", summary: boundedClaimError(claim, "Review could not be produced: ", err), findings: [] };
     }
 
     try {
@@ -325,7 +336,13 @@ export class ReviewRunner {
         }
       }
       try {
-        await this.client.postTaskReview(targetId, review, claim.claim_generation, reviewRunId);
+        // The review's summary and findings are model- or error-authored; scrub the claim's provider
+        // key (every encoded form) here, at the one sink, whichever path produced them.
+        const providerCredential = claim.secrets?.provider?.credential;
+        const scrubbed = providerCredential
+          ? redactStrings(review, makeTextRedactor(providerKeyForms(providerCredential)))
+          : review;
+        await this.client.postTaskReview(targetId, scrubbed, claim.claim_generation, reviewRunId);
       } catch (err) {
         // Issue #1423: the server fence refused the write because this flight's claim was
         // superseded (reclaimed at a newer generation), released, reassigned, or its review run
@@ -382,14 +399,14 @@ export class ReviewRunner {
   ): Promise<TaskReviewRequest> {
     try {
       const prompt = buildReviewPrompt(diff);
-      const text = await this.runModel(token, prompt, onUsage, provider);
+      const text = await this.runModel(token, prompt, onUsage, provider, configuredReviewModel(claim), configuredReviewEffort(claim));
       return parseTaskReview(text);
     } catch (err) {
       this.log.warn("review model call failed; posting failed review", {
         run_id: claim.run_id,
         error: errMessage(err),
       });
-      return fallbackTaskReview(`The reviewer model call did not complete: ${errMessage(err)}`.slice(0, 500));
+      return fallbackTaskReview(boundedClaimError(claim, "The reviewer model call did not complete: ", err));
     }
   }
 
@@ -411,11 +428,14 @@ export class ReviewRunner {
       const text = await runReadOnlyModelPass({
         systemPrompt: REVIEW_SYSTEM_PROMPT,
         prompt,
-        // PRD #1551 (M2, D5): Codex task review runs on the built-in review model, NOT the
-        // claim's default_model (which assembly does not even read for a review run). It is
-        // selected here in the advice request's `model`, flows to AdviceRequest.model, and is
-        // a curated contract model the advice renderer accepts.
-        model: CODEX_TASK_REVIEW_MODEL,
+        // PRD #1551 (M2, D5) / PRD #1570: Codex task review runs on the owner-configured
+        // review model (`claim.task_review_model`) when the claim carries one, else the
+        // built-in review model; never the claim's default_model. Selected here in the
+        // advice request's `model`, which flows to AdviceRequest.model.
+        model: configuredReviewModel(claim) ?? CODEX_TASK_REVIEW_MODEL,
+        // PRD #1570 M2: the server-resolved review effort (inheritance already folded in);
+        // omitted when the claim carries none or an unknown value.
+        ...configuredReviewEffortOpt(claim),
         homeRoot: this.homeRoot,
         homePrefix: "uzi-review-",
         label: "review",
@@ -433,13 +453,18 @@ export class ReviewRunner {
         run_id: claim.run_id,
         error: errMessage(err),
       });
-      return fallbackTaskReview(`The reviewer model call did not complete: ${errMessage(err)}`.slice(0, 500));
+      return fallbackTaskReview(boundedClaimError(claim, "The reviewer model call did not complete: ", err));
     }
   }
 
-  private async runModel(token: string, prompt: string, onUsage: (snapshot: AdviceUsageSnapshot) => void, provider?: ClaimProviderBinding): Promise<string> {
+  private async runModel(
+    token: string, prompt: string, onUsage: (snapshot: AdviceUsageSnapshot) => void,
+    provider?: ClaimProviderBinding, model?: string, effort?: HarnessEffort,
+  ): Promise<string> {
     return runReadOnlyModelPass({
       token,
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
       ...(provider ? { provider } : {}),
       systemPrompt: REVIEW_SYSTEM_PROMPT,
       prompt,
@@ -454,6 +479,26 @@ export class ReviewRunner {
     });
   }
 
+}
+
+/** PRD #1570: the owner-configured review model on the claim, or undefined when absent or
+ *  blank (the harness built-in applies). Never reads default_model / default_effort. */
+function configuredReviewModel(claim: ClaimResponse): string | undefined {
+  const m = (claim.task_review_model ?? "").trim();
+  return m === "" ? undefined : m;
+}
+
+/** PRD #1570 M2: the server-resolved review effort on the claim, or undefined when absent or
+ *  not one of the closed effort levels (send none). Never reads config.default_effort: the
+ *  server already folded worker-effort inheritance into `task_review_effort`. */
+function configuredReviewEffort(claim: ClaimResponse): HarnessEffort | undefined {
+  const e = claim.task_review_effort;
+  return isHarnessEffort(e) ? e : undefined;
+}
+
+function configuredReviewEffortOpt(claim: ClaimResponse): { effort?: HarnessEffort } {
+  const effort = configuredReviewEffort(claim);
+  return effort ? { effort } : {};
 }
 
 /** Build the reviewer's user prompt: the git diff, fenced as UNTRUSTED DATA under a

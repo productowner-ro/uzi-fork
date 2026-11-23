@@ -1526,7 +1526,7 @@ it("B throwing pack stream waits for controlled child exit", async () => {
     Object.assign(f.git, { checkpointPack: async () => ({ tipOid: H, pack, exited }) });
     let settled = false, cancelled = 0;
     Object.assign(f.git, { checkpointPack: async () => ({ tipOid: H, pack, exited, cancel: () => { cancelled++; } }) });
-    const preparing = prepareFrozenHeld({ git: f.git as unknown as HeldGit,
+    const preparing = prepareFrozenHeld({ literals: [], git: f.git as unknown as HeldGit,
       barePath: f.context.barePath, branch: f.record.branch, sourceSha: H,
       policy: f.record.heldPolicy!, deadlineMs: 1000 });
     const checked = assert.rejects(preparing, /stream failed/).then(() => { settled = true; });
@@ -5895,6 +5895,7 @@ async function issue3561RunnerCase(route: "terminal settlement" | "retained capt
     Object.assign(f.client, { hasHeldPublicationV2: () => false });
     Object.assign(f.git, {
       retainCurrentOwedCandidate: async () => ({ kind: "updated", candidateSha: H, retainedShas: [] }),
+      refusalReleaseGate: async () => ({ kind: "none" }),
       withRecoveryOperation: async (_signal: AbortSignal, _deadline: number, action: (signal: AbortSignal) => Promise<unknown>, inherited?: MaintenanceBudget) =>
         inherited ? MaintenanceBudget.run(inherited, () => action(inherited.signal)) : action(signal),
       reserveRecoveryIteration: async () => ({ attempts: 1, deadline: Date.now() + 60_000, backoffMs: 0, claimGeneration: 7 }),
@@ -6419,6 +6420,311 @@ for (const reason of ["budget", "abort"] as const) {
     } finally { budget.dispose(); await q.f.close(); }
   });
 }
+
+// ── #4609: characterization of the live inventory reconstruction queue ──────────────────────────
+// Drives the real resumeLive -> livePass -> snapshotOwedInventory / inventoryPriorityContexts /
+// materializeBootInventory path with a stub clock. Every number asserted below is the CURRENT
+// behaviour measured on the base, not a statement of desired behaviour. Diagnostics are counted by
+// wrapping the instance's noteInventoryDiagnostic, because the log line is deduplicated.
+type Issue4609Pass = {
+  n: number;
+  batch: string[]; // the selected opportunities, in selection order
+  priority: string[]; // run ids of the contexts the hint marked priority
+  holdCalls: string[]; // every listRecoveryHolds call, in order
+  ownershipCalls: string[]; // every getRunOwnership call, in order
+  inactiveCalls: string[]; // every inactiveInventory call, in order
+  reads: { skip: number; hint: number; materialize: number; other: number }; // newReconstructionRecords by phase
+  discoveries: number;
+  diagnostics: Array<{ run: string; reason: string }>;
+  produced: number; // captures produced during this pass
+  uploads: number;
+};
+
+async function issue4609Queue(opts: { retained: number; priority?: number; cap?: number; cloneHeads?: string[] }) {
+  const cap = opts.cap ?? 4;
+  const f = await fixture(true);
+  const seed = opts.priority ? await issue3561Invalidated(f) : undefined;
+  const retainedRows: Issue3614Row[] = Array.from({ length: opts.retained }, (_, i) => ({ context: { ...f.context, runId: `ret4609-${String(i).padStart(3, "0")}` } }));
+  const priorityRows: Issue3614Row[] = [];
+  for (let i = 0; i < (opts.priority ?? 0); i++) {
+    const context = { ...f.context, runId: `11111111-1111-4111-8111-${String(i + 1).padStart(12, "0")}` };
+    await fs.mkdir(path.join(f.root, "journal", context.runId));
+    const record = await issue3561Sibling(f, seed!, { runId: context.runId, coverageContext: context,
+      originalRoots: seed!.originalRoots!.map(root => ({ ...root, contexts: root.contexts.map(ctx => ({ ...ctx, runId: context.runId })) })) });
+    priorityRows.push({ context, record });
+  }
+  const rows: Issue3614Row[] = [...retainedRows, ...priorityRows];
+  const holdRuns = new Set<string>(); // runs whose open inventory-guarded hold is visible without a frozen record
+  const holds = f.client.listRecoveryHolds.bind(f.client);
+  let pass!: Issue4609Pass;
+  let phase: "skip" | "hint" | "materialize" | "other" = "other";
+  let completed = 0;
+  Object.assign(f.client, { listRecoveryHolds: async (run: string) => {
+    pass?.holdCalls.push(run);
+    const served = holdRuns.has(run) || rows.some(r => r.record && r.context.runId === run);
+    return { ...await holds(run), holds: served ? (await holds(run)).holds : [] };
+  } });
+  const ownership = f.client.getRunOwnership.bind(f.client);
+  Object.assign(f.client, { getRunOwnership: async (run: string) => { pass?.ownershipCalls.push(run); return ownership(); } });
+  const mappedCandidates = (runId: string) => structuredClone(f.state.candidates).map(root => ({ ...root,
+    contexts: root.contexts.map(ctx => ({ ...ctx, runId })) }));
+  Object.assign(f.git, {
+    enumerateOwedCandidates: async (_bare: string, run: string) => mappedCandidates(run),
+    discoverOwedCandidates: async () => { pass.discoveries++; return rows.map(r => ({ context: r.context, candidates: mappedCandidates(r.context.runId) })); },
+  });
+  f.state.cloneHeads = opts.cloneHeads ?? [H2];
+  let coordinatorExecuting = (_run: string) => false, passExecuting = (_run: string) => false;
+  const c = f.make(true, () => true, undefined, undefined, { ...buildRecoveryLiveTiming("stub", f.log, { UZI_E2E_RECOVERY_FAST_REDRIVE: "1" }),
+    liveMaxPerPass: cap, isExecuting: run => coordinatorExecuting(run) });
+  const any = c as any;
+  const wrap = (name: string, around: (inner: (...a: any[]) => Promise<any>, args: any[]) => Promise<any>) => {
+    const inner = any[name].bind(any);
+    any[name] = (...args: any[]) => around(inner, args);
+  };
+  wrap("snapshotOwedInventory", async (inner, args) => { phase = "skip"; try { return await inner(...args); } finally { phase = "other"; } });
+  wrap("inventoryPriorityContexts", async (inner, args) => {
+    phase = "hint";
+    try {
+      const result: ReadonlySet<string> = await inner(...args);
+      pass.priority = [...result].map(key => (JSON.parse(key) as { runId: string }).runId);
+      return result;
+    } finally { phase = "other"; }
+  });
+  wrap("materializeBootInventory", async (inner, args) => {
+    phase = "materialize";
+    try { return await inner(...args); }
+    finally {
+      phase = "other";
+      const queue = any.bootOwed as Array<{ context: PositiveOwedCandidateContext }>;
+      pass.batch = queue.slice(-Math.min(cap, queue.length)).map(e => e.context.runId);
+    }
+  });
+  wrap("newReconstructionRecords", (inner, args) => { pass.reads[phase]++; return inner(...args); });
+  wrap("inactiveInventory", (inner, args) => { pass.inactiveCalls.push(args[0].runId); return inner(...args); });
+  wrap("noteInventoryDiagnostic", async (inner, args) => { pass.diagnostics.push({ run: args[0].runId, reason: args[1] }); return inner(...args); });
+  wrap("livePass", async (inner, args) => { try { return await inner(...args); } finally { completed++; } });
+  const visit = async (): Promise<Issue4609Pass> => {
+    const before = { completed, produced: f.state.produced, uploads: f.state.uploads };
+    pass = { n: before.completed + 1, batch: [], priority: [], holdCalls: [], ownershipCalls: [], inactiveCalls: [],
+      reads: { skip: 0, hint: 0, materialize: 0, other: 0 }, discoveries: 0, diagnostics: [], produced: 0, uploads: 0 };
+    f.state.now += 5000;
+    await c.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: run => passExecuting(run) });
+    assert.equal(completed, before.completed + 1, "each visit completes exactly one live pass");
+    pass.produced = f.state.produced - before.produced;
+    pass.uploads = f.state.uploads - before.uploads;
+    const ids = (any.bootOwed as Array<{ context: PositiveOwedCandidateContext }>).map(e => canonicalJson(e.context));
+    assert.deepEqual([...ids].sort(), rows.map(r => canonicalJson(r.context)).sort(), "every owed context stays queued exactly once after every pass");
+    return pass;
+  };
+  const retained = retainedRows.map(r => r.context.runId);
+  const addRow = (runId: string, hold: boolean) => {
+    rows.push({ context: { ...f.context, runId } });
+    if (hold) holdRuns.add(runId);
+  };
+  return { f, c, rows, retained, priorityRows, visit, addRow, holdRuns,
+    executing: (which: "coordinator" | "pass", predicate: (run: string) => boolean) => {
+      if (which === "coordinator") coordinatorExecuting = predicate; else passExecuting = predicate;
+    } };
+}
+
+const issue4609Reasons = (p: Issue4609Pass, run?: string) =>
+  p.diagnostics.filter(d => run === undefined || d.run === run).map(d => d.reason);
+const issue4609Count = (p: Issue4609Pass, reason: string) => p.diagnostics.filter(d => d.reason === reason).length;
+
+it("#4609 first reconstruction waits behind retained no-hold contexts and is selected on pass 5", async () => {
+  const q = await issue4609Queue({ retained: 12, cloneHeads: [] });
+  try {
+    const ret = (a: number, b: number) => q.retained.slice(a, b);
+    const target = "target4609";
+    const passes: Issue4609Pass[] = [await q.visit()];
+    // Pass 1: only the retained no-hold contexts exist. Hint reads every distinct run once; cap 4 materialize.
+    assert.deepEqual(passes[0]!.batch, ret(0, 4));
+    assert.deepEqual(passes[0]!.reads, { skip: 0, hint: 12, materialize: 4, other: 0 });
+    assert.equal(passes[0]!.discoveries, 1);
+    assert.deepEqual(passes[0]!.holdCalls, ret(0, 4));
+    q.addRow(target, true); // newly owed: open inventory-guarded hold, no frozen record
+    for (let i = 0; i < 3; i++) passes.push(await q.visit());
+    assert.deepEqual(passes.slice(1).map(p => p.batch), [ret(4, 8), ret(8, 12), ret(0, 4)]);
+    for (const p of passes) {
+      assert.deepEqual(p.priority, [], "a context without a frozen replaceable sibling never qualifies for the reserved slot");
+      assert.deepEqual(issue4609Reasons(p), ["hold_unavailable", "hold_unavailable", "hold_unavailable", "hold_unavailable"]);
+      assert.equal(new Set(p.holdCalls).size, 4);
+      assert.equal(p.holdCalls.length, 4);
+      assert.ok(!p.batch.includes(target), `target is not selected on pass ${p.n}`);
+      assert.equal(p.produced, 0);
+    }
+    for (const p of passes.slice(1)) assert.deepEqual(p.reads, { skip: 0, hint: 13, materialize: 4, other: 0 }, `pass ${p.n} reads`);
+    const spent = passes.reduce((n, p) => n + issue4609Count(p, "hold_unavailable"), 0);
+    assert.equal(spent, 16, "hold_unavailable opportunities spent before the target's first selection");
+    const fifth = await q.visit();
+    passes.push(fifth);
+    assert.equal(fifth.n, 5);
+    assert.deepEqual(fifth.batch, [target, ...ret(4, 7)], "fresh arrivals queue behind retained survivors");
+    assert.deepEqual(fifth.priority, []);
+    // Proof used: a PRODUCED CAPTURE. On its selection pass the target passes the hold check, reaches
+    // ownership and inactiveInventory, is frozen (snapshot_created) and captured/uploaded in that pass.
+    assert.deepEqual(fifth.reads, { skip: 0, hint: 13, materialize: 6, other: 0 });
+    assert.equal(issue4609Count(fifth, "hold_unavailable"), 3);
+    assert.deepEqual(issue4609Reasons(fifth, target), ["snapshot_created"]);
+    assert.equal(fifth.holdCalls.length, 14);
+    assert.equal(new Set(fifth.holdCalls).size, 4);
+    assert.equal(fifth.holdCalls.filter(r => r === target).length, 11);
+    assert.equal(fifth.ownershipCalls.length, 10);
+    assert.ok(fifth.ownershipCalls.every(r => r === target));
+    assert.equal(fifth.inactiveCalls.length, 6);
+    assert.ok(fifth.inactiveCalls.every(r => r === target));
+    assert.equal(fifth.produced, 1);
+    assert.equal(fifth.uploads, 1);
+    assert.equal(passes.findIndex(p => p.batch.includes(target)) + 1, 5);
+  } finally { await q.f.close(); }
+});
+
+it("#4609 an invalidated replaceable target takes the reserved slot on pass 1 while cap-1 slots stay FIFO", async () => {
+  const q = await issue4609Queue({ retained: 12, priority: 1 });
+  try {
+    const target = q.priorityRows[0]!.context.runId;
+    const ret = (a: number, b: number) => q.retained.slice(a, b);
+    const passes: Issue4609Pass[] = [];
+    for (let i = 0; i < 5; i++) passes.push(await q.visit());
+    assert.deepEqual(passes.map(p => p.batch), [
+      [target, ...ret(0, 3)], [target, ...ret(3, 6)], [target, ...ret(6, 9)], [target, ...ret(9, 12)], [target, ...ret(0, 3)],
+    ]);
+    for (const p of passes) {
+      assert.deepEqual(p.priority, [target]);
+      assert.deepEqual(p.reads, { skip: 0, hint: 13, materialize: 6, other: 0 }, `pass ${p.n} reads`);
+      assert.equal(p.produced, 0, "no new capture while ancestry stays unproven");
+      assert.equal(p.uploads, 0);
+      assert.equal(p.holdCalls.length, 5);
+      assert.equal(new Set(p.holdCalls).size, 4);
+      assert.equal(p.ownershipCalls.length, 4);
+      assert.ok(p.ownershipCalls.every(r => r === target), "priority target is past the hold check on every pass");
+      assert.equal(p.inactiveCalls.length, 3);
+      assert.deepEqual(issue4609Reasons(p, target), ["invalidated_snapshot_reused"]);
+      assert.equal(issue4609Count(p, "hold_unavailable"), 3);
+    }
+  } finally { await q.f.close(); }
+});
+
+it("#4609 FIFO visits every retained context within ceil(N/cap) passes, ceil(N/(cap-1)) with a priority target", async () => {
+  for (const withPriority of [false, true]) {
+    const q = await issue4609Queue({ retained: 12, priority: withPriority ? 1 : 0 });
+    try {
+      const bound = withPriority ? Math.ceil(12 / 3) : Math.ceil(12 / 4);
+      const firstSeen = new Map<string, number>();
+      const visits = new Map<string, number>();
+      for (let n = 1; n <= bound; n++) {
+        const p = await q.visit();
+        for (const run of p.batch) { if (!firstSeen.has(run)) firstSeen.set(run, n); visits.set(run, (visits.get(run) ?? 0) + 1); }
+        assert.equal(issue4609Count(p, "hold_unavailable"), p.batch.filter(r => q.retained.includes(r)).length);
+      }
+      assert.deepEqual(q.retained.filter(r => !firstSeen.has(r)), [], "every retained context is visited within the bound");
+      assert.deepEqual(q.retained.map(r => visits.get(r)), q.retained.map(() => 1), "each retained context is visited exactly once in the bound");
+      assert.equal(bound, withPriority ? 4 : 3);
+    } finally { await q.f.close(); }
+  }
+});
+
+it("#4609 a late context stays queued while its hold is unavailable and passes the hold check one rotation after it appears", async () => {
+  const q = await issue4609Queue({ retained: 12, cloneHeads: [] });
+  try {
+    const late = "late4609";
+    q.addRow(late, false); // last in discovery order, hold not yet visible
+    const passes: Issue4609Pass[] = [];
+    for (let i = 0; i < 7; i++) passes.push(await q.visit());
+    const ret = (a: number, b: number) => q.retained.slice(a, b);
+    assert.deepEqual(passes.map(p => p.batch), [
+      ret(0, 4), ret(4, 8), ret(8, 12), [late, ...ret(0, 3)], ret(3, 7), ret(7, 11), [ret(11, 12)[0]!, late, ...ret(0, 2)],
+    ]);
+    const lateSelections = passes.filter(p => p.batch.includes(late)).map(p => p.n);
+    assert.deepEqual(lateSelections, [4, 7], "late context is selected once per full rotation of 13 contexts at cap 4");
+    for (const n of lateSelections) {
+      const p = passes[n - 1]!;
+      assert.deepEqual(issue4609Reasons(p, late), ["hold_unavailable"]);
+      assert.ok(p.holdCalls.includes(late), "each selection re-lists holds; no cross-pass negative cache");
+      assert.ok(!p.ownershipCalls.includes(late));
+    }
+    q.holdRuns.add(late); // the hold appears after pass 7
+    const next: Issue4609Pass[] = [];
+    for (let i = 0; i < 4; i++) next.push(await q.visit());
+    const selected = next.filter(p => p.batch.includes(late));
+    assert.equal(selected.length, 1, "exactly one selection within one rotation after the hold appears");
+    const p = selected[0]!;
+    assert.equal(p.n, 10);
+    assert.ok(p.holdCalls.includes(late));
+    assert.ok(p.ownershipCalls.includes(late) && p.inactiveCalls.includes(late), "late context passes the hold check and reaches inactiveInventory");
+    assert.deepEqual(issue4609Reasons(p, late), ["snapshot_created"]);
+    assert.deepEqual(p.reads, { skip: 0, hint: 13, materialize: 6, other: 0 });
+    assert.equal(p.holdCalls.length, 14);
+    assert.equal(new Set(p.holdCalls).size, 4);
+    assert.equal(p.ownershipCalls.length, 10);
+    assert.equal(p.inactiveCalls.length, 6);
+    assert.equal(p.produced, 1);
+    assert.equal(p.uploads, 1);
+    for (const earlier of passes) assert.deepEqual(earlier.reads, { skip: 0, hint: 13, materialize: 4, other: 0 });
+  } finally { await q.f.close(); }
+});
+
+for (const where of ["coordinator", "pass"] as const) {
+  it(`#4609 a ${where}-executing target spends its slot, rotates, and is reselected once inactive`, async () => {
+    const q = await issue4609Queue({ retained: 8, cloneHeads: [] });
+    try {
+      const target = "exec4609";
+      q.rows.unshift({ context: { ...q.f.context, runId: target } });
+      q.holdRuns.add(target);
+      q.executing(where, run => run === target);
+      const ret = (a: number, b: number) => q.retained.slice(a, b);
+      const p1 = await q.visit();
+      assert.deepEqual(p1.batch, [target, ...ret(0, 3)]);
+      assert.equal(issue4609Reasons(p1, target)[0], "executing");
+      assert.deepEqual(issue4609Reasons(p1, target), ["executing"], "slot spent on the executing diagnostic alone");
+      assert.ok(!p1.holdCalls.includes(target), "the executing gate precedes every hold RPC");
+      assert.deepEqual(p1.reads, { skip: 0, hint: 9, materialize: 3, other: 0 }, "executing short-circuits before the provenance read");
+      assert.equal(p1.holdCalls.length, 3);
+      const p2 = await q.visit();
+      assert.deepEqual(p2.batch, ret(3, 7));
+      assert.ok(!p2.batch.includes(target), "the executing entry rotated behind its siblings");
+      q.executing(where, () => false); // becomes inactive
+      const p3 = await q.visit();
+      assert.deepEqual(p3.batch, [ret(7, 8)[0], target, ret(0, 1)[0], ret(1, 2)[0]]);
+      assert.ok(!issue4609Reasons(p3, target).includes("executing"), "the reselected target passes the executing gate");
+      assert.ok(p3.holdCalls.includes(target) && p3.ownershipCalls.includes(target) && p3.inactiveCalls.includes(target));
+      assert.deepEqual(issue4609Reasons(p3, target), ["snapshot_created"]);
+      assert.deepEqual(p3.reads, { skip: 0, hint: 9, materialize: 6, other: 0 });
+      assert.equal(p3.holdCalls.length, 14);
+      assert.equal(p3.ownershipCalls.length, 10);
+      assert.equal(p3.inactiveCalls.length, 6);
+      assert.equal(p3.produced, 1);
+      assert.equal(p3.uploads, 1);
+    } finally { await q.f.close(); }
+  });
+}
+
+// inventory_not_inactive: a running run makes inactiveInventory refuse; the entry rotates and is
+// reselected once the run is no longer running.
+it("#4609 a running target reports inventory_not_inactive, rotates, and passes inactiveInventory once failed", async () => {
+  const q = await issue4609Queue({ retained: 8, cloneHeads: [] });
+  try {
+    const target = "running4609";
+    q.rows.unshift({ context: { ...q.f.context, runId: target } });
+    q.holdRuns.add(target);
+    q.f.state.status = "running";
+    const ret = (a: number, b: number) => q.retained.slice(a, b);
+    const p1 = await q.visit();
+    assert.deepEqual(p1.batch, [target, ...ret(0, 3)]);
+    assert.deepEqual(issue4609Reasons(p1, target), ["inventory_not_inactive"]);
+    assert.deepEqual(p1.reads, { skip: 0, hint: 9, materialize: 4, other: 0 });
+    assert.equal(p1.ownershipCalls.length, 2);
+    assert.equal(p1.inactiveCalls.length, 1);
+    const p2 = await q.visit();
+    assert.deepEqual(p2.batch, ret(3, 7));
+    q.f.state.status = "failed";
+    const p3 = await q.visit();
+    assert.deepEqual(p3.batch, [ret(7, 8)[0], target, ret(0, 1)[0], ret(1, 2)[0]]);
+    assert.deepEqual(issue4609Reasons(p3, target), ["snapshot_created"]);
+    assert.equal(p3.inactiveCalls.length, 6);
+    assert.equal(p3.produced, 1);
+  } finally { await q.f.close(); }
+});
 
 // ── #3727 C2 M3: release a thin archive FINAL on a pinned prerequisite closure ───────────────────
 const CLOSURE_FEATURE_NAME = "recovery_prerequisite_closure_v1";
@@ -8177,4 +8483,209 @@ it("#4140 C5 a validated 200 create_refused read back by the probe clears uncert
   assert.equal(emu.createsReachingMarker(), 0);
   assert.equal(f.finals.length, 1);
   assert.equal(heldKind(f.finals[0]), "archive");
+});
+
+// issue #4481 review: the seal awaits git I/O, so a residue latch that lands during it must stop the POST.
+for (const lane of ["archive", "held_publication"] as const) {
+  it(`#4481 a residue latch landing during the refusal seal sends no ${lane} FINAL`, async () => {
+    const { latchResidueQuarantine, resetResidueQuarantineForTests } = await import("../src/residue-quarantine.js");
+    try {
+      if (lane === "archive") {
+        const { f, before } = await pendingReceiptFixture();
+        try {
+          Object.assign(f.git, {
+            refusalReleaseGate: async () => ({ kind: "none" }),
+            sealRefusalRelease: async () => {
+              latchResidueQuarantine({ cause: "fixture", site: "cleanup" }, nullLogger());
+              return "sealed";
+            },
+          });
+          const finals = f.finals.length;
+          await f.make().resumePending(undefined, [before]);
+          assert.equal(f.finals.length, finals, "no release POST once the worker is latched");
+          resetResidueQuarantineForTests();
+          const after = (await f.coordinator.inspect("run-1"))[0]!;
+          assert.equal(after.finalAcknowledged, undefined);
+          assert.deepEqual(after.finalRequest, before.finalRequest);
+        } finally { await f.close(); }
+      } else {
+        const { f, record, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+        try {
+          closureRestrictions(f, record.sourceSha);
+          const publication = "00000000-0000-4000-8000-000000000009";
+          f.state.finalError = new Error("save held request");
+          await f.coordinator.releaseHeldPublication(record, publication);
+          f.state.finalError = undefined;
+          assert.equal((await saved()).finalRequest?.disposition.kind, "held_publication");
+          Object.assign(f.git, {
+            refusalReleaseGate: async () => ({ kind: "none" }),
+            sealRefusalRelease: async () => {
+              latchResidueQuarantine({ cause: "fixture", site: "cleanup" }, nullLogger());
+              return "sealed";
+            },
+          });
+          const finals = f.finals.length;
+          assert.equal(await f.coordinator.releaseHeldPublication(record, publication), "kept");
+          assert.equal(f.finals.length, finals, "no held release POST once the worker is latched");
+          assert.equal((await saved()).finalAcknowledged, undefined);
+        } finally { await f.close(); }
+      }
+    } finally { resetResidueQuarantineForTests(); }
+  });
+}
+
+// issue #4481 review: an exact already-accepted saved FINAL is recovered before the (ineligible) refusal gate.
+const INELIGIBLE_GATE = { refusalReleaseGate: async () => ({ kind: "ineligible", reason: "refusal history incomplete" }) };
+const HOLD_ID = "00000000-0000-4000-8000-000000000007";
+const REPO_ID = "00000000-0000-4000-8000-000000000008";
+
+it("#4481 an accepted saved archive FINAL is acknowledged without a POST while the refusal gate is ineligible", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  try {
+    Object.assign(f.git, INELIGIBLE_GATE);
+    f.committedReceipts.set(before.generation!, Object.freeze(structuredClone(before.finalRequest!.disposition)));
+    const reconcile = f.client.reconcileRecoveryCapture!;
+    let reconciles = 0;
+    f.client.reconcileRecoveryCapture = async (...args) => { reconciles++; return reconcile(...args); };
+    const finals = f.finals.length;
+    await f.make().resumePending(undefined, [before]);
+    assert.equal(reconciles, 1);
+    assert.equal(f.finals.length, finals, "nothing is POSTed");
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, true);
+  } finally { await f.close(); }
+});
+
+for (const answer of ["different receipt", "retained", "replaceable"] as const) {
+  it(`#4481 a ${answer} reconcile answer under an ineligible gate keeps the record untouched and POSTs nothing`, async () => {
+    const { f, before } = await pendingReceiptFixture();
+    try {
+      Object.assign(f.git, INELIGIBLE_GATE);
+      let reconciles = 0;
+      f.client.reconcileRecoveryCapture = async (run, id, request) => {
+        reconciles++;
+        const base = { run_id: run, capture_id: id, generation: request.generation };
+        if (answer === "retained") return { ...base, outcome: "retained", reason: "capture_failure_requires_attention" };
+        if (answer === "replaceable") return { ...base, outcome: "replaceable" };
+        return { ...base, outcome: "accepted", final_receipt: { ...before.finalRequest!.disposition, source_sha: H2 } } as never;
+      };
+      const finals = f.finals.length;
+      await f.make().resumePending(undefined, [before]);
+      assert.equal(reconciles, 1, "the accepted-only recovery asked once");
+      assert.equal(f.finals.length, finals);
+      assert.deepEqual((await f.coordinator.inspect("run-1"))[0], before, "no reason, hold reopen or rewrite");
+    } finally { await f.close(); }
+  });
+}
+
+it("#4481 without a saved FINAL an ineligible gate stays gated and asks nothing", async () => {
+  const { f, before } = await pendingReceiptFixture(false);
+  try {
+    assert.equal(before.finalRequest, undefined);
+    Object.assign(f.git, INELIGIBLE_GATE);
+    let reconciles = 0;
+    const reconcile = f.client.reconcileRecoveryCapture!;
+    f.client.reconcileRecoveryCapture = async (...args) => { reconciles++; return reconcile(...args); };
+    const finals = f.finals.length;
+    await f.make().resumePending(undefined, [before]);
+    assert.equal(reconciles, 0);
+    assert.equal(f.finals.length, finals);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+  } finally { await f.close(); }
+});
+
+for (const kind of ["held_publication", "settled"] as const) {
+  for (const observed of ["exact receipt", "different receipt", "open"] as const) {
+    it(`#4481 a saved ${kind} FINAL with ${observed} observed hold under an ineligible gate`, async () => {
+      const { f, before } = await pendingReceiptFixture();
+      try {
+        const disposition = kind === "held_publication"
+          ? { kind, publication_id: "00000000-0000-4000-8000-000000000009", source_sha: before.sourceSha, coverage_digest: before.coverageDigest! }
+          : { kind, coverage_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" };
+        const evidence = kind === "settled" ? "publication" : undefined;
+        await patchAuthenticated(f, before, { finalRequest: { disposition, ...(evidence ? { evidence } : {}) } as never,
+          exactHoldBinding: { holdId: HOLD_ID, repoId: REPO_ID },
+          ...(kind === "settled" ? { originalRoots: [], coverageDigest: disposition.coverage_digest } : {}) });
+        const record = (await f.coordinator.inspect("run-1"))[0]!;
+        Object.assign(f.git, INELIGIBLE_GATE);
+        Object.assign(f.client, {
+          getExactRecoveryHold: async () => ({
+            run_id: "run-1", hold_id: HOLD_ID, repo_id: REPO_ID, generation: 7,
+            state: observed === "open" ? "open" : "released",
+            original_worker_id: "original", original_worker_identity: "original", inventory_guarded: true,
+            run_status: "failed", current_claim_generation: 7, claim_released: true,
+            ...(observed === "open" ? { live_worker_id: "original", live_run_id: "run-1" } : {
+              release_evidence: evidence ?? "archive",
+              final_receipt: observed === "exact receipt" ? structuredClone(disposition) : { ...disposition, coverage_digest: "e".repeat(64) },
+            }),
+          }),
+        });
+        const finals = f.finals.length;
+        await f.make().resumePending(undefined, [record]);
+        assert.equal(f.finals.length, finals, "nothing is POSTed");
+        const after = (await f.coordinator.inspect("run-1"))[0]!;
+        assert.equal(after.finalAcknowledged, observed === "exact receipt" ? true : undefined);
+        assert.deepEqual(after.finalRequest, record.finalRequest);
+      } finally { await f.close(); }
+    });
+  }
+}
+
+// issue #4481 m3 review: the settled/held lane of the accepted-FINAL recovery drives recoverAcceptedFinalBeforeGate directly,
+// because every other way of reaching it is stopped upstream (settledRefusesWork / finalHoldAllowsReplay) before the lane.
+async function settledLaneFixture(receiptDigest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") {
+  const { f, before } = await pendingReceiptFixture();
+  const disposition = { kind: "settled" as const, coverage_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" };
+  const settlement = {
+    run_id: "run-1", hold_id: HOLD_ID, repo_id: REPO_ID, generation: 7, state: "released",
+    original_worker_id: "original", original_worker_identity: "original", inventory_guarded: true,
+    run_status: "failed", current_claim_generation: 7, claim_released: true,
+    release_evidence: "publication", final_receipt: { ...disposition, coverage_digest: receiptDigest },
+  };
+  // The record already carries the observed settlement (heldOperationState returns "settled" for it without a receipt check).
+  await patchAuthenticated(f, before, { finalRequest: { disposition, evidence: "publication" } as never,
+    exactHoldBinding: { holdId: HOLD_ID, repoId: REPO_ID }, holdSettlement: settlement as never,
+    originalRoots: [], coverageDigest: disposition.coverage_digest });
+  const record = (await f.coordinator.inspect("run-1"))[0]!;
+  Object.assign(f.git, INELIGIBLE_GATE);
+  const rec = f.make();
+  const lane = (prove: () => Promise<boolean>) =>
+    (Reflect.get(rec, "recoverAcceptedFinalBeforeGate") as (r: RecoveryRecord, p: () => Promise<boolean>) => Promise<unknown>).call(rec, record, prove);
+  return { f, rec, lane };
+}
+
+it("#4481 settled lane control: the exact settled receipt and a proven-inactive run are acknowledged without a POST", async () => {
+  const { f, lane } = await settledLaneFixture();
+  try {
+    const finals = f.finals.length;
+    assert.equal(await lane(async () => true), "acked");
+    assert.equal(f.finals.length, finals);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, true);
+  } finally { await f.close(); }
+});
+
+it("#4481 settled lane: a settlement carrying a different receipt than the saved FINAL is not acknowledged", async () => {
+  const { f, lane } = await settledLaneFixture("e".repeat(64));
+  try {
+    const finals = f.finals.length;
+    assert.equal(await lane(async () => true), undefined);
+    assert.equal(f.finals.length, finals);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+  } finally { await f.close(); }
+});
+
+it("#4481 settled lane: an unproven source is not acknowledged", async () => {
+  const { f, lane } = await settledLaneFixture();
+  try {
+    assert.equal(await lane(async () => false), undefined);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+  } finally { await f.close(); }
+});
+
+it("#4481 settled lane: an active run is not acknowledged", async () => {
+  const { f, rec, lane } = await settledLaneFixture();
+  try {
+    Reflect.set(rec, "inactiveInventory", async () => false);
+    assert.equal(await lane(async () => true), undefined);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+  } finally { await f.close(); }
 });

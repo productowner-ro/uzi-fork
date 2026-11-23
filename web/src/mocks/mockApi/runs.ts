@@ -42,7 +42,7 @@ import { foreignCooldownRun } from "../runProgress";
 import { getRun, nextRunId, patchRun, state } from "../store";
 import { delay, mockScenario, requireSession } from "./shared";
 import { LEAD_NAME_RE, templates } from "./agents";
-import { appSettings, mockVaultRateFields } from "./settings";
+import { appSettings, mockVaultRateFields, mockWeeklyWarningMarginPts } from "./settings";
 import { visibleCodexAccounts, visibleTokenMeters } from "./secrets";
 
 // Fixed at module load so refreshing usage does not reset the demo's elapsed clock.
@@ -70,7 +70,7 @@ function listRunsFor(): Run[] {
 
 // ── Custody recovery mock (PRD #1349 M6) ──────────────────────────────────────
 // The `?mock=custody` scenario seeds a full spread of owner custody holds — every
-// server-derived attention across several workers — so the board alert and the Workers
+// server-derived attention across several workers — so the Held work card and the Workers
 // resolution surface can be seen and driven offline. Any other scenario reports zero open
 // holds, so the alert self-hides and the existing demos stay clean.
 //
@@ -356,9 +356,20 @@ function toSummary(item: RunListItem): RunSummaryItem {
     repo_agents: _repoAgents,
     issue_description: _issueDescription,
     preserved_patch: _preservedPatch,
+    weekly_limit: weeklyLimit,
     ...summary
   } = item;
-  return summary;
+  // PRD #4123: the summary row carries only the compact weekly-limit projection.
+  return weeklyLimit
+    ? {
+        ...summary,
+        weekly_limit: {
+          tier: weeklyLimit.tier,
+          credential_key: weeklyLimit.credential_key,
+          credential_label: weeklyLimit.credential_label,
+        },
+      }
+    : summary;
 }
 
 // PRD #4040: the server sets `pending_question` only on the caller's own awaiting_input rows
@@ -381,6 +392,21 @@ function withCrossCheckActive(item: RunListItem): RunListItem {
       ? overviewNextCrossCheckActive[item.id]
       : null;
   return { ...item, cross_check_active: active };
+}
+
+// PRD #4123 module 6: margin 0 turns the early (near/at) weekly-limit blocks off, the way the
+// server's weeklylimit loader does; a run parked on its weekly limit (a seven_day limit_wait or
+// a weekly-reserve pause) keeps its park explanation whatever the margin.
+function withWeeklyMargin<T extends { status: string; rate_limit_type?: string | null; hold_reason?: string | null; weekly_limit?: unknown }>(
+  item: T,
+): T {
+  if (item.weekly_limit === undefined || mockWeeklyWarningMarginPts() > 0) return item;
+  const parked =
+    (item.status === "limit_wait" && item.rate_limit_type === "seven_day") ||
+    (item.status === "paused" && item.hold_reason === "weekly_reserve");
+  if (parked) return item;
+  const { weekly_limit: _dropped, ...rest } = item;
+  return rest as T;
 }
 
 // Overload order mirrors realApi.listRuns: summary first, legacy LAST.
@@ -413,7 +439,7 @@ function mockListRuns(params?: {
     .filter((r) => !(r.id in mockOtherRunOwners))
     .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
     .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
-    .map((r) => withCrossCheckActive(withPendingQuestion(runListItem(harnessOverlay(r)))));
+    .map((r) => withWeeklyMargin(withCrossCheckActive(withPendingQuestion(runListItem(harnessOverlay(r))))));
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }
 
@@ -737,8 +763,9 @@ export const runsApi = {
       run_count: 23,
       // PRD #1293 failed-run outcomes. Internally consistent: finished === completed +
       // cancelled + plan_rejected + base_diverged + failed, and sum(fail_origins) === failed. finished is a
-      // different population from run_count (D2) — infra failures spend no tokens, so it sits
-      // a little above the 23 primary work runs with usage. Mirrors the u-vlad row below ("you").
+      // different population from run_count (D2): finished counts every non-chat run kind
+      // (including reworks and CI fixes) and infra failures spend no tokens, so it need not
+      // track the 23 primary work runs with usage. Mirrors the u-vlad row below ("you").
       // needs_landing (issue #1418) is the sub-cut of failed whose committed work is
       // human-landable (here the workflow-scope + push-secret failures); needs_landing <= failed.
       outcomes: {
@@ -898,7 +925,7 @@ export const runsApi = {
     // (a no-op for the default/unknown scenario, and for a run switched this session).
     // PRD #1429 M4a: layered with the harness overlay, so a "codex-only" run also
     // reads harness=codex on the detail page.
-    const decorated = { ...harnessOverlay(credentialOverlay(id in mockOtherRunOwners ? foreignCooldownRun(run) : run)) };
+    const decorated = withWeeklyMargin({ ...harnessOverlay(credentialOverlay(id in mockOtherRunOwners ? foreignCooldownRun(run) : run)) });
     if (id in mockOtherRunOwners) {
       delete decorated.account_cooldown_class;
       delete decorated.account_cooldown_eligible_at;
@@ -1371,7 +1398,7 @@ export const runsApi = {
         : [];
     return delay({ publications }, 80);
   },
-  // PRD #1349 M6 (D7/D8): the owner-wide custody hold listing + aggregate the board alert and
+  // PRD #1349 M6 (D7/D8): the owner-wide custody hold listing + aggregate the Held work card and
   // the Workers resolution surface read. Rich under ?mock=custody; empty otherwise so the
   // alert self-hides and the other demos stay clean.
   getRecoveryHolds: async () => delay(custodyResponse(), 80),

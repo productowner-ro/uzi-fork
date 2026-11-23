@@ -329,6 +329,7 @@ audited_prd_refs = %w[
   agent/templates/jvm/Dockerfile.dockerignore
   agent/test/chat-executor.test.ts
   agent/test/codex-pins.ts
+  agent/test/credential-switch-validation.md
   agent/test/executor.test.ts
   agent/test/fixtures/repoagents/.claude/agents/researcher.md
   agent/test/git-read-bare.test.ts
@@ -338,6 +339,7 @@ audited_prd_refs = %w[
   agent/test/provider-context-window.integration.test.ts
   agent/test/runner-completion-attempt.test.ts
   agent/test/runner-plan-gate.test.ts
+  agent/test/runner-provider-completion-redaction.test.ts
   agent/test/runner-semantic-drift.test.ts
   agent/test/sdk-executor.test.ts
   agent/test/secret-finding-render.test.ts
@@ -364,6 +366,7 @@ audited_prd_refs = %w[
   api/internal/handler/semantic_drift_livedb_test.go
   api/internal/handler/sweep_uzi_gate_livedb_test.go
   api/internal/poller/autopilot_test.go
+  api/internal/poller/linked_comments_livedb_test.go
   api/internal/poller/linked_repo_livedb_test.go
   api/internal/poller/poller.go
   api/internal/poller/recorded_calls_livedb_test.go

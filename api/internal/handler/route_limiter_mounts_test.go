@@ -405,6 +405,7 @@ var wantRouteMounts = []routeMount{
 	// call, no token spend) in the admin read group → noLimiter, like /rate-limits beside it.
 	{"GET", "/api/admin/codex-rate-limits", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
+	{"GET", "/api/admin/run-writers", noLimiter},
 	{"GET", "/api/admin/agent-source", noLimiter},
 	// PRD #836 M3: the admin Updates-card data source — a cache-backed read, no forge
 	// call → noLimiter, like the agent-source GET beside it.
@@ -944,6 +945,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// issue #3194: the base-attestation HOLD report, fenced server-side like the wall park above.
 	{"POST", "/api/worker/runs/{id}/base-attestation-hold", noLimiter},
+	{"POST", "/api/worker/runs/{id}/phase-switch-hold", noLimiter},
 	{"POST", "/api/worker/runs/{id}/repo-agent-source-hold", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
@@ -1009,6 +1011,7 @@ var wantRouteMounts = []routeMount{
 	// Issue #4201: the in-place credential switch apply rides proposalLimiter.PerWorkerMiddleware
 	// (per-WORKER), which this per-USER probe reads as noLimiter.
 	{"POST", "/api/worker/runs/{id}/credential-switch/apply", noLimiter},
+	{"POST", "/api/worker/runs/{id}/credential-switch/codex/preflight", noLimiter},
 	// Bounded local lifecycle report, no forge/provider I/O; both actual router
 	// chains are also pinned by TestPolicyHoldRouteHasNoRateLimiter.
 	{"POST", "/api/worker/runs/{id}/policy-hold", noLimiter},
@@ -1100,6 +1103,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #3522: the weekly usage reserve (SetUsageReserve). One owner-scoped UPDATE of two
 	// columns, no spend, no forge write, no fan-out: the same shape as /me/notify-early-reset.
 	{"PUT", "/api/me/usage-reserve", noLimiter},
+	// PRD #4123 M2: the weekly-limit warning margin (SetWeeklyWarningMargin). One owner-scoped UPDATE
+	// of one column: the same shape as /me/usage-reserve.
+	{"PUT", "/api/me/weekly-warning-margin", noLimiter},
 	{"PUT", "/api/me/codex-account-mode", noLimiter},
 	{"PUT", "/api/me/harness-overflow", noLimiter},
 	// PRD #3264: the model and effort defaults (PutMyModelSettings). One bounded body, one transaction
@@ -1140,6 +1146,9 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
 	// PRD #4173 M4: the repo link reads the issue tracker (token, projects, tags).
 	{"PUT", "/api/repos/{id}/issue-tracker-link", limForge},
+	// PRD #4173 M5: the State mapping reads the issue tracker's States on both verbs.
+	{"GET", "/api/repos/{id}/issue-tracker-link/states", limForge},
+	{"PUT", "/api/repos/{id}/issue-tracker-link/states", limForge},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
 	{"PUT", "/api/repos/{id}/env/{name}", noLimiter},
 	// PRD #35 Decision 7, the per-run toggle. noLimiter for the same reason as

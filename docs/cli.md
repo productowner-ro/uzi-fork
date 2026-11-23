@@ -230,7 +230,7 @@ uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
 uzi admin users | workers | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
-uzi admin runs [--all [--user <uuid>] [--since <rfc3339>]] [--json]
+uzi admin runs [--all [--user <uuid|email>] [--since <rfc3339>] [--status <s[,s]>]] [--json]
 uzi admin usage [--window lifetime|last_7_days]
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
@@ -245,8 +245,8 @@ uzi settings set <setting> [--harness claude|codex] <value>
 uzi settings reset <setting> [--harness claude|codex]
 uzi agent-template list
 uzi agent-template show <name|id>
-uzi agent-template set <name|id> --harness claude|codex <model>
-uzi agent-template reset <name|id> --harness claude|codex
+uzi agent-template set <name|id> --harness claude|codex [<model>] [--effort <level>]
+uzi agent-template reset <name|id> --harness claude|codex [--effort]
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -271,8 +271,8 @@ A few worth knowing:
   window (default `lifetime`).** The factory summary and per-user rows use
   the same window. `RUNS` counts primary work runs (issue, task, prompt, job,
   self_improve) with recorded usage. Finished, failed and the failure rate
-  count terminal primary work runs, including runs without usage; failure rate
-  is failed runs divided by finished runs. Tokens and API-equivalent cost also
+  count every terminal run except chat (helper runs included), including runs
+  without usage; failure rate is failed runs divided by finished runs. Tokens and API-equivalent cost also
   include helper runs (judge, cross_check, mr_rework, ci_fix); chat is
   excluded. Cost shows `$0.00` for metered zero and discloses runs without a
   cost estimate and unreported runs. Incomplete totals include recorded partial
@@ -291,8 +291,9 @@ A few worth knowing:
   in both windows, showing minutes, hours or days since the last failed run.
   A scope with lifetime finished runs but no failures shows `no failures`;
   one with no lifetime finished runs shows `-`. These are the same definitions
-  as Overview: chat, judge, rejected plans and `base_diverged` required-base
-  rejections do not count as failures. Required-base rejections remain in the
+  as Overview: chat, rejected plans and `base_diverged` required-base
+  rejections do not count as failures; failed helper runs (judge,
+  cross_check, mr_rework, ci_fix) do. Required-base rejections remain in the
   finished-run denominator and have a separate numeric `base_diverged` count
   in usage JSON. See [usage accounting](./run-cost.md#rejected-runs-and-failure-accounting)
   for the partition identity and the web bar's combined **rejected** segment.
@@ -317,6 +318,15 @@ A few worth knowing:
   schedule get`.
   There's no CLI setter for your own default harness; that's a **Settings →
   Run defaults** web-only control (see [Worker model](./worker-model.md)).
+- **`run get` explains a 7-day park.** For a run parked at `limit_wait` on the
+  `seven_day` window, or paused by the weekly usage reserve, `uzi run get`
+  adds a `WEEKLY_LIMIT` row (the credential, its reason in plain words and what
+  happens if you do nothing) and one `FIX` row per copyable fix command (`FIX_FUTURE_RUNS` for advice that only affects runs you start later).
+  Both rows are absent on any other run, including 5-hour and per-model parks,
+  and for the owner only. A token label that cannot be copied safely shows a
+  hint to rename the token in Settings instead of a command. `--json` carries
+  the same block as `weekly_limit`. Reasons, wait statements and fix commands
+  are described in [Why the run did not move to another token](./run-limit-wait.md#why-the-run-did-not-move-to-another-token).
 - **`version` reports two coordinates, not one.** It always prints the CLI's own
   version (the `v*` release this binary was built from). When a server URL is
   configured it additionally reports that server's build info — version, full
@@ -1669,6 +1679,10 @@ differs. V1 remains failed-current-generation only. See
 [Publishing terminal held work](./run-recovery.md#publishing-terminal-held-work)
 for eligibility, deadlines and accepted late-writer risk. Both commands are
 owner-only (a run that is not yours reads as not found) and work with a `uzc_` token.
+The one exception is the read: `uzi run held <run-id>` on another user's run is served as an
+admin run debug read when the server flag is on and you use a `uza_` token (see
+[Admin run debug](#admin-run-debug-reading-other-users-runs)); `uzi run held expire` stays
+owner-only.
 
 ```
 uzi run held <run-id> [--json]
@@ -1685,6 +1699,11 @@ uzi run held <run-id> [--json]
   `--quiet`). A parked run, an excluded failure origin or work handled by the archive
   can have no publication; cancellation alone no longer implies that result under V2. A refused
   create, an unconfirmed create (`create_unknown`) or a created row later deleted still lists a row.
+- **Another user's run (admin run debug read).** The read prints
+  `note: admin run debug read of another user's run (read-only; held expiry is owner-only)` on
+  stderr, omits the owner-only `uzi run held expire` hint and keeps the `git fetch` advice. A
+  refusal prints the [prerequisites hint](#admin-run-debug-reading-other-users-runs). The
+  response carries `admin_debug_read: true`, but `--json` prints the bare array with no marker.
 - **`--json`** prints the array of publication objects (`id`, `run_id`, `generation`, `ref`,
   `tip`, `state`, `created_at`, and when set `ref_created_at`, `acknowledged_at`,
   `expires_at`, `owner_expired_at`, `deleted_at`, `last_error`, `refusal_reason`). An empty
@@ -1740,11 +1759,20 @@ Retry the removal once the refs are deleted or settled.
 
 ### Admin run debug: reading other users' runs
 
-Off by default. A deployment turns it on with `UZI_ADMIN_RUN_DEBUG` (chart value
-`api.adminRunDebug.enabled`; see [configuration](./configuration.md#admin-run-debug-issue-4198)).
-When it is on, a live admin using an `admin_ro` (`uza_`) CLI token can read, never change, another
-user's run data. A browser cookie or a `uzc_` token never qualifies, and demoting the admin takes
-effect on the next request. Each newly authorized cross-user read writes one audit log line.
+Two kinds of read reach another user's run. From the CLI both need a `uza_` (`admin_ro`) token,
+because a `uzc_` token masks admin-ness. Browser admin access is unchanged (the flag-gated reads below
+are CLI-only).
+
+**Owner-or-admin reads, regardless of the flag.** A live admin can read these on any run:
+`run get`, `run logs`, `run plan`, `run lead-config` and `review show`.
+
+**Flag-gated, audited debug reads.** Off by default. A deployment turns it on with
+`UZI_ADMIN_RUN_DEBUG` (chart value `api.adminRunDebug.enabled`; see
+[configuration](./configuration.md#admin-run-debug-issue-4198)). When it is on, a live admin using an
+`admin_ro` (`uza_`) CLI token can read, never change, another user's run data through `run inputs`,
+`run fetches`, `run recovery`, `run held`, `admin runs --all` and `admin run-writers`. A browser cookie or a `uzc_` token
+never qualifies, and demoting the admin takes effect on the next request. Each newly authorized
+cross-user read writes one audit log line.
 
 - **`uzi run inputs <id>` and `uzi run fetches <id>`** work on a foreign run. A foreign chat run still
   reads as not found. A debug-served inputs or archives response carries `admin_debug_read: true`.
@@ -1766,17 +1794,45 @@ effect on the next request. Each newly authorized cross-user read writes one aud
 
   Each entry in `captures` has the same shape as a hold's `captures` entries above. The human view
   prints a `captures (no listed hold)` table instead.
-- **`uzi admin runs --all [--user <uuid>] [--since <rfc3339>]`** lists runs of every status, newest
-  first (`created_at`, then `id`), capped at 500 rows, with the same run-kind exclusions as the active
-  listing (chat, judge and cross-check runs). `--user` limits it to one owner, `--since` to runs
-  created at or after an RFC3339 time. `--user` and `--since` without `--all` exit 2. When the cap is hit
-  the CLI prints `note: showing the newest 500 runs; narrow with --user or --since` on stderr. `--json`
-  prints a `{runs, truncated}` envelope of summary rows instead of the table.
+- **`uzi run held <id>`** on a foreign run lists its held-work publications (see
+  [`uzi run held`](#fetching-and-expiring-terminal-held-refs-uzi-run-held)). It prints a read-only
+  notice on stderr, drops the owner-only expire hint and keeps the `git fetch` advice. `--json` prints
+  the bare publications array, without the `admin_debug_read` marker.
+- **`uzi admin runs --all [--user <uuid|email>] [--since <rfc3339>] [--status s[,s]]`** lists runs of every
+  status, newest first (`created_at`, then `id`), capped at 500 rows, with the same run-kind exclusions
+  as the active listing (chat, judge and cross-check runs). `--user` limits it to one owner: a user UUID,
+  or an email matched case-insensitively against `admin users` (no match exits 4; several matches exit 1
+  and list the user IDs). `--since` limits it to runs created at or after an RFC3339 time. `--status`
+  takes a comma-separated list of run statuses (for example `failed,cancelled`) and is applied before
+  the 500-row cap; an invalid status exits 2. `--user`, `--since` and `--status` without `--all` exit 2.
+  An older server that ignores `--status` is refused with `this uzi server does not support --status;
+  upgrade the server`. When the cap is hit the CLI prints
+  `note: showing the newest 500 runs; narrow with --user, --since or --status` on stderr. `--json`
+  prints a `{runs, truncated}` envelope of summary rows instead of the table, plus `status_filter` when
+  `--status` was given.
+- **`uzi admin run-writers --repo <uuid> --branch <ref> [--mr <iid>]`** lists the active `ci_fix` and
+  `mr_rework` runs, across all owners, that may push to a branch. Same prerequisites as the rest of this
+  section (`UZI_ADMIN_RUN_DEBUG` and an `admin_ro` token; an older server answers 404). `--repo` and
+  `--branch` are required; `--mr` must be positive. Each read is audited.
+  - **Matching.** `ci_fix` runs match by exact branch; `mr_rework` runs match only by `--mr`, never by
+    branch alone. Equivalent connections across owners count as the same repo: the match is by forge
+    type, the canonical base URL (`:443` folded; `api.github.com` folded to `github.com` for GitHub) and
+    the project id. A writer's REPO column is its own repo id, which may differ from `--repo` because
+    equivalent connections of other owners match.
+  - **Completeness.** `complete=false` means more than 500 matched and the answer is unknown: the CLI
+    prints `incomplete: more than 500 matching writers; absence is unknown` on stderr and exits 1,
+    unlike `admin runs --all`, which only prints a note and exits 0. An empty, complete result proves
+    no matching writer at that database snapshot only: a writer may start after the read.
+  - **Output.** A table (RUN, KIND, STATUS, OWNER, REPO, BRANCH, MR), or with `--json` the
+    decoded `{writers, complete}` document.
+  - **Landing scripts.** The uzi-lander scripts use this lookup and, when it answers 401, 403 or 404 or
+    the CLI predates the verb, fall back to the owner-scoped `uzi run list` check and print
+    `VISIBILITY=owner_only`.
 - **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
   `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
-  metadata-only). `run discard` stays owner-only too. The TUI shows no steer controls on a foreign run.
+  metadata-only). `run discard` and `uzi run held expire` stay owner-only too. The TUI shows no steer controls on a foreign run.
 - **Hints.** When a read that admin run debug could serve is refused or not found (a 404, 401 or 403
-  from `run inputs`, `run fetches`, `run recovery --user` or `admin runs --all`), the CLI prints
+  from `run inputs`, `run fetches`, `run held`, `run recovery --user` or `admin runs --all`), the CLI prints
   `hint: reading another user's run needs the server flag UZI_ADMIN_RUN_DEBUG (chart
   api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr, at most once per command.
   `uzi run recovery <run-id>` prints it only when you hold nothing on the run and one of its per-run
@@ -2971,7 +3027,7 @@ applies to runs you start afterwards and Codex runs are unaffected. Exit codes: 
 has no key or a disabled key, the feature is off, or the server answers `provider_source_unusable`
 (`use --none` only clears the selection, so it succeeds even with the feature off).
 `--json` prints `{"claude_provider_id", "name"}`. `run get` shows a `PROVIDER` row and cost as
-"unknown (custom provider)". Runs through a provider are currently blocked and stay queued; see [Model providers](./providers.md).
+"unknown (custom provider)". Runs start on workers that advertise `claude_provider_v1`; an older worker leaves them queued ("no worker that supports model providers is online"). See [Model providers](./providers.md).
 
 ## Anthropic tokens
 
@@ -3485,6 +3541,8 @@ the instance defaults are untouched.
 | `effort` | `claude` or `codex`, required | `low`, `medium`, `high`, `xhigh`, `max` or `runtime` | [Reasoning effort](./worker-effort.md) |
 | `judge-model` | `claude` or `codex`, required | A model id, validated by the server (the Codex judge lane accepts only curated models) | [Run judge](./judge.md#which-model-it-runs-on) |
 | `summary-model` | `claude` or `codex`, required | A model id, validated by the server | [Run summaries](./run-summaries.md#which-model-it-runs-on) |
+| `task-review-model` | `claude` or `codex`, required | A model id, validated by the server (Claude: any Claude id, Codex ids refused; Codex: a supported Codex role model). `reset` returns to the built-in (Claude: the SDK default, Codex: `gpt-6-sol`) | [Task review model](./worker-model.md#task-review-model) |
+| `task-review-effort` | `claude` or `codex`, required | `low`, `medium`, `high`, `xhigh`, `max` or `runtime` (Runtime default, no level sent). `reset` follows your worker effort again (the built-in `medium` when that is unset) | [Task review effort](./worker-model.md#task-review-effort) |
 | `judge-runs-on` | none (an error if given) | `same-as-run`, `claude` or `codex` | [Judge runs on](./judge.md#judge-runs-on) |
 | `cross-check` | `claude` or `codex`, required, plus `--stage plan` or `--stage code`, required | No positional value; `--model <id>` and `--effort low`, `medium`, `high`, `xhigh` or `max`, at least one of them (`runtime` is not a checker effort) | [Cross-check pins](./configuration.md#plan-cross-check-model-and-effort-pins) |
 
@@ -3508,7 +3566,8 @@ exit 2 without a request.
 `effort ... runtime` is the explicit **Runtime default** mode: uzi sends no
 effort and the runtime picks its own level (see [Runtime
 default](./worker-effort.md#runtime-default)). It is not a reset. A reset
-removes your choice so the default applies (built-in medium); `runtime` is a
+removes your choice so the default applies (for the lead, the lead template's
+effort when it has one, else built-in medium); `runtime` is a
 stored choice that `uzi settings get` shows as `runtime default`.
 
 Human output prints the changed row of the **Model settings** table from a fresh
@@ -3541,38 +3600,46 @@ server could not confirm or read back the write, while the exit 0 line means
 the server confirmed the write and only the CLI's own effective-settings read
 failed.
 
-The route is an allowlist of ten fields (the two worker-model lanes, the two
-effort lanes, the two judge-model lanes, the two summary-model lanes,
-`judge_runs_on` and `cross_check_pins`); any other key is a 400 naming it, and the fields of one request
+The route is an allowlist of fourteen fields (the two worker-model lanes, the two
+effort lanes, the two judge-model lanes, the two summary-model lanes, the two
+task-review-model lanes, the two task-review-effort lanes, `judge_runs_on` and `cross_check_pins`); any other key is a 400 naming it, and the fields of one request
 are written in one transaction. Consent switches (enabling the judge, cross-check
 or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
-`judge-runs-on`, `judge-model` and `summary-model` choose which harness or model
-already-enabled judge and summary work uses, and cannot turn that work on.
+`judge-runs-on`, `judge-model`, `summary-model`, `task-review-model` and `task-review-effort` choose which harness, model or effort
+already-enabled judge, summary and task-review work uses, and cannot turn that work on.
 
-### Agent-template model pins
+### Agent-template model and effort pins
 
 ```sh
 uzi agent-template list
 uzi agent-template show my-reviewer
 uzi agent-template set my-reviewer --harness claude sonnet
 uzi agent-template set my-reviewer --harness codex <model-id>
+uzi agent-template set my-reviewer --harness codex --effort high
+uzi agent-template set my-reviewer --harness claude sonnet --effort medium
 uzi agent-template reset my-reviewer --harness claude
+uzi agent-template reset my-reviewer --harness claude --effort
 ```
 
-`uzi agent-template` reads and edits the Claude pin (`model`) and the Codex pin
-(`codex_model`) of **your own** agent templates over `GET /api/me/agent-templates`
+`uzi agent-template` reads and edits the Claude pins (`model`, `effort`) and the
+Codex pins (`codex_model`, `codex_effort`) of **your own** agent templates over `GET /api/me/agent-templates`
 and `PUT /api/me/agent-templates/{id}/model-pins`, both of which accept a `uzc_`
 or `uza_` Bearer token. A pin is stored per family; `--harness claude` or
 `--harness codex` is required for `set` and `reset`, and the other family is left
 unchanged. `set` passes the model id through and the server validates it like the
-web editor (see [Model pins](./agent-templates.md#model-pins)). `reset` clears
-that pin so the family inherits again. Only the two pins change; description,
+web editor (see [Model pins](./agent-templates.md#model-pins)). `set` needs a
+model, `--effort <level>` (`low`, `medium`, `high`, `xhigh` or `max`), or both;
+`runtime` is not a template effort. `reset` clears the model pin so the family
+inherits again; `reset --effort` clears only the effort pin and keeps the model
+pin (see [Reasoning effort pins](./agent-templates.md#reasoning-effort-pins)).
+Only the pins change; description,
 tools and prompt are untouched, and the template's `customized` flag stays as it
 was.
 
 `list` prints your builtin, global and own templates with `NAME`, `SCOPE`,
-`CLAUDE PIN`, `CODEX PIN`, `EDITABLE` and `ID`. `show`, `set` and `reset` print
-the template's stored pins, each as the value or `inherit`. The output states
+`CLAUDE PIN`, `CODEX PIN`, `CLAUDE EFFORT`, `CODEX EFFORT`, `EDITABLE` and `ID`.
+`show`, `set` and `reset` print the template's stored pins (`Claude pin`,
+`Codex pin`, `Claude effort`, `Codex effort`), each as the value or `inherit`. The output states
 stored pins only and never a resolved model, because the model a template
 actually uses depends on the run role it fills (see [Model
 pins](./agent-templates.md#model-pins)). `--json` prints the server's envelope;
@@ -3593,8 +3660,8 @@ lists the ids; pass the id of one.
 | Exit | Meaning |
 | --- | --- |
 | 0 | The template was read or the pin written. |
-| 1 | The server predates the routes: the list answered an error-less 404 or 405 (or the write an error-less 405), printing `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
-| 2 | Usage error: a missing or invalid `--harness`, a missing or empty model, or an ambiguous name (the ids are listed), refused before any write. A pin the server rejects (a model of the wrong family) also exits 2 with the server's message and nothing is written. |
+| 1 | The server predates the routes: the list answered an error-less 404 or 405 (or the write an error-less 405), or the write answered 400 `unknown field effort` / `unknown field codex_effort` (a server that predates effort pins), printing `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
+| 2 | Usage error: a missing or invalid `--harness`, a missing or empty model, an invalid `--effort`, `set` with neither a model nor `--effort`, or an ambiguous name (the ids are listed), refused before any write. A pin the server rejects (a model of the wrong family) also exits 2 with the server's message and nothing is written. |
 | 3 | Authentication failed, or the template is builtin or global. |
 | 4 | The template does not exist or belongs to another user, including a `404` on the write. |
 | 6 | Server error or rate limit, including a typed 500 for an unknown commit outcome or a failed readback. |
@@ -3613,10 +3680,11 @@ setting prints once. The rows, in order:
 | --- | --- | --- |
 | `start (default)`, `start (claude)`, `start (codex)` | One each | `HARNESS`, `STORED` and `DEFAULT` show `-`. `RESOLVED` is the predicted harness, `claude or codex` when the harness is chosen when the run is created, or `refused: <token>` / `refused: <token> (<detail>)`. `SOURCE` is the harness source label (`your choice for this run`, `your default harness`, `automatic` or `chosen when the run is created`) plus its notes. |
 | `worker model` | `claude`, `codex` | `RESOLVED` and `DEFAULT` show `SDK/account default` when the runtime decides. |
-| `worker effort` | `claude`, `codex` | As the existing effort rows. |
+| `worker effort` | `claude`, `codex` | As the existing effort rows. `SOURCE` reads `lead template` when you have no per-harness effort preference and the lead template's effort is used (see [the lead template's effort](./worker-effort.md#the-lead-templates-effort)). |
+| `planning model`, `planning effort` | `claude`, `codex` | The optional per-harness [planning settings](./worker-model.md#planning-model-and-effort), with one model row and one effort row for each harness. `STORED` shows `Default` when unset, and `RESOLVED` then reads the run's own (implementation) value, for example `opus` or `SDK/account default`. Where a preview shows a run's plan and implement values, it may show them as a pair. Read-only here: there is no CLI setter for these two settings. |
 | `judge`, `summary` | `claude`, `codex` | Unchanged; printed from the settings read. |
-| `task review model` | `claude`, `codex` | Built-in; Codex notes `not configurable`, Claude `the SDK decides`. |
-| `task review effort` | `claude`, `codex` | `not sent` for both. |
+| `task review model` | `claude`, `codex` | Your stored model (`your choice`) or the built-in; an unset Claude model notes `the SDK decides`. Set it with `uzi settings set task-review-model`. |
+| `task review effort` | `claude`, `codex` | Your stored level, else the worker effort it follows (SOURCE is then the worker effort's source and STORED reads Default), else the built-in `medium`; `not sent` only for Runtime default. Set it with `uzi settings set task-review-effort`; `reset` follows the worker effort again. |
 
 `SOURCE` appends each cell's notes after a `·`, for example `built-in · not sent`.
 When a start choice is chosen at creation, the table is followed by one block per
@@ -3639,8 +3707,7 @@ usable. The CLI shows the `GET` only; it does not call the start-preview.
 `--schedule` adds the schedule preview, below.
 
 `--json` carries every key of the settings read plus an `effective` key holding
-the view's body: `version`, `harnesses`, `start`, `models`, `efforts` and
-`cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
+the view's body: `version`, `harnesses`, `start`, `models`, `efforts` (`models` includes Claude and Codex `planning_model` cells and `efforts` their `planning_effort` cells) and `cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
 `effective` is `null` when the server does not have the view or the read failed.
 In that case the human output falls back to the previous Model settings rows, a
 line goes to stderr (`Effective settings: not available on this server` for an
@@ -3665,6 +3732,7 @@ the same columns:
 | --- | --- | --- |
 | `schedule harness` | `-` | `RESOLVED` is the harness, `claude or codex` when it is chosen when the run is created, or `refused: <token>` (with the detail in parentheses). A refusal on a known harness reads `<harness>, refused: <token>`. |
 | `worker model`, `worker effort`, `credential`, `subagents` | `claude` or `codex` | One set per harness the fire can land on; with a single harness the rows are that harness's. |
+| `plan phase model`, `plan phase effort` | `claude`, `codex` | Printed between the worker effort and credential rows, and only on a fire where your [planning settings](./worker-model.md#planning-model-and-effort) apply. `STORED` and `DEFAULT` show `-`. `RESOLVED` is the model or effort the plan phase ships (`SDK/account default` for an empty model), or `same as the worker model` / `same as the worker effort` when the plan phase ships nothing on that side. `SOURCE` is the planning label for a planning value, else the ordinary model or effort label of the implement value that won (for example a schedule pin). On the model row it shows `-` when the plan phase ships no model; the effort row shows the implement effort's label (for example `your choice`). |
 | `fire` | `claude` or `codex` | Replaces the set above for a harness whose fire is refused, as `refused: <token>`. |
 
 When the harness is chosen at creation, the rows for both harnesses follow
@@ -3674,8 +3742,10 @@ run on this harness; the default applies`).
 
 `--json` adds a `schedule_preview` key holding the response body
 (`version`, `harness`, `refusal`, `refusal_detail`, `worker_model`,
-`worker_effort`, `credential`, `subagents`, `notes` and, when the harness is
-chosen at creation, `alternatives`). The key is absent without `--schedule`.
+`worker_effort`, `credential`, `subagents`, `notes`, the optional `plan_phase`
+(`model`, `effort`, `model_source`, `effort_source`, each omitted when absent;
+also on each alternative) and, when the harness is chosen at creation,
+`alternatives`). The key is absent without `--schedule`.
 
 Exit codes follow the schedule being something you asked for: a schedule that
 does not exist for your account (or a server that predates the route) is a 404
@@ -3721,6 +3791,28 @@ On a run the reserve touches, `uzi run get` shows:
   uzi run resume <id>`);
 - a pending reserve pause: the `PAUSE_REQUESTED` suffix described under
   `run pause` above.
+
+### Weekly warning margin
+
+```sh
+uzi settings warning-margin 15
+uzi settings warning-margin off
+```
+
+`uzi settings warning-margin <0..50|off>` sets how many percentage points below its
+effective weekly limit a credential must be before the [early
+warning](./rate-limits.md#early-warning-before-the-weekly-limit) shows. The
+default is 15; `0` (or `off`) turns early warnings off, including the [Slack
+warning](./rate-limits.md#slack-warning) (park explanations stay).
+A value outside 0..50 is a usage error. It posts to `PUT /api/me/weekly-warning-margin`
+(`{"margin_pts": <0..50>}`), which accepts a `uzc_` Bearer token; the response
+is `{"weekly_warning_margin_pts": <n>}`. Human output prints `Weekly warning
+margin: 15 points`, or a `Weekly warning margin: 0 (off ...)` line when off;
+`--json` returns `weekly_warning_margin_pts`. `uzi settings get` prints the same
+`Weekly warning margin:` line and its `--json` carries the field.
+
+For a run that is near its weekly limit but not yet parked, `uzi run get` shows
+the same `WEEKLY_LIMIT` and `FIX` rows as for a park.
 
 ### Codex account mode
 
@@ -4300,8 +4392,7 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   again; `hold_reason: provider_binding_stale` means the provider's key or revision changed
   after the run was created, so it cannot continue. `run get` prints a `HOLD` row reading
   `provider URL not allowed` or `provider binding changed`; `run logs --follow` and `run wait`
-  name the next step (wait, or `uzi run cancel` and start a new run). No worker claims a provider
-  run yet (activation is blocked), so these holds cannot occur until it lands. `run resume` is refused with a 409 for both, and neither
+  name the next step (wait, or `uzi run cancel` and start a new run). `run resume` is refused with a 409 for both, and neither
   falls back to an Anthropic token. See [Model providers](./providers.md#what-a-run-keeps).
   A `paused` run can also be **waiting because your credentials were reset**
   (`hold_reason: credentials_reset`): a Claude or chat run created before an
@@ -4336,8 +4427,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   If the worker cannot prove whether that switch took effect, the run is
   `paused` with no hold reason and a `credential_switch_uncertain` message in
   the run feed (posted by the worker):
-  `uzi run resume <id>` re-resolves the token from the run's current choice
-  and continues. See [Paused after an uncertain token switch](./run-pause.md#paused-after-an-uncertain-token-switch).
+  On Claude, `uzi run resume <id>` re-resolves the token from the run's current
+  choice. Codex new claims use the database-committed binding; set-token refuses
+  paused Codex runs (422), and neither credential executes while unresolved. See [Paused after an uncertain token switch](./run-pause.md#paused-after-an-uncertain-token-switch).
   A `paused` run created with `--require-base` can also be **held because
   its kept work is not attested** (`hold_reason: base_attestation_missing`):
   it continued its own work, but no checkpoint proves that work was produced
@@ -4361,6 +4453,13 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `run logs --follow` print a notice naming the hold. `uzi run resume <id>` retries only
   if the choice has become available on that harness; otherwise cancel the run
   (`uzi run cancel <id>`) and start a new run with a different choice.
+  A `paused` run can also be **held because the switch from its planning
+  model and effort to its own could not be verified**
+  (`hold_reason: phase_switch_unavailable`): `run get` prints a `HOLD` row
+  reading `planning switch unavailable`, and `run wait` and `run logs --follow`
+  print a notice naming the hold. `uzi run resume <id>` retries on a new
+  claim, which verifies the switch again; `uzi run cancel <id>` ends the run.
+  See [Planning model and effort](./worker-model.md#planning-model-and-effort).
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -4440,8 +4539,8 @@ These are presentation labels: raw JSON, scalar fields and status
 transitions stay unchanged. Filtering raw `status: failed` in JSON still
 includes failed-path cancellations, plan rejections and required-base
 rejections. See [required-base changes](./run-activity.md#when-a-required-base-has-changed)
-for rollout order and older payloads. Neither `run list`
-nor `admin runs` exposes a `--status` flag.
+for rollout order and older payloads. `run list` exposes no `--status` flag;
+`admin runs --all` takes one (see [Admin run debug](#admin-run-debug-reading-other-users-runs)).
 
 ### Provider outage recovery and owner hold
 
@@ -4591,6 +4690,29 @@ uzi run resume-now <id> --policy-mode <mode> --episode <outcome_id> \
 
 Without `--policy-mode`, `uzi run resume-now <id>` is unchanged.
 
+### Codex live credential switch
+
+`uzi run set-token <run-id> <label>` selects an enabled owner-owned Codex
+subscription or OpenAI API-key label. Codex refuses `--auto`, `--default`
+and `--inherit`; it does not use Anthropic pool or binding selection.
+The web picker offers the same explicit choice. An ambiguous eligible label
+(two or more matching credentials, compared case-insensitively) is refused before anything is written; rename a
+credential in the web UI, since the CLI cannot rename, then retry. Running and worker-held
+awaiting_approval/input/followup runs switch at the next safe boundary.
+Claimed returns 409; queued and every park return 422, including worker-held
+limit_wait/recovery_wait. Policy episodes unresolved at request or apply
+refuse the switch; a busy refresh lease/intent asks you to retry.
+
+Success keeps worker, generation and worktree without an attempt, custody
+or reclaim transition. It attempts the saved session; confirmed provider
+refusal alone permits a fresh thread and lineage notice, subject to
+preservation holds. Unproven teardown keeps settling/unsettled custody.
+An uncertain apply pauses with `credential_switch_uncertain`, and neither
+credential executes until resolved. No release/reclaim fallback is added.
+Real cross-account provider acceptance is unproven; owner two-account
+acceptance remains pending and non-closing. See
+[Codex switch and recovery limits](codex-credentials.md#switching-a-live-run).
+
 ### Codex idle stalls
 
 `recovery_wait` / `codex_idle_stall` covers measured no-output and productive
@@ -4607,8 +4729,8 @@ It preserves lifetime recovery backoff, provider streak, session, affinity,
 worker recovery episode and requeue baseline, with ordinary claim-release and
 custody semantics. Timer promotion preserves the count and grants a fresh wall
 window too; the default can therefore buy three extra full wall windows.
-`set-token` can promote a timed park; a held park returns a named 409 requiring
-Resume first.
+Claude `set-token` can promote a timed park; a held park returns a named 409
+requiring Resume first. Codex `set-token` refuses these parks with 422.
 
 Default wait and log follow stop for a NULL-retry hold, continue through finite
 or unknown timing, and report finite-to-held changes within the same cause/status.
@@ -4713,8 +4835,8 @@ except a default wait also stops at `recovery_wait` with cause
 `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, or
 owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), `anthropic_spend_limit` (an
 Anthropic API spend-limit or exhausted-credit hold, Resume, Switch token or Cancel), and at a `paused` run held on
-`base_attestation_missing`, `run_override_unavailable` or a credential-switch
-hold, for an owner decision:
+`base_attestation_missing`, `run_override_unavailable`, `phase_switch_unavailable`
+or a credential-switch hold, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park,

@@ -1,4 +1,4 @@
-// Pure helpers shared by the default and classic Overview pages (PRD #3878, #3877).
+// Pure helpers for the Overview page (PRD #3878, #3877).
 // Nothing here fetches or renders.
 
 import {
@@ -14,7 +14,7 @@ import { effectiveRunStatus, isAccountCooldownWaiting, isReserveHeldPause, NON_C
 import { stripUnsafeChars } from "./safeText";
 
 // Exhaustive over the wire status union; a new status needs an explicit bucket.
-export const activeRunBuckets: Record<RunStatus, "running" | "needsYou" | "queued" | "waiting" | null> = {
+const activeRunBuckets: Record<RunStatus, "running" | "needsYou" | "queued" | "waiting" | null> = {
   running: "running",
   awaiting_approval: "needsYou",
   awaiting_input: "needsYou",
@@ -37,7 +37,7 @@ export interface OverviewCounts {
 }
 
 // Executing, queued and parked counts over the non-terminal runs. Buckets on the RAW
-// status, as Dashboard's tile always has, with an account cooldown counted as waiting;
+// status, with an account cooldown counted as waiting;
 // feeding it effective statuses would drop runs. Runs that need the owner (the
 // needsYou bucket) are deliberately not counted here: the decision card covers them.
 export function overviewCounts(runs: ReadonlyArray<Pick<RunSummaryItem, "status" | "health">>): OverviewCounts {
@@ -71,8 +71,8 @@ export function mergeOverviewRows(
 }
 
 // PRD #1349 M6 (D8/D10): the count of the viewer's runs currently self-healing in the
-// recovery_wait park, derived client-side from runs the page already polls. Both Overview
-// pages feed it the viewer's OWN runs only.
+// recovery_wait park, derived client-side from runs the page already polls. The Overview
+// feeds it the viewer's OWN runs only.
 export function ownRecoveryWaitCount(runs: ReadonlyArray<Pick<RunSummaryItem, "status">>): number {
   return runs.filter((r) => r.status === "recovery_wait").length;
 }
@@ -81,7 +81,7 @@ export function ownRecoveryWaitCount(runs: ReadonlyArray<Pick<RunSummaryItem, "s
 // brought online if it is online now OR has ever registered (last_heartbeat_at is stamped
 // at register/heartbeat and never cleared by the offline sweep), so a fleet mid-roll
 // (every worker offline + upgrading) does not reopen the step. Live health stays on the
-// "Workers online N/M" tile.
+// Capacity rail (OverviewNext).
 export function workerJoined(workers: ReadonlyArray<Pick<Worker, "status" | "last_heartbeat_at">>): boolean {
   return workers.some((w) => w.status === "online" || w.last_heartbeat_at != null);
 }
@@ -178,12 +178,14 @@ export function openPrs<T extends PrRun>(runs: ReadonlyArray<T>): T[] {
   return [...byMr.values()].filter((r) => r.mr_state === "opened");
 }
 
-export type DecisionKind = "plan" | "question" | "park" | "pr";
+// PRD #4123: `limit` is a run whose credential is near or at its weekly limit with a fix the
+// owner can apply (the summary row's weekly_limit.tier "warning"), grouped by credential.
+export type DecisionKind = "plan" | "question" | "park" | "limit" | "pr";
 
 export interface RunDecisionItem {
   kind: DecisionKind;
   run: RunSummaryItem;
-  verb: "Review plan" | "Answer" | "Resume" | "Review PR";
+  verb: "Review plan" | "Answer" | "Resume" | "Review fix" | "Review PR";
   since: string;
   // PRD #4040: the server's one-line excerpt of the pending question, only on an
   // awaiting_input question item (never awaiting_followup). Untrusted model text: the card
@@ -210,16 +212,23 @@ const DECISION_VERB: Record<DecisionKind, RunDecisionItem["verb"]> = {
   plan: "Review plan",
   question: "Answer",
   park: "Resume",
+  limit: "Review fix",
   pr: "Review PR",
 };
 
-// The viewer's decision items, grouped held, plan, question, park, pr (#4041: held work and
-// plans lead, open PRs come last) and oldest first inside a
+// The viewer's decision items, grouped held, plan, question, park, limit, pr (#4041: held work
+// and plans lead, open PRs come last) and oldest first inside a
 // group. The groups are disjoint by raw status, so no run-level guard is needed: plan is
 // awaiting_approval, question is awaiting_input / awaiting_followup, pr is completed, and
 // park is a PARKED_STATUSES status, or an account cooldown, which parkDisposition always
 // calls "automatic" and so never lands in the owner-only park group. Callers pass ONLY the
 // viewer's own rows (listRuns), never the admin rows.
+//
+// limit (PRD #4123) is the exception to disjointness: the weekly-limit block rides any
+// non-terminal run, so a warning-tier run already listed as a plan, question or owner park keeps
+// that one row (its run page carries the banner) and is never listed twice. A timed limit_wait
+// or a weekly-reserve pause is "automatic", so it is not a park row and does get its limit row.
+// Notice-tier runs (no fix for the run itself) get none.
 //
 // `holds` (the owner's custody holds) adds exactly one held-work item, first of all,
 // when the aggregate says an open hold needs a decision. The count is the aggregate's
@@ -255,6 +264,8 @@ export function overviewDecisions(
   add("plan", ownRuns.filter((r) => r.status === "awaiting_approval" && !r.is_revising), since);
   add("question", ownRuns.filter((r) => r.status === "awaiting_input" || r.status === "awaiting_followup"), since);
   add("park", ownRuns.filter((r) => isParked(r) && parkDisposition(r) === "owner"), since);
+  const listed = new Set(out.flatMap((i) => (i.kind === "held" ? [] : [i.run.id])));
+  add("limit", ownRuns.filter((r) => r.weekly_limit?.tier === "warning" && !isTerminalRun(r.status) && !listed.has(r.id)), since);
   add("pr", openPrs(ownRuns), (r) => r.finished_at ?? r.status_since ?? r.created_at);
   return out;
 }
@@ -264,16 +275,34 @@ export function overviewDecisions(
 export type DecisionRow =
   | { type: "held"; item: HeldDecisionItem }
   | { type: "single"; item: RunDecisionItem }
-  | { type: "group"; kind: DecisionKind; items: RunDecisionItem[] };
+  | { type: "group"; kind: DecisionKind; items: RunDecisionItem[] }
+  // PRD #4123: one row per credential near its weekly limit, however many runs it carries.
+  // credentialKey is the grouping identity (never shown); credentialLabel is owner text.
+  | { type: "limit"; credentialKey: string; credentialLabel: string; items: RunDecisionItem[] };
 
 // Groups run items by kind in first-appearance order, keeping item order inside a kind.
-// Open PRs always group (even one); plan, question and park group from two items up.
+// Open PRs always group (even one); plan, question and park group from two items up. Limit
+// items group by credential_key instead (PRD #4123): one row per credential, even for one run,
+// and two credentials that share a label stay two rows.
 export function decisionRows(items: ReadonlyArray<DecisionItem>): DecisionRow[] {
   const rows: DecisionRow[] = [];
   const groups = new Map<DecisionKind, RunDecisionItem[]>();
+  const limits = new Map<string, RunDecisionItem[]>();
   for (const item of items) {
     if (item.kind === "held") {
       rows.push({ type: "held", item });
+      continue;
+    }
+    const limit = item.kind === "limit" ? item.run.weekly_limit : undefined;
+    if (limit) {
+      const existing = limits.get(limit.credential_key);
+      if (existing) {
+        existing.push(item);
+      } else {
+        const list = [item];
+        limits.set(limit.credential_key, list);
+        rows.push({ type: "limit", credentialKey: limit.credential_key, credentialLabel: limit.credential_label, items: list });
+      }
       continue;
     }
     const existing = groups.get(item.kind);
@@ -304,6 +333,8 @@ export function groupTitle(kind: DecisionKind, n: number): string {
       return one ? "1 run needs your input" : `${n} runs need your input`;
     case "park":
       return one ? "1 run waits on you" : `${n} runs wait on you`;
+    case "limit":
+      return one ? "1 run on it has a fix you can apply" : `${n} runs on it have a fix you can apply`;
     case "pr":
       return one ? "1 pull request is open for your review" : `${n} pull requests are open for your review`;
   }
@@ -313,8 +344,18 @@ export const GROUP_BUTTON: Record<DecisionKind, string> = {
   plan: "Review plans",
   question: "Open runs",
   park: "Resume runs",
+  limit: "Show runs",
   pr: "Review PRs",
 };
+
+// The credential noun for a limit row (PRD #4123), from the grouping key's vendor prefix so two
+// credentials sharing a label read apart ("Token" vs "Codex account"); the key itself is never
+// shown. An unknown prefix stays generic.
+export function limitCredentialNoun(credentialKey: string): string {
+  if (credentialKey.startsWith("anthropic:")) return "Token";
+  if (credentialKey.startsWith("codex:")) return "Codex account";
+  return "Credential";
+}
 
 // How many items a collapsed group previews (#4041).
 export const GROUP_PREVIEW = 3;

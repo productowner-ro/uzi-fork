@@ -85,7 +85,9 @@ RETURNING *;
 -- percent at which uzi stops spending the user's subscription (NULL = off), and
 -- weekly_reserve_pause_running says whether a running run is also paused. The narrow read the
 -- claim path and the sweeper use, so they need not load the whole users row.
-SELECT weekly_reserve_pct, weekly_reserve_pause_running FROM users WHERE id = $1;
+-- weekly_warning_margin_pts (PRD #4123 M2) rides this read too, so the next-claim snapshot's one owner
+-- read also carries the early-warning margin; the claim path ignores it.
+SELECT weekly_reserve_pct, weekly_reserve_pause_running, weekly_warning_margin_pts FROM users WHERE id = $1;
 
 -- name: SetUserUsageReserve :one
 -- Set both reserve fields together (PRD #3522); the API requires both, so a write is never a
@@ -93,6 +95,14 @@ SELECT weekly_reserve_pct, weekly_reserve_pause_running FROM users WHERE id = $1
 -- other per-user toggles, so the handler answers with the updated user envelope.
 UPDATE users SET weekly_reserve_pct = $2, weekly_reserve_pause_running = $3 WHERE id = $1
 RETURNING *;
+
+-- name: SetUserWeeklyWarningMargin :one
+-- Set the current user's weekly-limit warning margin in percentage points (PRD #4123 M2): how far
+-- below its effective weekly limit a credential must be before the early banner shows; 0 turns the
+-- early warnings off. The API validates 0..50 and the column CHECK backs it. Own-user only; the
+-- caller passes the session user's id. Returns the stored value.
+UPDATE users SET weekly_warning_margin_pts = @margin_pts WHERE id = @id
+RETURNING weekly_warning_margin_pts;
 
 -- name: SetUserJudgeEnabled :one
 -- Flip a user's run-retrospective opt-in (PRD #46 Decision 7). Per-user consent to
@@ -214,6 +224,36 @@ SET default_harness = CASE WHEN @set_harness::bool THEN @default_harness ELSE de
 WHERE id = @id
 RETURNING default_harness, default_claude_model, default_codex_model, default_model;
 
+-- name: GetUserPlanningClaude :one
+-- The owner's Claude planning model and effort (PRD #3252), each NULL = "Same as the run".
+-- Narrow read keyed on the user, mirroring GetUserHarnessModelDefaults.
+SELECT planning_claude_model, planning_claude_effort FROM users WHERE id = $1;
+
+-- name: SetUserPlanningClaude :one
+-- PATCHes the owner's Claude planning model and effort in ONE atomic statement (PRD #3252), the
+-- SetUserHarnessModels shape: each field is written only when its @set_* flag is true, otherwise the
+-- CASE keeps the row's own value; a true flag with a NULL value CLEARS that field. Own-user only.
+UPDATE users
+SET planning_claude_model = CASE WHEN @set_model::bool THEN @planning_claude_model ELSE planning_claude_model END,
+    planning_claude_effort = CASE WHEN @set_effort::bool THEN @planning_claude_effort ELSE planning_claude_effort END
+WHERE id = @id
+RETURNING planning_claude_model, planning_claude_effort;
+
+-- name: GetUserPlanningCodex :one
+-- The owner's Codex planning model and effort (PRD #3253), each NULL = "Same as the run".
+-- Narrow read keyed on the user, mirroring GetUserHarnessModelDefaults.
+SELECT planning_codex_model, planning_codex_effort FROM users WHERE id = $1;
+
+-- name: SetUserPlanningCodex :one
+-- PATCHes the owner's Codex planning model and effort in ONE atomic statement (PRD #3253), the
+-- SetUserHarnessModels shape: each field is written only when its @set_* flag is true, otherwise the
+-- CASE keeps the row's own value; a true flag with a NULL value CLEARS that field. Own-user only.
+UPDATE users
+SET planning_codex_model = CASE WHEN @set_model::bool THEN @planning_codex_model ELSE planning_codex_model END,
+    planning_codex_effort = CASE WHEN @set_effort::bool THEN @planning_codex_effort ELSE planning_codex_effort END
+WHERE id = @id
+RETURNING planning_codex_model, planning_codex_effort;
+
 -- name: GetUserDefaultEffort :one
 -- The current user's per-user default reasoning effort (PRD #617); NULL = inherit,
 -- resolved to the uzi default `medium` at claim assembly (issue #1157). Read at issue-
@@ -294,6 +334,39 @@ RETURNING summary_model;
 UPDATE users SET codex_summary_model = @codex_summary_model WHERE id = @id
 RETURNING codex_summary_model;
 
+-- name: GetUserTaskReviewSettings :one
+-- The owner's task-review settings per harness (PRD #1570): the model (task_review_model for the
+-- Claude lane, codex_task_review_model for Codex; NULL = the built-in review model) and the effort
+-- (task_review_effort / codex_task_review_effort; NULL = inherit the worker effort). default_effort
+-- and default_codex_effort ride along as the owner's stored ordinary worker effort a NULL review
+-- effort inherits. Read at REVIEW-run claim assembly and by the effective-settings prediction,
+-- keyed on the run owner. A narrow read: the claim needs no other user field.
+SELECT task_review_model, codex_task_review_model, task_review_effort, codex_task_review_effort, default_effort, default_codex_effort FROM users WHERE id = $1;
+
+-- name: SetUserTaskReviewModel :one
+-- Sets (or clears, when @task_review_model is NULL) the current user's Claude task-review model
+-- (PRD #1570). NULL = the built-in. Own-user only; caller passes the session user's id.
+UPDATE users SET task_review_model = @task_review_model WHERE id = @id
+RETURNING task_review_model;
+
+-- name: SetUserCodexTaskReviewModel :one
+-- Sets (or clears, when @codex_task_review_model is NULL) the current user's Codex task-review
+-- model (PRD #1570). NULL = the built-in. Own-user only; caller passes the session user's id.
+UPDATE users SET codex_task_review_model = @codex_task_review_model WHERE id = @id
+RETURNING codex_task_review_model;
+
+-- name: SetUserTaskReviewEffort :one
+-- Sets (or clears, when @task_review_effort is NULL) the current user's Claude task-review effort
+-- (PRD #1570). NULL = inherit the worker effort. Own-user only; caller passes the session user's id.
+UPDATE users SET task_review_effort = @task_review_effort WHERE id = @id
+RETURNING task_review_effort;
+
+-- name: SetUserCodexTaskReviewEffort :one
+-- Sets (or clears, when @codex_task_review_effort is NULL) the current user's Codex task-review
+-- effort (PRD #1570). NULL = inherit the worker effort. Own-user only; caller passes the session user's id.
+UPDATE users SET codex_task_review_effort = @codex_task_review_effort WHERE id = @id
+RETURNING codex_task_review_effort;
+
 -- name: LockUserSettingsRow :one
 -- Takes the row lock a multi-column settings write holds for its whole transaction (PUT
 -- /api/me/model-settings). FOR NO KEY UPDATE is the mode a plain UPDATE of a non-key column
@@ -328,7 +401,14 @@ SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE;
 -- reviews, the settings surface exposes it as nullable claude|codex.
 -- claude_provider_id (PRD #4320 M4) rides it too, read-only on the settings surface: the owner's
 -- Claude model-provider source (NULL = the vendor ladder); written only by PUT /me/providers/claude-source.
-SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id, sidebar_motion FROM users WHERE id = $1;
+-- planning_claude_model and planning_claude_effort (PRD #3252) ride it too: the owner's Claude
+-- planning pair, NULL = "Same as the run"; written by SetUserPlanningClaude.
+-- task_review_model and codex_task_review_model (PRD #1570) ride it too: the owner's per-harness
+-- handoff-review model, NULL = the built-in; task_review_effort and codex_task_review_effort are the
+-- matching efforts, NULL = inherit the worker effort.
+-- weekly_warning_margin_pts (PRD #4123 M2) rides it too: the early weekly-limit warning margin
+-- (0 = off, default 15); written by SetUserWeeklyWarningMargin.
+SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id, sidebar_motion, planning_claude_model, planning_claude_effort, planning_codex_model, planning_codex_effort, task_review_model, codex_task_review_model, task_review_effort, codex_task_review_effort, weekly_warning_margin_pts FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch

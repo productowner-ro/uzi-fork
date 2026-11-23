@@ -70,6 +70,7 @@ func wakeDemandWith(fx *fleetFixture, allow []uuid.UUID, maxRows int32, lease pg
 	fx.t.Helper()
 	now := time.Now()
 	rows, err := fx.q.ListHibernationWakeDemand(fx.ctx, store.ListHibernationWakeDemandParams{
+		CodexCuratedModels:       []string{"gpt-6-sol"},
 		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
 		CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-time.Hour), Valid: true},
 		AffinityCutoff:           pgtype.Timestamptz{Time: now.Add(-2 * time.Hour), Valid: true},
@@ -106,15 +107,18 @@ func claimsAfterWake(fx *fleetFixture, worker, run uuid.UUID, allow []uuid.UUID,
 	var claimed store.Run
 	if chat {
 		claimed, err = fx.q.ClaimChatRun(fx.ctx, store.ClaimChatRunParams{
-			WorkerID:       pgtype.UUID{Bytes: worker, Valid: true},
-			UserID:         fx.userID,
-			AffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Hour), Valid: true},
+			WorkerID:           pgtype.UUID{Bytes: worker, Valid: true},
+			UserID:             fx.userID,
+			IsEphemeral:        wkr.Ephemeral,
+			WorkerProtocolCaps: wkr.ProtocolCapabilities,
+			AffinityCutoff:     pgtype.Timestamptz{Time: now.Add(-2 * time.Hour), Valid: true},
 		})
 	} else {
 		claimed, err = fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{
 			WorkerID:                 pgtype.UUID{Bytes: worker, Valid: true},
 			Lane:                     lane,
 			UserID:                   fx.userID,
+			CodexCuratedModels:       []string{"gpt-6-sol"},
 			CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
 			CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-time.Hour), Valid: true},
 			HeartbeatCutoff:          pgtype.Timestamptz{Time: now.Add(-45 * time.Second), Valid: true},
@@ -206,6 +210,59 @@ func TestHibernationWakeDemandMatchesClaimLiveDB(t *testing.T) {
 			}, want: true,
 		},
 		{name: "chat run", chat: true, setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID { return queuedChat(fx) }, want: true},
+		// PRD #4320 / #4505: a provider-bound chat wakes only a worker advertising claude_provider_v1,
+		// mirroring ClaimChatRun's provider clause; a vendor chat is unchanged.
+		{
+			name: "provider-bound chat, capable hibernated worker", chat: true,
+			opts: wakeWorkerOpts{protocol: []string{claudeProviderCap}},
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID {
+				id := queuedChat(fx)
+				bindRunToProvider(fx, id, "wake-chat-capable")
+				return id
+			}, want: true,
+		},
+		{
+			name: "provider-bound chat, incapable hibernated worker", chat: true,
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID {
+				id := queuedChat(fx)
+				bindRunToProvider(fx, id, "wake-chat-incapable")
+				return id
+			}, want: false,
+		},
+		{
+			name: "vendor chat, capable hibernated worker", chat: true,
+			opts:  wakeWorkerOpts{protocol: []string{claudeProviderCap}},
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID { return queuedChat(fx) }, want: true,
+		},
+		{
+			name: "provider-bound run, capable hibernated worker",
+			opts: wakeWorkerOpts{protocol: []string{claudeProviderCap}},
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID {
+				id := fx.queuedRun()
+				bindRunToProvider(fx, id, "wake-run-capable")
+				return id
+			}, want: true,
+		},
+		{
+			name: "provider-bound run, incapable hibernated worker",
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID {
+				id := fx.queuedRun()
+				bindRunToProvider(fx, id, "wake-run-incapable")
+				return id
+			}, want: false,
+		},
+		{
+			// An AWAKE online worker that lacks claude_provider_v1 cannot claim the provider-bound chat,
+			// so it must not block the wake of the capable sleeper (claimsAfterWake agrees).
+			name: "provider-bound chat, awake incapable worker plus capable hibernated sleeper", chat: true,
+			opts: wakeWorkerOpts{protocol: []string{claudeProviderCap}},
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID {
+				hostedWorker(fx, wakeWorkerOpts{})
+				id := queuedChat(fx)
+				bindRunToProvider(fx, id, "wake-chat-awake-incapable")
+				return id
+			}, want: true,
+		},
 		{
 			name: "cross-check child, legacy run-lane worker", opts: wakeWorkerOpts{protocol: checkerProtocol},
 			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID { return queuedPlanChecker(fx) }, want: true,
@@ -434,4 +491,28 @@ func TestHibernationWakeDemandMatchesClaimLiveDB(t *testing.T) {
 			t.Fatalf("control: run %s demanded %s, want the sleeper %s", follow, got, h)
 		}
 	})
+}
+
+func TestCodexPlanningHibernationConsumersLiveDB(t *testing.T) {
+	for _, capable := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing phase", true: "phase capable"}[capable], func(t *testing.T) {
+			fx := newFleetFixture(t)
+			mustExec(fx.ctx, t, fx.pool, `UPDATE users SET planning_codex_model='gpt-6-sol' WHERE id=$1`, fx.userID)
+			run := phaseRun(fx, phaseMatrixCase{kind: "issue", harness: "codex", noCaps: true})
+			w := hostedWorker(fx, wakeWorkerOpts{protocol: phaseProtocols("codex", capable)})
+			setHibernated(fx, w, "hibernated")
+			if got := wakeDemandFor(fx, nil)[run]; (got == w) != capable {
+				t.Fatalf("wake target=%v capable=%v", got, capable)
+			}
+			setHibernated(fx, w, "waking")
+			mustExec(fx.ctx, t, fx.pool, `INSERT INTO hibernation_wakes(run_id,worker_id,first_woken_at) VALUES($1,$2,now())`, run, w)
+			suppressed, err := fx.q.HibernationWakeSuppresses(fx.ctx, store.HibernationWakeSuppressesParams{
+				RunID: run, CodexCuratedModels: []string{"gpt-6-sol"}, WakeTimeout: leaseInterval(leaseTwoHours), EphemeralLease: leaseInterval(leaseTwoHours),
+				CrossCheckEvaluatedAt: planCrossCheckTime(time.Now()), CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-time.Hour)),
+			})
+			if err != nil || suppressed != capable {
+				t.Fatalf("wake suppression=(%v,%v) capable=%v", suppressed, err, capable)
+			}
+		})
+	}
 }

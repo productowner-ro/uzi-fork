@@ -49,6 +49,10 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// listing; it additionally needs UZI_ADMIN_RUN_DEBUG and an admin_ro Bearer token
 			// (checked in the handler, 403 otherwise). Without those keys the response is unchanged.
 			r.With(chimw.Compress(5)).Get("/runs", h.AdminListRuns)
+			// Issue #4618: the active ci_fix / mr_rework writers of one branch across ALL owners.
+			// Same gate as the debug listing above: UZI_ADMIN_RUN_DEBUG plus an admin_ro Bearer
+			// token, checked in the handler (403 otherwise).
+			r.Get("/run-writers", h.AdminRunWriters)
 			// Admin "All users" judge aggregate reads (PRD #1184 M1): every user's judge
 			// recommendations deduped by (category, target) with attribution hidden, plus the
 			// cross-user triage strip and filter-chip counts. Separate handlers calling distinct
@@ -182,7 +186,7 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// user. Refused 409 until a fresh controller report advertises admin-size support.
 			r.Put("/worker-sizes/{name}", h.AdminPutWorkerSize)
 			r.Post("/worker-sizes/{name}/reset", h.AdminResetWorkerSize)
-			// PRD #4213 M3: PUT also creates an absent size; DELETE removes an unused admin size.
+			// PRD #4213 M3: PUT also creates an absent size (If-None-Match: * makes it create-only, 412 when present); DELETE removes an unused admin size.
 			r.Delete("/worker-sizes/{name}", h.AdminDeleteWorkerSize)
 			// Worker hibernation (PRD #4205): admin-only sleep and wake of a persistent hosted
 			// worker. Cookie-only so a uza_ Bearer 401s and CSRF applies; the actor is the

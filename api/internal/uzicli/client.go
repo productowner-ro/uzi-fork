@@ -159,11 +159,10 @@ type Client interface {
 	ResumePolicyHold(ctx context.Context, id, mode, episodeID, guidance string) (apitypes.RunDTO, bool, error)
 	// SetRunCredential is the `uzi run set-token` verb (PRD #1247 M4, D4/D12): POST
 	// /api/runs/{id}/credential {mode, secret_id?}, RequireUser so a uzc_ CLI Bearer reaches
-	// it. It re-points which Anthropic token a queued or parked run spends (promoting a
-	// parked run to queued at once) and returns the updated run plus an optional D6 warning
-	// string. A held/claimed/terminal run is 409 → ExitConflict (5); a foreign/unknown run
-	// or token is 404 → ExitNotFound (4); a codex-harness run is 422; a bad mode is 400 →
-	// ExitUsage (2) — all via the shared status→exit mapping.
+	// it. Claude supports eligible queued, parked and live token changes. Codex requires
+	// an explicit credential on a live worker-held run; claimed is 409, queued and every
+	// park are 422. It returns the updated run and an optional warning. Foreign/unknown
+	// runs or credentials are 404. Errors use the shared status-to-exit mapping.
 	SetRunCredential(ctx context.Context, id string, override SetRunCredentialOverride) (apitypes.RunDTO, string, error)
 	// SetRunMrRework sets the per-run MR review-rework override (PRD #841 M3): PUT
 	// /api/runs/{id}/mr-rework {enabled: bool|null}, RequireUser so a CLI `uzc_` token can
@@ -264,6 +263,10 @@ type Client interface {
 	// subscription; pauseRunning also pauses running runs. Both are always sent (the
 	// server requires both). RequireUser, so a uzc_ token reaches it. Returns the updated user.
 	SetUsageReserve(ctx context.Context, thresholdPct *int, pauseRunning bool) (apitypes.UserDTO, error)
+	// SetWeeklyWarningMargin sets the caller's weekly-limit early-warning margin (PRD #4123):
+	// PUT /api/me/weekly-warning-margin {"margin_pts": 0..50}, 0 = off. RequireUser, so a
+	// uzc_ token reaches it. Returns the saved value.
+	SetWeeklyWarningMargin(ctx context.Context, marginPts int) (int, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
 	// DeleteRepo removes a single repo: DELETE /api/repos/{id}, 204 on success
 	// (PRD #357 M3). The server only removes a DISABLED repo and refuses one that
@@ -293,12 +296,19 @@ type Client interface {
 	// (GET /api/admin/runs?view=summary, issue #2661), polled by the admin TUI board.
 	AdminListRunSummaries(ctx context.Context) ([]apitypes.RunSummaryItemDTO, error)
 	// AdminListRunsDebug is the admin run debug listing (issue #4198): GET
-	// /api/admin/runs?state=all[&user=<uuid>][&since=<RFC3339>], summary rows of every
-	// status, newest first, with Truncated set when the server's row cap cut the list. The
+	// /api/admin/runs?state=all[&user=<uuid>][&since=<RFC3339>][&status=a,b], summary rows
+	// (of every status, or only the requested statuses), newest first, with Truncated set
+	// when the server's row cap cut the list. A server that ignored the status filter is
+	// refused (CheckAdminRunsDebugStatusFilter). The
 	// server needs UZI_ADMIN_RUN_DEBUG plus an admin_ro (uza_) token, else 403 -> ExitAuth.
 	// An older server ignores the query and answers with its active-runs listing, which
 	// is refused here with a clear error rather than shown as if it were everything.
-	AdminListRunsDebug(ctx context.Context, userID, since string) (apitypes.AdminRunsDebugDTO, error)
+	AdminListRunsDebug(ctx context.Context, userID, since string, statuses []string) (apitypes.AdminRunsDebugDTO, error)
+	// AdminRunWriters is GET /api/admin/run-writers (issue #4618): active ci_fix / mr_rework
+	// writers for repoID and branch, plus mrIID's mr_rework writers when mrIID > 0. Needs the
+	// admin run debug prerequisites (403 -> ExitAuth, older server 404 -> ExitNotFound). The
+	// reply is decoded strictly; Complete=false means absence proves nothing.
+	AdminRunWriters(ctx context.Context, repoID, branch string, mrIID int64) (apitypes.RunWritersDTO, error)
 	AdminListWorkers(ctx context.Context) ([]apitypes.AdminWorkerDTO, error)
 	// AdminHealth reads the admin health document (PRD #1484 M3): GET
 	// /api/admin/health, in the admin READ group (RequireUser + RequireAdminRO), so a
@@ -847,7 +857,9 @@ type Client interface {
 	DiscardRecoveryHold(ctx context.Context, runID, holdID string) error
 	// HeldPublications lists a run's held-work publications (issue #2545):
 	// GET /api/runs/{runID}/held-publications. RequireUser and owner-or-404, so a uzc_ CLI token
-	// reaches its OWN runs only. Publications is always a JSON array (never null).
+	// reaches its OWN runs only; an admin_ro (uza_) token may also read a foreign run's list when
+	// the server's admin run debug flag is on (the response is marked admin_debug_read).
+	// Publications is always a JSON array (never null).
 	HeldPublications(ctx context.Context, runID string) (apitypes.HeldPublicationsDTO, error)
 	// ExpireHeldPublications makes every ACKNOWLEDGED held publication of the run due now
 	// (issue #2545): POST /api/runs/{runID}/held-publications/expire. It deletes nothing itself

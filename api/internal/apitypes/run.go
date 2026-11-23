@@ -152,6 +152,29 @@ func IsTerminalRunStatus(status string) bool {
 	}
 }
 
+// RunStatuses is the ordered set of every value the runs.status column accepts (the
+// live runs_status_check constraint, migrations 00206/00207). Parity tests pin it to
+// the migration and to the CLI's copies.
+var RunStatuses = []string{
+	"queued", "claimed", "running", "awaiting_approval", "awaiting_input",
+	"awaiting_followup", "limit_wait", "pool_wait", "paused", "recovery_wait",
+	"completed", "failed", "cancelled",
+}
+
+var runStatusSet = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(RunStatuses))
+	for _, s := range RunStatuses {
+		m[s] = struct{}{}
+	}
+	return m
+}()
+
+// IsRunStatus reports whether s is a member of RunStatuses.
+func IsRunStatus(s string) bool {
+	_, ok := runStatusSet[s]
+	return ok
+}
+
 // CompletionDeferredDTO is one owner-deferred (out-of-scope) milestone on a revised completion
 // contract (PRD #1227 M1, D2): the milestone id, the owner's reason, and the contract revision the
 // deferral was recorded at. A milestone deferred in an earlier revision keeps its original
@@ -244,6 +267,9 @@ type RunDTO struct {
 	MilestoneReconciliationsNextBeforeGateRevision *int64                `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
 	WorkerRecovery                                 *WorkerRecoveryDTO    `json:"worker_recovery,omitempty"`
 	MemoryHold                                     *MemoryHoldDTO        `json:"memory_hold,omitempty"`
+	// WeeklyLimit is the owner-only weekly-limit block (PRD #4123); absent unless the run's vendor
+	// credential is in a weekly-limit park.
+	WeeklyLimit *WeeklyLimitDTO `json:"weekly_limit,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -1209,14 +1235,19 @@ type CredentialOverrideDTO struct {
 // epoch's own spend, computed by telescoping the run's usage legs, and is omitted when the run has
 // recorded none.
 type CredentialEpochDTO struct {
-	ClaimGeneration int64                    `json:"claim_generation"`
-	Ordinal         int32                    `json:"ordinal"`
-	SecretID        *string                  `json:"secret_id"`
-	Label           *string                  `json:"label"`
-	SelectReason    *string                  `json:"select_reason"`
-	AppliedAt       time.Time                `json:"applied_at"`
-	MessageSeq      *int32                   `json:"message_seq,omitempty"`
-	Usage           *CredentialEpochUsageDTO `json:"usage,omitempty"`
+	CodexAuthMode         *string                  `json:"codex_auth_mode,omitempty"`
+	CodexMaterialRevision *int64                   `json:"codex_material_revision,omitempty"`
+	CodexAccountKey       *string                  `json:"codex_account_key,omitempty"`
+	CodexAccountID        *string                  `json:"codex_account_id,omitempty"`
+	CodexClaimEpoch       *int64                   `json:"codex_claim_epoch,omitempty"`
+	ClaimGeneration       int64                    `json:"claim_generation"`
+	Ordinal               int32                    `json:"ordinal"`
+	SecretID              *string                  `json:"secret_id"`
+	Label                 *string                  `json:"label"`
+	SelectReason          *string                  `json:"select_reason"`
+	AppliedAt             time.Time                `json:"applied_at"`
+	MessageSeq            *int32                   `json:"message_seq,omitempty"`
+	Usage                 *CredentialEpochUsageDTO `json:"usage,omitempty"`
 }
 
 // CredentialEpochUsageDTO is one credential epoch's spend (issue #4201). The fields mean what the
@@ -1247,6 +1278,8 @@ type RunSummaryItemDTO struct {
 	MemoryHold     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
 	// Optional advisory cooldown for the assigned worker and current authorized origin.
 	ForgeOriginCooldown *ForgeOriginCooldownDTO `json:"forge_origin_cooldown,omitempty"`
+	// WeeklyLimit is the compact owner-only weekly-limit projection (PRD #4123).
+	WeeklyLimit *WeeklyLimitSummaryDTO `json:"weekly_limit,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -2140,6 +2173,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		PolicyHold:                    item.PolicyHold,
 		WorkerRecovery:                item.WorkerRecovery,
 		MemoryHold:                    item.MemoryHold,
+		WeeklyLimit:                   item.WeeklyLimit.Summary(),
 		ID:                            item.ID,
 		RepoID:                        item.RepoID,
 		ForgeType:                     item.ForgeType,
@@ -2336,6 +2370,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			PolicyHold:                    s.PolicyHold,
 			WorkerRecovery:                s.WorkerRecovery,
 			MemoryHold:                    s.MemoryHold,
+			WeeklyLimit:                   weeklyLimitFromSummary(s.WeeklyLimit),
 			ID:                            s.ID,
 			RepoID:                        s.RepoID,
 			ForgeType:                     s.ForgeType,
@@ -2843,4 +2878,28 @@ func (r *RunSummaryItemDTO) UnmarshalJSON(data []byte) error {
 type AdminRunsDebugDTO struct {
 	Runs      []RunSummaryItemDTO `json:"runs"`
 	Truncated bool                `json:"truncated"`
+	// StatusFilter echoes the applied status filter so a client can detect an older
+	// server that ignored it (the key is then absent). Omitted when no filter was sent.
+	StatusFilter []string `json:"status_filter,omitempty"`
+}
+
+// RunWriterDTO is one active ci_fix / mr_rework run in the GET /api/admin/run-writers
+// response (issue #4618). Metadata only: no plan, report, log or patch text.
+type RunWriterDTO struct {
+	RunID       string    `json:"run_id"`
+	Kind        string    `json:"kind"`
+	Status      string    `json:"status"`
+	OwnerID     string    `json:"owner_id"`
+	RepoID      string    `json:"repo_id"`
+	PipelineRef *string   `json:"pipeline_ref"`
+	MRIID       *int64    `json:"mr_iid"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// RunWritersDTO is the GET /api/admin/run-writers response. Writers is always a JSON array,
+// never null. Complete is false when more matching writers existed than the server serves,
+// in which case the absence of a writer from the list proves nothing.
+type RunWritersDTO struct {
+	Writers  []RunWriterDTO `json:"writers"`
+	Complete bool           `json:"complete"`
 }
