@@ -228,6 +228,7 @@ uzi run resume-now <run-id>
 uzi run resume <run-id>
 uzi run set-token <run-id> (<label> | --auto | --default | --inherit)
 uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
+uzi run ci-autofix <run-id> [--enabled[=false]] [--clear]
 uzi run rework <run-id> [-m|--message <text>]
 uzi run decide <run-id> --continue [--guidance <text>]
 uzi run export <run-id> --output <path> [--capture <id>]
@@ -419,7 +420,11 @@ uzi version
   is passed through and the server validates it; `reset` clears to the inherited value.
   Prints the changed row with its source, from a fresh effective-settings read; when
   that read fails the stored value is shown, the write still exits 0 and the read error
-  goes to stderr. `--json` prints the server's `{"settings": ...}` envelope unchanged.
+  goes to stderr. `--json` prints the server's `{"settings": ..., "effective": ...}` envelope
+  unchanged (`effective` is null with `effective_error` if the server's own read failed).
+  The route allows 19 fields (the Settings → Models page saves through it); a 400 adds an
+  `errors` array per problem. The writes commit in one transaction; the response reads
+  are separate queries after it, not a snapshot.
   Usage exit 2 (no request) on an unknown setting, a missing, invalid or unwanted
   `--harness`, or an invalid value. Exit 6 with "the save may or may not have been
   applied; check with `uzi settings get`" when the commit outcome is unknown, and with
@@ -913,6 +918,14 @@ uzi version
   usage error (exit 2); a foreign/unknown run is a 404 (exit 4). The write is inert once
   the MR is merged or closed. Prints the updated run, whose `MR_REWORK` row reads
   inherit/on/off.
+- `uzi run ci-autofix <run-id>` — set the per-run override for AUTOMATIC CI fixes on the
+  run's branch. Tri-state like `mr-rework` (`--enabled`, `--enabled=false`, `--clear` to
+  inherit; `--clear` with `--enabled` is exit 2; a foreign/unknown run is exit 4), editable
+  after completion. The override that counts is the branch's selected run (newest
+  non-cancelled issue/ci_fix/prompt/self_improve run with an MR); the output names the run
+  that governs and any of your in-flight CI fix runs, which keep their own copied value.
+  The admin gate always wins and manual `uzi ci fix` is never blocked. It does not expire.
+  Prints the updated run (`CI_AUTOFIX` row); `--json` emits the full result envelope.
 - `uzi run rework <run-id> [-m|--message <text>]` — start ONE on-demand MR-rework cycle
   on a **completed** run whose MR is open, PAST the automatic cap (PRD #1202) — the way to
   rework an MR after the automatic watcher has stopped. It SKIPS the cap, the quiet-period

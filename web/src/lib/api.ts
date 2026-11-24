@@ -67,6 +67,9 @@ import type {
   AdminOAuthConnection,
   OAuthRedirect,
   EffectiveSettings,
+  ModelSettingsFieldError,
+  ModelSettingsPatch,
+  ModelSettingsSaveResponse,
   ScheduleSettingsPreview,
   ScheduleSettingsPreviewRequest,
   StartPreview,
@@ -132,6 +135,7 @@ import type {
   RunListItem,
   RunMessage,
   RunStartBody,
+  SetRunCiAutofixResponse,
   RunSummaryItem,
   RunNowResponse,
   RunReview,
@@ -383,6 +387,35 @@ export function egressProfileProblems(err: unknown): EgressProfileProblem[] | nu
       typeof (p as EgressProfileProblem).message === "string",
   );
   return problems.length > 0 ? problems : null;
+}
+
+// modelSettingsFieldErrors returns every defect of a PUT /me/model-settings 400 (PRD #3263).
+// The additive `errors` array is preferred; a body without it (an older server, or an invalid
+// body) falls back to the flat field/error pair, and a 400 naming no field yields one entry with
+// an empty field so the caller can still show the message. Anything but a 400 is [].
+export function modelSettingsFieldErrors(err: unknown): ModelSettingsFieldError[] {
+  if (!(err instanceof ApiError) || err.status !== 400) return [];
+  const body = err.body as { errors?: unknown; field?: unknown } | null;
+  if (Array.isArray(body?.errors)) {
+    const listed = body.errors.filter(
+      (e): e is ModelSettingsFieldError =>
+        typeof e === "object" && e !== null &&
+        typeof (e as ModelSettingsFieldError).field === "string" &&
+        typeof (e as ModelSettingsFieldError).message === "string",
+    );
+    if (listed.length > 0) return listed;
+  }
+  return [{ field: typeof body?.field === "string" ? body.field : "", message: err.message }];
+}
+
+// The two 500 reasons PUT /me/model-settings distinguishes from a plain failure, so the Models
+// page can say whether the save may have happened (commit_unknown) or did happen (readback).
+export type ModelSettingsFailureReason = "settings_commit_unknown" | "settings_saved_readback_failed";
+
+export function modelSettingsFailureReason(err: unknown): ModelSettingsFailureReason | null {
+  if (!(err instanceof ApiError) || err.status !== 500) return null;
+  const reason = (err.body as { reason?: unknown } | null)?.reason;
+  return reason === "settings_commit_unknown" || reason === "settings_saved_readback_failed" ? reason : null;
 }
 
 async function request<T>(
@@ -722,8 +755,8 @@ const realApi = {
   createProvider: (input: CreateProviderInput) =>
     request<{ provider: ProviderDTO }>("POST", "/me/providers", {
       ...input,
-      engine: "claude",
-      protocol: "anthropic_messages",
+      engine: input.engine ?? "claude",
+      protocol: input.protocol ?? (input.engine === "codex" ? "openai_responses" : "anthropic_messages"),
     }),
   patchProvider: (id: string, body: { name?: string; model_map?: ProviderModelMap }) =>
     request<{ provider: ProviderDTO }>("PATCH", `/me/providers/${id}`, body),
@@ -740,6 +773,8 @@ const realApi = {
   // return to Anthropic. A 409 reason provider_source_unusable names why it cannot serve.
   setClaudeProviderSource: (providerId: string | null) =>
     request<{ claude_provider_id: string | null }>("PUT", "/me/providers/claude-source", { provider_id: providerId }),
+  setCodexProviderSource: (providerId: string | null) =>
+    request<{ codex_provider_id: string | null }>("PUT", "/me/providers/codex-source", { provider_id: providerId }),
   testProvider: (id: string) =>
     request<{ probe: ProviderProbe }>("POST", `/me/providers/${id}/test`),
   testSecret: (kind: "anthropic_token" | "codex_auth" | "openai_api_key", id: string) =>
@@ -893,6 +928,11 @@ const realApi = {
     }),
   putMySettings: (patch: UserSettingsPatch) =>
     request<{ settings: UserSettings }>("PUT", "/me/settings", patch),
+  // PRD #3263: the Models tab's one atomic save. A 400 lists every defect; read them with
+  // modelSettingsFieldErrors. A 500 reason distinguishes an unknown commit outcome from a
+  // committed save whose readback failed (modelSettingsFailureReason).
+  putMyModelSettings: (patch: ModelSettingsPatch) =>
+    request<ModelSettingsSaveResponse>("PUT", "/me/model-settings", patch),
   // Slack linking (PRD #25 M3), own-user only. member_id null clears the override
   // (falls back to email auto-match). A 409 from setMySlackOverride means the id is
   // already linked to another account.
@@ -1571,6 +1611,16 @@ const realApi = {
    */
   setRunMrRework: (id: string, enabled: boolean | null) =>
     request<{ run: Run }>("PUT", `/runs/${id}/mr-rework`, { enabled }),
+
+  /**
+   * Issue #4617: set (or clear) THIS run's per-run CI-autofix override. `true`/`false` is an
+   * explicit override; `null` clears back to inherit the owner's Settings default. Owner-scoped.
+   * The response carries the updated run plus, when another run on the branch governs the
+   * setting (ci_autofix_governing_run_id) or CI fixes are already in flight
+   * (ci_autofix_inflight_fix_run_ids, which keep their own setting), the ids to tell the owner.
+   */
+  setRunCiAutofix: (id: string, enabled: boolean | null) =>
+    request<SetRunCiAutofixResponse>("PUT", `/runs/${id}/ci-autofix`, { enabled }),
 
   /**
    * PRD #1202: start an ON-DEMAND MR-review-rework run for THIS run's open MR, right now.

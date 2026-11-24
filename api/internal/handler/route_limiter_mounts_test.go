@@ -315,6 +315,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/admin/egress-profiles", noLimiter},
 	{"PUT", "/api/admin/egress-profiles/{name}", noLimiter},
 	{"PUT", "/api/me/providers/claude-source", noLimiter},
+	// Issue #4323: owned local DB source selection, with no outbound probe.
+	{"PUT", "/api/me/providers/codex-source", noLimiter},
 	{"PUT", "/api/me/providers/{id}/key", noLimiter},
 	{"DELETE", "/api/admin/egress-profiles/{name}", noLimiter},
 	// PRD #685 M1: admin clear of a branding logo — cookie-only admin DB delete, no
@@ -1160,6 +1162,7 @@ var wantRouteMounts = []routeMount{
 	// write, and no status change. Unlike wait-on-limit it is mounted on RequireUser (D3),
 	// but the limiter dimension is the same.
 	{"PUT", "/api/runs/{id}/mr-rework", noLimiter},
+	{"PUT", "/api/runs/{id}/ci-autofix", noLimiter},
 	{"PUT", "/api/runs/{id}/wait-on-limit", noLimiter},
 	{"PUT", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},
 	{"PUT", "/api/skills/{id}", noLimiter},

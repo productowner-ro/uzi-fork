@@ -760,6 +760,7 @@ type ModelProviderRevision struct {
 	AuthStyle  string             `json:"auth_style"`
 	ModelMap   []byte             `json:"model_map"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	Engine     string             `json:"engine"`
 }
 
 type MrReviewAuthorQueue struct {
@@ -1436,6 +1437,7 @@ type Run struct {
 	CodexSwitchTargetMaterialRevision pgtype.Int8        `json:"codex_switch_target_material_revision"`
 	CodexSwitchTargetAccountKey       pgtype.Text        `json:"codex_switch_target_account_key"`
 	CodexSwitchTargetAccountRevision  pgtype.Int8        `json:"codex_switch_target_account_revision"`
+	CiAutofixEnabled                  pgtype.Bool        `json:"ci_autofix_enabled"`
 }
 
 type RunCompletionAttempt struct {
@@ -2076,6 +2078,7 @@ type User struct {
 	TaskReviewEffort          pgtype.Text        `json:"task_review_effort"`
 	CodexTaskReviewEffort     pgtype.Text        `json:"codex_task_review_effort"`
 	WeeklyWarningMarginPts    int16              `json:"weekly_warning_margin_pts"`
+	CodexProviderID           pgtype.UUID        `json:"codex_provider_id"`
 }
 
 type UserCrossCheckPin struct {

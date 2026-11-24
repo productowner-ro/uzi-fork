@@ -116,6 +116,8 @@ type Client interface {
 	// once cleared). An unusable provider (retired, keyless, not allowlisted) is a 409 with reason
 	// provider_source_unusable, an unknown or foreign one a 404.
 	SetClaudeProviderSource(ctx context.Context, id *string) (*string, error)
+	// SetCodexProviderSource selects or clears only the caller's Codex provider source.
+	SetCodexProviderSource(ctx context.Context, id *string) (*string, error)
 	// SetTokenAutoEligible opts one of the caller's Anthropic tokens into or out of
 	// the auto-selection pool (PRD #111 M2, D2): PATCH
 	// /api/me/secrets/anthropic_token/{id}/auto-eligible {auto_eligible}.
@@ -171,6 +173,11 @@ type Client interface {
 	// null`). No status guard: editable on a completed run for as long as its MR is open. A
 	// foreign/absent run is 404 → 4.
 	SetRunMrRework(ctx context.Context, id string, enabled *bool) (apitypes.RunDTO, error)
+	// SetRunCIAutofix sets the per-run CI-autofix override: PUT /api/runs/{id}/ci-autofix
+	// {enabled: bool|null}, RequireUser. Tri-state like SetRunMrRework (nil sends null =
+	// inherit). The reply also names the run that governs automatic CI fixes on the branch
+	// and the caller's in-flight ci_fix runs there. A foreign/unknown run is 404 → 4.
+	SetRunCIAutofix(ctx context.Context, id string, enabled *bool) (SetRunCIAutofixResult, error)
 	// RunRework starts ONE on-demand MR-rework cycle on a completed run whose MR is open,
 	// past the automatic cap (PRD #1202 M1): POST /api/runs/{id}/rework {guidance},
 	// RequireUser so a `uzc_` token reaches it. guidance is the optional operator note
