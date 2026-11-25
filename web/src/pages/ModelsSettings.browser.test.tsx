@@ -268,6 +268,53 @@ describe("Models grid layout", () => {
     },
   );
 
+  // #4665/#4671: a long model ID in a shown saved line (here the server resolves another value
+  // than the saved choice, so the line shows) wraps on a phone instead of widening the page, and
+  // the line and the Reset to default button stay at AA contrast.
+  it("wraps a long model ID inside its saved line at 390px", async () => {
+    const long = "acme-internal-finetune-claude-opus-distilled-2026-11-24-experiment-b";
+    mockApi.getEffectiveSettings.mockResolvedValue({
+      ...effective,
+      models: effective.models.map((m) =>
+        m.setting === "worker_model" && m.harness === "claude" ? { ...m, resolved_model: long } : m,
+      ),
+    } as EffectiveSettings);
+    await mount(390);
+    const cell = cellOf("Worker model — Claude");
+    const tag = cell.querySelector<HTMLElement>("[data-prediction]")!;
+    expect(tag.textContent).toContain(long);
+    expect(rect(tag).right).toBeLessThanOrEqual(rect(cell).right + 0.5);
+    // Wrapped: taller than one line of its own text.
+    expect(rect(tag).height).toBeGreaterThan(parseFloat(getComputedStyle(tag).lineHeight) * 1.5);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
+  });
+
+  it.each(["dawn", "hall", "shadow", "ember", "mission"])("keeps the saved line and Reset to default at AA contrast on %s", async (theme) => {
+    document.documentElement.setAttribute("data-theme", theme);
+    try {
+      await mount(1280);
+      // Default harness hides its value (automatic); Worker model — Codex is changed by mount().
+      for (const name of ["Default harness", "Worker model — Codex"]) {
+        const line = cellOf(name).querySelector<HTMLElement>("[data-prediction]")!;
+        expect(textContrast(line), `${theme} ${name}`).toBeGreaterThanOrEqual(4.5);
+      }
+      // A saved override the select already shows: no visible line, a Reset button instead.
+      expect(cellOf("Worker model — Claude").querySelector("[data-prediction]")).toBeNull();
+      const reset = screen.getByRole("button", { name: "Reset to default (Worker model — Claude)" });
+      expect(textContrast(reset), `${theme} reset`).toBeGreaterThanOrEqual(4.5);
+    } finally {
+      document.documentElement.removeAttribute("data-theme");
+    }
+  });
+
+  // #4665/#4671: the visible line is split or hidden; the COMPUTED description must still be one
+  // sentence, clean (line hidden) and dirty (mount() leaves Worker model — Codex changed).
+  it("computes the saved prediction as one description sentence, clean and dirty", async () => {
+    await mount(1280);
+    expect(screen.getByRole("combobox", { name: "Worker model — Claude", description: /^Saved effective value: sonnet · your choice$/ })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Worker model — Codex", description: /^Saved effective value: gpt-6\.2-sol · built-in, Unsaved$/ })).toBeTruthy();
+  });
+
   it("computes every control's accessible name as <Row> — <Family>", async () => {
     await mount(1024);
     for (const name of NAMES) {

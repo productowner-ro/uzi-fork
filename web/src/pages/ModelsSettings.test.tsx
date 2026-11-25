@@ -137,6 +137,28 @@ function describedText(name: string): string {
   return ids.map((id) => document.getElementById(id)?.textContent ?? "").join(" | ");
 }
 
+// The visible saved-prediction tag (#4665), apart from the accessible description around it.
+function savedLine(name: string): HTMLElement {
+  const [savedId] = (control(name).getAttribute("aria-describedby") ?? "").split(" ");
+  const el = document.getElementById(savedId);
+  if (!el) throw new Error(`${name}: no saved-prediction element`);
+  return el;
+}
+
+function tag(name: string): HTMLElement {
+  const el = savedLine(name).querySelector<HTMLElement>("[data-prediction]");
+  if (!el) throw new Error(`${name}: no visible saved value`);
+  return el;
+}
+
+// The words of the prediction line a sighted user sees: everything outside .sr-only ("" when
+// the control already shows the saved value and the line is hidden, #4671).
+function visibleLine(name: string): string {
+  const line = savedLine(name).cloneNode(true) as HTMLElement;
+  line.querySelectorAll(".sr-only").forEach((el) => el.remove());
+  return Array.from(line.children).map((el) => el.textContent).join(" ");
+}
+
 beforeEach(() => {
   auth.set({ id: "u1" });
   mockApi.getMySettings.mockResolvedValue({ settings: makeSettings() });
@@ -190,6 +212,83 @@ describe("Models page", () => {
     expect(describedText("Worker model — Codex")).toContain("Saved effective value: gpt-6-sol · your choice");
     expect(describedText("Worker model — Codex")).not.toContain("Unsaved");
     expect(saveButton().disabled).toBe(true);
+  });
+
+  // #4665: one card per group, each its own container-query context, so a group never reads
+  // as just another row; Default harness stays in the intro card above them.
+  it("renders each model group in its own card", async () => {
+    mount();
+    await screen.findByLabelText("Worker model — Claude");
+    const cards = ["Worker runs", "Planning", "Helper runs", "Cross-check"].map((name) => {
+      const card = screen.getByRole("group", { name }).closest<HTMLElement>("[id^='models-card-']");
+      expect(card, name).not.toBeNull();
+      expect(card!.className, name).toContain("@container");
+      expect(screen.getByRole("heading", { name }).closest("[id^='models-card-']"), name).toBe(card);
+      return card;
+    });
+    expect(new Set(cards).size).toBe(4);
+    expect(control("Default harness").closest("[id^='models-card-']")).toBeNull();
+    expect(control("Worker model — Claude").closest("[id^='models-card-']")).toBe(cards[0]);
+    expect(control("Code cross-check effort — Codex").closest("[id^='models-card-']")).toBe(cards[3]);
+  });
+
+  // #4665: the cell shows its prediction as a compact tag; the "Saved effective value:" wording
+  // lives only in the accessible description.
+  it("shows the saved value only where the control does not, and keeps the full wording for assistive tech", async () => {
+    mount();
+    await screen.findByLabelText("Default harness");
+    // Default · automatic hides which harness a run gets, so the line names it.
+    expect(tag("Default harness").textContent).toBe("Claude · automatic");
+    expect(visibleLine("Default harness")).toBe("\u2192 Claude · automatic");
+    // The COMPUTED description (what assistive tech receives), not just the referenced text.
+    expect(screen.getByRole("combobox", { description: /^Saved effective value: Claude · automatic$/ })).toBe(control("Default harness"));
+    // "Default · opus (lead template)" already says what the line would: no visible line, same description.
+    expect(control("Worker model — Claude").selectedOptions[0].text).toBe("Default · opus (lead template)");
+    expect(visibleLine("Worker model — Claude")).toBe("");
+    expect(screen.getAllByRole("combobox", { description: /^Saved effective value: opus · lead template$/ })).toContain(control("Worker model — Claude"));
+
+    // A dirty cell shows the SAVED prediction, says so visibly, and marks itself Unsaved.
+    select("Worker model — Codex", "gpt-6-sol");
+    expect(tag("Worker model — Codex").textContent).toBe("gpt-6.2-sol · built-in");
+    expect(visibleLine("Worker model — Codex")).toBe("Saved \u2192 gpt-6.2-sol · built-in Unsaved");
+    expect(describedText("Worker model — Codex")).toContain("Saved effective value: gpt-6.2-sol · built-in");
+    expect(
+      screen.getByRole("combobox", { description: /^Saved effective value: gpt-6\.2-sol · built-in, Unsaved\b/ }),
+    ).toBe(control("Worker model — Codex"));
+  });
+
+  it("offers Reset to default on a saved override: it edits the draft, keeps focus, and one Save clears it", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: makeSettings({ default_claude_model: "sonnet" }) });
+    mockApi.getEffectiveSettings.mockResolvedValue(makeEffective({ claudeModel: "sonnet" }));
+    mockApi.putMyModelSettings.mockResolvedValue({ settings: makeSettings(), effective: makeEffective() });
+    mount();
+    await screen.findByLabelText("Worker model — Claude");
+    // Only a saved override offers it: the Default Codex cell has none.
+    expect(screen.queryByRole("button", { name: "Reset to default (Worker model — Codex)" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default (Worker model — Claude)" }));
+    expect(control("Worker model — Claude").value).toBe("inherit");
+    expect(document.activeElement).toBe(control("Worker model — Claude"));
+    expect(screen.queryByRole("button", { name: "Reset to default (Worker model — Claude)" })).toBeNull();
+    expect(visibleLine("Worker model — Claude")).toContain("Unsaved");
+    expect(status()).toBe("1 unsaved change: Worker model — Claude");
+    // Discard restores the override and its button.
+    fireEvent.click(discardButton());
+    expect(control("Worker model — Claude").value).toBe("sonnet");
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default (Worker model — Claude)" }));
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(1));
+    expect(mockApi.putMyModelSettings).toHaveBeenCalledWith({ default_claude_model: null });
+  });
+
+  it("Reset to default clears a saved custom model ID and leaves custom mode", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: makeSettings({ default_claude_model: "claude-x-1" }) });
+    mount();
+    await screen.findByLabelText("Worker model — Claude, custom model ID");
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default (Worker model — Claude)" }));
+    expect(screen.queryByLabelText("Worker model — Claude, custom model ID")).toBeNull();
+    expect(control("Worker model — Claude").value).toBe("inherit");
+    expect(document.activeElement).toBe(control("Worker model — Claude"));
+    expect(saveButton().disabled).toBe(false);
   });
 
   it("labels the saved prediction as saved and marks a changed cell Unsaved", async () => {
@@ -588,6 +687,7 @@ describe("Models page", () => {
     mount();
     await screen.findByLabelText("Worker model — Codex");
     expect(describedText("Worker model — Claude")).toContain("Saved effective value: Unavailable");
+    expect(tag("Worker model — Claude").textContent).toBe("Unavailable");
     select("Worker model — Codex", "gpt-6-sol");
     fireEvent.click(saveButton());
     await within(bar()).findByText(/Saved\. Every change committed, but the new effective values could not be read/);
