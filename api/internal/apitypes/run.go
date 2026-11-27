@@ -246,9 +246,19 @@ type HarnessDecisionDTO struct {
 // CreatedIssueDTO is a confirmed issue created by this scheduled prompt run.
 // WebURL is empty when the stored repository URL cannot safely form a link.
 type CreatedIssueDTO struct {
-	IID    int64  `json:"iid"`
-	Title  string `json:"title"`
-	WebURL string `json:"web_url"`
+	IID int64 `json:"iid"`
+	// IssueKey is the issue tracker key of IID on a linked repo, omitted otherwise (PRD #4173 M6).
+	IssueKey string `json:"issue_key,omitempty"`
+	Title    string `json:"title"`
+	WebURL   string `json:"web_url"`
+}
+
+// InjectedEnvVarDTO names one run environment variable the run's current claim delivered
+// (PRD #4416 M2): never a value, a hash or a version. Owner-only, detail read only.
+type InjectedEnvVarDTO struct {
+	Name   string `json:"name"`
+	Scope  string `json:"scope"`
+	Secret bool   `json:"secret"`
 }
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
@@ -267,6 +277,9 @@ type RunDTO struct {
 	MilestoneReconciliationsNextBeforeGateRevision *int64                `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
 	WorkerRecovery                                 *WorkerRecoveryDTO    `json:"worker_recovery,omitempty"`
 	MemoryHold                                     *MemoryHoldDTO        `json:"memory_hold,omitempty"`
+	// InjectedEnv lists the run environment variables the current claim generation delivered:
+	// names, scope and the secret flag. Detail read, run owner only; never on the worker DTO.
+	InjectedEnv []InjectedEnvVarDTO `json:"injected_env,omitempty"`
 	// WeeklyLimit is the owner-only weekly-limit block (PRD #4123); absent unless the run's vendor
 	// credential is in a weekly-limit park.
 	WeeklyLimit *WeeklyLimitDTO `json:"weekly_limit,omitempty"`
@@ -287,8 +300,11 @@ type RunDTO struct {
 	// set for the issue-shaped kinds (issue, self_improve); the ci_fix fields below carry
 	// pipeline context, chat carries Title, and a task (uzi handoff) carries
 	// Branch/BaseBranch/OpenMr set at create.
-	Kind              string `json:"kind"`
-	IssueIID          *int64 `json:"issue_iid"`
+	Kind     string `json:"kind"`
+	IssueIID *int64 `json:"issue_iid"`
+	// IssueKey is the issue tracker key ("ABC-12") of IssueIID on a repo linked to an issue
+	// tracker (PRD #4173 M6): omitted for an unlinked repo and for a run with no issue.
+	IssueKey          string `json:"issue_key,omitempty"`
 	ContinuedIssueIID *int64 `json:"continued_issue_iid"`
 	IssueTitle        string `json:"issue_title"`
 	IssueDescription  string `json:"issue_description"`
@@ -961,7 +977,7 @@ type RunDTO struct {
 	// RecoveryWaitCause is the TYPED cause of a 'recovery_wait' park (PRD #1392 M1). Null is
 	// the LEGACY/untyped park — the empty-turn park writes NULL (D9), so a client must render
 	// null as the generic "waiting to retry" wording, NOT as any particular cause. Today the
-	// non-null values are "forge_unreachable" (the forge stayed unreachable at clone),
+	// non-null values are "forge_unreachable" (the forge could not be reached: at clone or fetch, during publication, or, for a started run, by the api's guardrail read at claim, issue #4689),
 	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
@@ -1299,8 +1315,11 @@ type RunSummaryItemDTO struct {
 	// set for the issue-shaped kinds (issue, self_improve); the ci_fix fields below carry
 	// pipeline context, chat carries Title, and a task (uzi handoff) carries
 	// Branch/BaseBranch/OpenMr set at create.
-	Kind              string `json:"kind"`
-	IssueIID          *int64 `json:"issue_iid"`
+	Kind     string `json:"kind"`
+	IssueIID *int64 `json:"issue_iid"`
+	// IssueKey is the issue tracker key ("ABC-12") of IssueIID on a repo linked to an issue
+	// tracker (PRD #4173 M6): omitted for an unlinked repo and for a run with no issue.
+	IssueKey          string `json:"issue_key,omitempty"`
 	ContinuedIssueIID *int64 `json:"continued_issue_iid"`
 	IssueTitle        string `json:"issue_title"`
 	// Harness is the run's ACTUAL execution harness (PRD #1429 M1 / D2), the stored
@@ -1936,7 +1955,7 @@ type RunSummaryItemDTO struct {
 	// RecoveryWaitCause is the TYPED cause of a 'recovery_wait' park (PRD #1392 M1). Null is
 	// the LEGACY/untyped park — the empty-turn park writes NULL (D9), so a client must render
 	// null as the generic "waiting to retry" wording, NOT as any particular cause. Today the
-	// non-null values are "forge_unreachable" (the forge stayed unreachable at clone),
+	// non-null values are "forge_unreachable" (the forge could not be reached: at clone or fetch, during publication, or, for a started run, by the api's guardrail read at claim, issue #4689),
 	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
@@ -2187,6 +2206,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		ForgeType:                     item.ForgeType,
 		Kind:                          item.Kind,
 		IssueIID:                      item.IssueIID,
+		IssueKey:                      item.IssueKey,
 		ContinuedIssueIID:             item.ContinuedIssueIID,
 		IssueTitle:                    item.IssueTitle,
 		Harness:                       item.Harness,
@@ -2385,6 +2405,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			ForgeType:                     s.ForgeType,
 			Kind:                          s.Kind,
 			IssueIID:                      s.IssueIID,
+			IssueKey:                      s.IssueKey,
 			ContinuedIssueIID:             s.ContinuedIssueIID,
 			IssueTitle:                    s.IssueTitle,
 			Harness:                       s.Harness,

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -22,6 +21,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
@@ -209,7 +209,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// repos → forge_connections and returns no rows for a repo-less judge run, which
 	// the no-rows branch below would then fail as an owner mismatch, #1691)
 	// and before the bot-PAT open. A vendor judge's claim carries only the Anthropic token; a
-	// provider-bound Claude judge carries only its frozen provider binding, and a provider refusal
+	// provider-bound judge (Claude or Codex) carries only its frozen provider binding, and a provider refusal
 	// fails it terminally (credential_unavailable) rather than parking it (PRD #4322 D-G).
 	// PRD #1906 M3: a profile-bound run (runs.egress_profile_id) is claimed only as an
 	// isolated research claim (isolateClaim, at the end). Refuse, before anything is opened,
@@ -221,9 +221,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, errIsolatedClaimRefused
 	}
 	// Provider claims support ordinary engine-aware lanes only; refuse unsupported
-	// shapes before context or credential reads, without entering a vendor ladder. A Claude judge
-	// is supported (PRD #4322 M1a); a provider-bound Codex judge stays refused here until #4574.
-	if providerBoundRun(run) && ((run.Kind == runkind.Judge && run.Harness != harnessClaude) || run.Kind == runkind.Job || run.Kind == runkind.CrossCheck ||
+	// shapes before context or credential reads, without entering a vendor ladder. A Claude or
+	// Codex judge is supported (PRD #4322 M1a, #4574 M1); the worker capability check below gates it.
+	// A Claude job is supported (PRD #4322 M1b); a provider-bound Codex job (a data error) stays refused,
+	// and a profile-bound (isolated) provider job is refused by the isolated term.
+	if providerBoundRun(run) && ((run.Kind == runkind.Job && run.Harness != harnessClaude) || run.Kind == runkind.CrossCheck ||
 		isolated || (run.Harness != harnessClaude && run.Harness != harnessCodex) ||
 		(run.Harness == harnessCodex && run.Kind == runkind.Chat)) {
 		return nil, errProviderLaneClaimRefused
@@ -347,6 +349,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			Overridden: rc.GuardrailOverrideReason.Valid,
 		})
 		if res.Blocked {
+			if class, ok := res.TransientForgeCause(); ok {
+				// The only blocker is an unreadable forge that may recover: finishRunClaimTx parks a
+				// started run on it instead of failing it terminally.
+				return nil, guardrailForgeTransientError{
+					class: class,
+					msg:   errGuardrailBlockedClaim.Error() + ": " + strings.Join(res.BlockMessages(), "; "),
+				}
+			}
 			return nil, fmt.Errorf("%w: %s", errGuardrailBlockedClaim, strings.Join(res.BlockMessages(), "; "))
 		}
 	}
@@ -1150,6 +1160,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// so a run's credential history is complete for both harnesses.
 	}
 
+	// PRD #4416 M2: the run environment variables of a lead-lane run. Isolated runs are excluded
+	// (RunEnvDelivered), and stripForIsolation clears both lists as a backstop. The snapshot of
+	// what was delivered rides unexported on the payload for finishRunClaimTx's re-check.
+	// A Codex claim has minted its capability by now, so the failure carries the minted identity
+	// (the cross-check lane's crossCheckAssemblyError idiom) for finishRunClaimTx to settle.
+	if err := s.attachRunEnv(ctx, wkr, run, payload); err != nil {
+		return nil, crossCheckAssemblyError(payload, err)
+	}
+
 	// PRD #1798 D9: the existing PR's description record, for a PR-producing run whose PR
 	// already exists. Best-effort (a read error omits it); nil keeps the wire unchanged.
 	// Skipped for a profile-bound run (it has no PR, and stripForIsolation clears it anyway).
@@ -1493,6 +1512,19 @@ func (e legacyReviewClaimError) Error() string {
 
 func (e legacyReviewClaimError) Unwrap() error { return errGuardrailBlockedClaim }
 
+// guardrailForgeTransientError is the claim-time guardrail block whose only cause is an unreadable
+// forge that may recover (privcheck.GuardResult.TransientForgeCause). It reads exactly like the
+// terminal block and unwraps to errGuardrailBlockedClaim, so a never-started run, a kind that cannot
+// park, or any caller that does not look for it fails the run as before; finishRunClaimTx parks a
+// started run instead. It carries no transport error, only the scrubbed class.
+type guardrailForgeTransientError struct {
+	class forge.ErrorClass
+	msg   string
+}
+
+func (e guardrailForgeTransientError) Error() string { return e.msg }
+func (e guardrailForgeTransientError) Unwrap() error { return errGuardrailBlockedClaim }
+
 // planCrossCheckCodexLeadSupported reports whether the claim should carry
 // plan_cross_check_codex_lead: this api accepts a Codex lead's checked-plan submission,
 // so the signal is set for a Codex run that requires the cross-check, or (PRD #3708) is
@@ -1602,7 +1634,7 @@ func linkedIssueKey(run store.Run, projectShort pgtype.Text) string {
 	if run.Kind != runkind.Issue || !run.IssueIid.Valid || !projectShort.Valid || projectShort.String == "" {
 		return ""
 	}
-	return projectShort.String + "-" + strconv.FormatInt(run.IssueIid.Int64, 10)
+	return issuetracker.IssueKey(projectShort.String, run.IssueIid.Int64)
 }
 
 // phaseModelsCapability selects the protocol for the run's harness.

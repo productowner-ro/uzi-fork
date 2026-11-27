@@ -537,8 +537,14 @@ vendor fallback. A provider run's claim carries one `provider` object and no
 `anthropic_oauth_token`; the worker maps it onto the SDK env in `buildSdkEnv`. Issue runs wait out
 a gateway 429 or overload as `limit_wait` (`provider_gateway_limit`) on a 1, 5, 15 minute
 schedule and then for the owner; chat ends the turn instead. Usage is recorded with
-`cost_status='unreported'`. The job, cross-check and isolated lanes refuse provider-sourced
-owners (`provider_lane_unsupported`). The judge no longer does for Claude (PRD #4322 M1a): its
+`cost_status='unreported'`. The cross-check and isolated lanes refuse provider-sourced
+owners (`provider_lane_unsupported`), as does a site-list job. An ordinary job (no `egress_profile`) no
+longer does (PRD #4322 M1b): `CreateJobRun` freezes the owner's Claude source under the secret-mutation lock
+and validates one canonical job model, its claim carries only the provider binding (no Anthropic token or
+run credential epoch) and needs `claude_provider_job_v1` plus `claude_provider_v1` on a non-Docker worker,
+a provider refusal fails it as `credential_unavailable` and a gateway limit fails it (jobs never park),
+and the worker scrubs the bound key from results and scans every output file for its bytes (byte-exact only;
+accidental-publication protection, not a defence against the job's own agent). The judge no longer refuses for Claude (PRD #4322 M1a): its
 lane decision (`decideJudgeLane`, taken under the shared secret-mutation lock in `createRunAtomic`)
 freezes the owner's Claude source onto the judge in the creation transaction, unless the owner pinned
 a vendor Anthropic token (`judgeLaneDecision.Vendor` from `decideJudgeLane`, which sends the provider run's trace to Anthropic). A provider
@@ -548,6 +554,19 @@ revocation or an unmapped model at assembly or the final locked re-check fails i
 (`credential_unavailable`), never parked, and a gateway limit fails it with fixed text. It sends the
 judged trace, a vendor run's included, to the gateway. Design: [PRD #4322](prds/4322-custom-providers-server-lanes.md);
 user docs: [docs/judge.md](docs/judge.md#a-judge-on-a-model-provider).
+
+The Codex judge follows the same freeze (PRD #4574 M1): for an owner whose Codex source is a provider,
+the creation transaction freezes that provider and revision onto the judge, with no vendor fallback and
+no pin that keeps it a vendor judge (a source change between decision and freeze fails creation with
+`ErrJudgePolicyChanged`). The claim carries only the provider binding and needs `codex_provider_judge_v1`
+(claim, placement, wake, reap, demand, health). The worker resolves the server-sent Codex judge model
+through the provider's map (exact key, else the required `default`; a map without `default` is an unusable
+source, never `provider_model_unmapped`). A typed settlement seam on the Codex pass classifies terminals:
+a gateway 429/529 fails the judge with `provider_gateway_limit` and no review, a revoked binding is
+`credential_unavailable`, timeouts, aborts and unclassified errors fail with no review, and other
+classified errors keep the scrubbed fallback review. The judged trace goes to the Codex gateway and any
+redirect it issues. User docs:
+[docs/judge.md](docs/judge.md#a-codex-judge-on-a-model-provider).
 
 The Test probe is dialed from the api, ignores proxy variables, never follows a redirect and
 admits private gateway ranges (refusing link-local, metadata, unspecified and, without the dev
@@ -578,22 +597,25 @@ with the Codex harness capabilities; the api admits the claim only to a worker w
 The issue/task/prompt/self_improve lane, its in-run advice, summary and task-review passes, and
 retries, resume and cold resume use the frozen binding (provider, revision, key `enablement_rev`);
 `mr_rework` and follow-ups inherit it, CI-fix and handoff resolve the owner's current Codex source.
-Interim refusals (`provider_lane_unsupported`, follow-up #4574): the Codex judge is skipped for an
-owner with a Codex source (an owner with only a Claude source gets a vendor Codex judge since PRD
-#4322 M1a; earlier rows for a Claude judge with a Claude source are historical), plan and code cross-check refuse when either side is Codex-provider
+Interim refusals (`provider_lane_unsupported`, follow-up #4574 M2): the Codex judge half is resolved
+(#4574 M1: a Codex-source owner's judge runs on the provider; earlier skip rows are historical), and
+plan and code cross-check refuse when either side is Codex-provider
 bound (a Claude lead with plan cross-check owned by someone with a Codex source gets a human plan
 gate), and jobs and chat stay Claude-only. The pinned runtime follows redirects and does not bound
 model-response ingestion (accepted, owner decisions 2026-11-19 and 2026-11-22);
 [ADR-4320, Codex engine](adr/4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23)
 records the claim ordering and recovery model.
 
-**Admin-shared definitions (PRD #4324).** An admin can publish a keyless Claude definition
-(`owner_user_id IS NULL`, `credential_mode = 'per_user_key'`) from Admin → Shared providers. Every
-user sees it next to their own providers, attaches their own sealed key and selects it as their
-Claude source; the admin never sees a key. Endpoint and auth style are fixed at creation (admin
-edits change only the name and model map), keys and selections are pinned to the definition's
-scope by composite foreign keys to `model_providers (scope_owner_id, id)`, Test results are kept
-per user, and delete is refused while anyone has it selected. Codex shared definitions are #4633.
+**Admin-shared definitions (PRD #4324).** An admin can publish a keyless Claude or Codex definition
+(`owner_user_id IS NULL`, `credential_mode = 'per_user_key'`) from Admin → Shared providers; the
+engine is chosen at creation and never changes. Every user sees it next to their own providers,
+attaches their own sealed key and selects it as their Claude or Codex source; uzi's admin UI and API never show
+a key (whoever operates the gateway receives it), and a Codex definition's admin-chosen URL receives every recipient's key (the accepted
+redirect risk). Endpoint and auth style are fixed at creation (admin
+edits change only the name and model map), keys and selections (Claude and, since #4633, Codex)
+are pinned to the definition's scope by composite foreign keys to `model_providers (scope_owner_id, id)`,
+Test results are kept per user, and delete is refused while anyone has it selected. With no usable
+key a run is refused, never sent on the vendor credential.
 Design record, lock orders and migration failure model:
 [adr/4324-admin-shared-providers.md](adr/4324-admin-shared-providers.md).
 
@@ -616,7 +638,12 @@ per-token readings — and the SPA renders them as meters in three places: a
 Settings card, a sidebar micro-meter, and an Admin → Rate limits table. See
 [prds/done/53-rate-limits.md](prds/done/53-rate-limits.md) (especially its Design
 Decisions) for the full rationale, including the vault-locked staleness
-rule and the failure/backoff semantics; user-facing behavior is in
+rule and the failure/backoff semantics; the gauges keep no history themselves,
+but every accepted reading is also copied best effort, after the gauge write,
+into raw five-minute `anthropic_usage_samples` / `codex_usage_samples` rows with
+no default deletion (PRD #4692,
+[prds/done/4692-provider-usage-limit-history.md](prds/done/4692-provider-usage-limit-history.md),
+[docs/provider-usage-history.md](docs/provider-usage-history.md)); user-facing behavior is in
 [docs/rate-limits.md](docs/rate-limits.md).
 
 ## Codex account rate-limit visibility (PRD #1209)
@@ -2226,12 +2253,22 @@ defense-in-depth *on top of* this, not instead of it):
    whose values are readable on argv in the process table). The PAT is never
    written to on-disk git config and never enters the agent subprocess's
    environment.
-3. **The agent subprocess** (the Claude Agent SDK's own process) gets *only*
-   `CLAUDE_CODE_OAUTH_TOKEN`, `HOME`, `PATH` — none of the worker's own env
-   (join token, PAT) is inherited; `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`
-   are explicitly unset so they can't outrank the OAuth token. The agent only
-   edits files and makes local commits; when it signals done, the worker
-   performs the push and MR.
+3. **The agent subprocess** (the Claude Agent SDK's own process) gets a
+   replacement environment built by `buildSdkEnv`: the worker-set keys
+   (`CLAUDE_CODE_OAUTH_TOKEN`, `HOME`, `PATH`, …) plus, on a lead-lane run,
+   the repo's run environment variables ([ADR-4416](adr/4416-run-env-vars.md)).
+   None of the worker's own env (join token, PAT) is inherited;
+   `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` are explicitly unset so they
+   can't outrank the OAuth token. Repo variables are folded in at the lowest
+   precedence. Existing keys, protected git-config carriers and names denied by
+   the pinned rules (`fixtures/run-env/name-rules.json`) are dropped. The rules
+   reserve worker credentials and harness controls; allowed application-setting
+   overlaps are recorded in ADR-4416. The agent can read every value it is
+   given. Output redaction and publication checks cover the registered secret
+   forms; an incomplete publication scan withholds the publish. Exact-match and
+   multiline limitations are recorded in ADR-4416. The agent only edits
+   files and makes local commits; when it signals done, the worker performs the
+   push and MR.
 
 This means "worker disk/agent env contain no PAT" (a Success Criterion) holds
 structurally, not by policy — the agent has no credential to push with in the
@@ -2752,6 +2789,10 @@ trust boundary](#serverworker-trust-boundary) and
 under PRD #58: there is now a published worker image too
 (`.../uzi/agent-{base,jvm}:<tag>`, built on every `v*` tag), and an optional
 in-cluster alternative — see the next section.
+
+### Runtime web modules (PRD #4686)
+
+Operators can add trusted UI modules to the web app without rebuilding the web image. The list is deployment configuration (chart `web.modules[]`, or the compose generator `scripts/web-modules-gen.py`), rendered into files the `web` nginx reads at start: `/modules.json` (the public list the SPA fetches) and one `location ^~ /modules/<id>/` proxy per module, resolved at request time. The SPA registers each module with the Module Federation runtime and loads its page on first visit; failures stay on that page. The `api` is not involved: there is no new endpoint, privilege or credential, and no trust boundary beyond the module itself, which runs with full page authority as the signed-in user and is the operator's trust decision (`/modules.json` and module files are unauthenticated). Module locations drop session headers and the upstream's cache, cookie and security headers, and the CSP stays `script-src 'self'`. Operator reference: [docs/web-modules.md](docs/web-modules.md); module authors: [docs/web-modules-dev.md](docs/web-modules-dev.md); rationale: [prds/done/4686-runtime-web-modules.md](prds/done/4686-runtime-web-modules.md).
 
 ### Worker controller (k8s only)
 

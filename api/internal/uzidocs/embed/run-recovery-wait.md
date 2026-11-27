@@ -776,6 +776,42 @@ is not treated as proof that the run ended. The same applies to the
 data-volume park and to a claim already enrolled for publication whose clone
 fails; the later publishing park below is a separate path.
 
+### Refused by the guardrail at claim
+
+The default-branch guardrail also runs when uzi assigns a run to a worker.
+If the **api** could not read the forge at that moment (verifying the bot
+token, or reading the default branch's protection, including a GitHub
+ruleset) because of a timeout, a 5xx, a rate limit, or a network failure
+(connection refused, reset or unreachable, or a temporary DNS failure), the
+guardrail still refuses fail-closed: no payload and no credential reach the
+worker.
+
+What happens next depends on the run:
+
+- **A run that has already started once parks** in `recovery_wait` with
+  cause `forge_unreachable`, but only when that unreadable protection is the
+  only blocking finding. A run that never started fails with
+  `guardrail_blocked`, as before.
+- **An ordinary started run** counts against `forge_park_count` and
+  `RUN_FORGE_UNREACHABLE_MAX_PARKS` (`0` = unlimited) with the usual backoff.
+  At the cap it holds for owner **Resume** with a NULL retry time.
+- **A publication-enrolled run** keeps its publication phase, intent,
+  custodian worker, handoff and episode clock, and leaves `forge_park_count`
+  unchanged. It is bounded by `RUN_PROVIDER_PARK_MAX_DURATION` instead: at
+  that bound it holds for owner Resume with `publication_retry_exhausted`.
+  After Resume the next park starts a new episode clock.
+- **No worker cooldown and no worker health evidence is recorded**, because
+  the failed read happened on the api, not on the worker. The claim's own
+  half-open reservations are released by the existing lifecycle cleanup.
+
+Everything else still fails immediately as `guardrail_blocked`: an auth
+failure (401/403, a revoked or expired token), an unprotected branch or any
+other blocking finding, a client-build failure, an unknown error class,
+NXDOMAIN, certificate/TLS and address errors, a cancelled forge call, and a stop
+or cancel requested during the claim. If the claim request itself is
+cancelled or its deadline expires, nothing is written and the run stays claimed for the sweeper. See
+[ADR-1392](../adr/1392-forge-unreachable-preclone-park.md) for the design.
+
 ## Forge unreachable while publishing
 
 A run whose work is finished can meet the same kind of forge outage at
@@ -788,17 +824,24 @@ permission errors, history or movement proofs, local git errors, aborts and
 residue blocks. The hops after the merge request exists are unchanged and
 are not covered: description publish, title read/write and PR-head verify.
 
-Two refusals that look permanent are retried: a push refused only with git's
-bare `! [remote rejected] <src> -> <dst> (failed)` or
+Three refusals that look permanent are retried. Two are a push refused only
+with git's bare `! [remote rejected] <src> -> <dst> (failed)` or
 `! [remote rejected] <src> -> <dst> (missing necessary objects)` line, with no
 other diagnostic (both observed from GitHub; reasons undocumented, and whether
-they are transient is unproven). Either is treated as
+they are transient is unproven). The third is GitHub's server error:
+`! [remote rejected] <src> -> <dst> (Internal Server Error)` together with its
+complete banner, the three lines `remote: Internal Server Error`,
+`remote: Request ID <uppercase hex groups joined by colons>` and `remote: Time <UTC timestamp>`, each exactly
+once. An `(Internal Server Error)` line without that banner, a partial or
+repeated banner, a second ref line or any other non-empty `remote:` line
+(an empty `remote:` line is ordinary framing) stays permanent, and a banner beside a `(failed)` or
+`(missing necessary objects)` line keeps that push permanent. Each retried refusal is treated as
 transient and the same non-forced push is retried on the same schedule, with
 the full publication proof on every attempt. If it keeps failing, it is
 classified `publication_forge_unreachable` like any other exhausted push. Any
 other reason, a `[rejected]` line, authentication, protected-branch or hook
 refusals, workflow scope and push protection stay permanent. A deterministic
-refusal that prints only one of those two reasons is therefore retried too: a run that is not
+refusal that prints only one of those shapes is therefore retried too: a run that is not
 enrolled pays about 31 s of backoff before failing, and an enrolled run retries
 until a publication park at or past the hold threshold
 (`RUN_PROVIDER_PARK_MAX_DURATION`); the threshold is checked only at park

@@ -31,6 +31,7 @@ import { AdminBlockedRepos } from "./pages/AdminBlockedRepos";
 import { AdminEgressProfiles } from "./pages/AdminEgressProfiles";
 import { AdminSharedProviders } from "./pages/AdminSharedProviders";
 import { ForgeSettings } from "./pages/ForgeSettings";
+import { IssueTrackerSettings } from "./pages/IssueTrackerSettings";
 import { Repos } from "./pages/Repos";
 import { Board } from "./pages/Board";
 import { IssueView } from "./pages/IssueView";
@@ -43,6 +44,7 @@ import { ChatList, ChatConversation } from "./pages/Chat";
 import { WorkersSettings } from "./pages/WorkersSettings";
 import { Docs } from "./pages/Docs";
 import { DocPage } from "./pages/DocPage";
+import { ModulePage } from "./modules/ModulePage";
 
 // The guard wrapping a route's page. "public" means the page renders with NO
 // guard (still inside AppShell) — the docs pages, the CLI-auth and Connect consent pages,
@@ -121,6 +123,8 @@ export const APP_ROUTES: AppRoute[] = [
   // Run-behavior defaults, split out of the overloaded Account tab.
   { path: "/settings/run-defaults", element: <RunDefaults />, guard: "protected" },
   { path: "/settings/forge", element: <ForgeSettings />, guard: "protected" },
+  // External issue tracker connections (PRD #4173 M6).
+  { path: "/settings/issue-trackers", element: <IssueTrackerSettings />, guard: "protected" },
   { path: "/workers", element: <WorkersSettings />, guard: "protected" },
   { path: "/settings/access", element: <AccessSettings />, guard: "protected" },
   { path: "/settings/memory", element: <MemorySettings />, guard: "protected" },
@@ -153,6 +157,10 @@ export const APP_ROUTES: AppRoute[] = [
     guard: "protected",
     sample: "/repos/repo-uzi/issues/31",
   },
+  // PRD #4686: runtime web modules. One generic route; ModulePage resolves the id against
+  // /modules.json and adds AdminRoute for an adminOnly module. No `sample`: there is no
+  // fixture module, so the route smoke test mounts the bare pattern (the unknown-module view).
+  { path: "/m/:id/*", element: <ModulePage />, guard: "protected" },
   // Admin.
   { path: "/admin/users", element: <AdminUsers />, guard: "admin" },
   { path: "/admin/rate-limits", element: <AdminRateLimits />, guard: "admin" },

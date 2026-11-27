@@ -47,6 +47,8 @@ cd api && ../scripts/sqlc.sh v1.31.1 generate
 | `fixtures/code-cross-check/` | `api/internal/handler/code_cross_check_contract_test.go`, `agent/test/code-cross-check-wire.test.ts` |
 | `fixtures/claims/resume-unapproved-no-session.json` | `api/internal/workersvc/resume_unapproved_claim_livedb_test.go`, `agent/test/runner-gate-verdict-interruption.test.ts` |
 | `fixtures/claims/claim-response-limit.json` | `api/internal/workersvc/claim_size_test.go`, `agent/test/client-claim-response-bound.test.ts` |
+| `fixtures/claims/run-env-claim.json` | `api/internal/workersvc/run_env_claim_wire_test.go`, `agent/test/run-env-claim.test.ts` |
+| `fixtures/claims/run-env-redact-response.json` | `api/internal/workersvc/run_env_claim_wire_test.go`, `agent/test/run-env-claim.test.ts` |
 | `fixtures/run-start-options/cases.json` | `api/internal/handler/run_start_options_livedb_test.go` (LiveDB; the web mock test joins it in M2) |
 | `fixtures/forge-api-origin/cases.json` | `api/internal/store/forge_api_origin_livedb_test.go` (LiveDB), `agent/test/forge-api-origin-parity.test.ts` |
 | `fixtures/recovery-archive-redundancy/vectors.json` | `api/internal/workersvc/archive_redundancy_test.go`, `agent/test/recovery-archive-redundancy.test.ts` |
@@ -221,6 +223,7 @@ task vet:controller                        # or build:controller, individually
 |---|---|
 | `controller/internal/protocol/protocol_contract_test.go` | `../../../api/internal/hostedsvc/testdata/controller_poll_wire.json` |
 | `controller/internal/preset/preset_contract_test.go` (`goldenPath`, shared with `size_display_golden_test.go`) | `../../../api/internal/hostedsvc/testdata/{hosted_sizes,hosted_templates}.json` |
+| `controller/internal/apiclient/poll_capability_bound_test.go` | `../../../api/internal/hostedsvc/testdata/controller_poll_limits.json` (also read by `api/internal/capability`) |
 
 - Those cross-reads are the gate: they make two modules' independently-declared types and tables safe to drift apart, so a `(cached)` run silently retires the only check on the wire format. A warm `GOCACHE` (the job's `cache:`) arms the trap, so it is invisible until the build gets faster.
 

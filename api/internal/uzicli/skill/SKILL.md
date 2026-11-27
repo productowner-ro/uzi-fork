@@ -296,6 +296,8 @@ uzi docs show <slug>
 uzi docs search <query> [--audience user|operator|design|contributor|all]
 uzi repo list
 uzi repo remove <id> [--force]
+uzi repo issue-tracker-states <repo>
+uzi issue-tracker list
 uzi project-sync status <repo>
 uzi project-sync resync <repo>
 uzi pr list [--repo <repo-id>]
@@ -543,7 +545,7 @@ uzi version
   or workspace spend limit; no timer, no automatic retry or credential switch, work and custody kept,
   owner Resume, Switch token or Cancel). Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first. To choose another token now, use Switch token or `uzi run set-token`
   (`uzi token list`, then `uzi run set-token <id> <label>`; not for chat, judge, self_improve or job runs) — or
-  because the forge was unreachable at clone — cause `forge_unreachable`, with up to
+  because the forge was unreachable at clone (or, for a started run, the api could not read it at claim) — cause `forge_unreachable`, with up to
   `RUN_FORGE_UNREACHABLE_MAX_PARKS` timed parks (`0` means unlimited), followed by an
   owner Resume/Cancel hold with NULL retry. Resume queues one bounded attempt without
   resetting lifetime counts or bypassing cooldown/custody admission. Heartbeat online
@@ -2038,6 +2040,12 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   `vault_locked` (the vault is locked or its state could not be checked), the table
   path prints a note to stderr suggesting `uzi vault unlock`, carrying the same
   `--context`/`--url` flags; `--json` prints no note. Variables are written in the web UI only; the CLI has no write verb.
+- `uzi issue-tracker list` — your issue tracker connections (kind, base URL, account,
+  created, last verified). `uzi repo issue-tracker-states <repo>` — a linked repo's
+  State mapping (open, closed, each column's State) and its project's States with
+  whether each can close or open an issue; `<repo>` is a path or a repo id (a repo is
+  linked before its first enable, so it may not be in `uzi repo list`). Both take
+  `--json`. On a linked repo an issue shows as its key (`ABC-12`), not `#number`.
 - `uzi admin users|runs|workers|health|usage|rate-limits|cli-tokens|guardrail-impact` and
   `uzi admin agent-source get|status` —
   **read-only** factory-wide views. These require an admin-scoped (`uza_`) token; a

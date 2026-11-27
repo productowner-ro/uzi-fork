@@ -13,7 +13,7 @@ import (
 // mountRepoRoutes registers the repos group: list/run-create/task-run/remove/
 // schedules on RequireUser, and the cookie-only board, project-sync and issue
 // routes on RequireAuth.
-func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter *mw.Limiter) {
+func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter, authLimiter *mw.Limiter) {
 	// Repos (PRD #64): GET / (uzi repo list), POST /{id}/runs (uzi run create) and
 	// POST /{id}/task-runs (uzi handoff) are RequireUser; every other repo route is
 	// cookie-only. PATCH /{id} is the F1 admin-write path (repo_skills_enabled /
@@ -96,6 +96,12 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			// posture as POST /{id}/rework and /{id}/runs. Snapshots the failed pipeline's
 			// jobs + logs from the forge → per-user forge budget.
 			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/ci-fix-runs", h.CreateCIFixRun)
+			// The linked repo's State mapping read (PRD #4173 M6) for `uzi repo issue-tracker-states`:
+			// RequireUser so the CLI's uzc_ Bearer reaches it, owner-scoped in the service. It
+			// reads the project's States from the issue tracker, so it carries the per-user forge
+			// budget (after RequireUser, as above). The response carries no token. The PUT of the
+			// same path stays cookie-only below.
+			r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/issue-tracker-link/states", h.GetIssueTrackerStateMapping)
 		})
 		r.Group(func(r chi.Router) {
 			r.Use(h.requireAuth())
@@ -112,10 +118,10 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			// and tag lists), so it carries the per-user forge budget; owner-scoped in the
 			// service (404 for a foreign repo or connection). No unlink or relink route exists.
 			r.With(forgeLimiter.PerUserMiddleware).Put("/{id}/issue-tracker-link", h.LinkRepoToIssueTracker)
-			// The linked repo's State mapping (PRD #4173 M5): the GET lists the project's States
-			// from the issue tracker and the PUT validates against them, so both carry the forge
-			// budget. Session-only and owner-scoped in the service, like the link itself.
-			r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/issue-tracker-link/states", h.GetIssueTrackerStateMapping)
+			// The linked repo's State mapping (PRD #4173 M5): the PUT validates against the
+			// project's States from the issue tracker, so it carries the forge budget. It is
+			// session-only and owner-scoped in the service, like the link itself. The read of
+			// the same path is in the RequireUser group above (PRD #4173 M6).
 			r.With(forgeLimiter.PerUserMiddleware).Put("/{id}/issue-tracker-link/states", h.PutIssueTrackerStateMapping)
 			// GitHub Projects v2 sync, owner-or-admin (issue #534, PRD #364 follow-up):
 			// relocated out of /admin (D4). Owner path is guarded by a GetRepoForUser
@@ -149,10 +155,12 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			r.Put("/{id}/tool-profile", h.SetRepoToolProfile)
 			// Per-repo environment variable writes (PRD #4416): cookie and CSRF only, like every
 			// secret write. Owner-only behind the same preflight as the tool profile.
-			r.Put("/{id}/env/{name}", h.PutRepoEnvVar)
-			r.Post("/{id}/env/{name}/disable", h.DisableRepoEnvVar)
-			r.Post("/{id}/env/{name}/enable", h.EnableRepoEnvVar)
-			r.Delete("/{id}/env/{name}", h.DeleteRepoEnvVar)
+			// authLimiter (the per-user secret-write budget) runs AFTER the group's auth, which is
+			// what populates the user key it buckets on.
+			r.With(authLimiter.PerUserMiddleware).Put("/{id}/env/{name}", h.PutRepoEnvVar)
+			r.With(authLimiter.PerUserMiddleware).Post("/{id}/env/{name}/disable", h.DisableRepoEnvVar)
+			r.With(authLimiter.PerUserMiddleware).Post("/{id}/env/{name}/enable", h.EnableRepoEnvVar)
+			r.With(authLimiter.PerUserMiddleware).Delete("/{id}/env/{name}", h.DeleteRepoEnvVar)
 			r.Get("/{id}/board", h.GetBoard)
 			// Per-user, per-repo board view preferences (PRD #196 M3): the
 			// membership extras override and "show all other issues" toggle, moved

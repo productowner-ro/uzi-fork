@@ -100,6 +100,14 @@ import type {
   ForgeConfig,
   ForgeConnection,
   HealthDoc,
+  IssueTrackerConfig,
+  IssueTrackerConnection,
+  IssueTrackerLinkRequest,
+  IssueTrackerLinkResult,
+  IssueTrackerProject,
+  IssueTrackerStateMapping,
+  IssueTrackerStatesView,
+  IssueTrackerTag,
   HostedConfig,
   IncidentalFinding,
   IncidentalFindingBacklog,
@@ -476,6 +484,44 @@ async function request<T>(
     throw new ApiError(res.status, message, payload);
   }
   return payload as T;
+}
+
+// moduleApiRequest is the transport behind a runtime web module's `sdk.api.request`
+// (PRD #4686). `path` is relative to /api and must start with "/". It rejects, with a
+// 400 ApiError and no fetch, anything that could leave /api/: a method outside
+// GET/POST/PUT/PATCH/DELETE; in the whole string, backslashes, whitespace and C0/C1
+// control characters; and in the path part only (before the first "?" or "#", so query
+// values such as `branch=a%2Fb` or `next=//x` stay legal), "//" empty segments, encoded
+// separators or dots (%2f, %5c, %2e, any case) and "." / ".." segments. It then checks
+// the normalized URL still sits under /api/. A passing path goes to the private
+// request() unchanged, so the session cookie, CSRF header, passive handling, the 401
+// logout path and vault-lock handling all apply. Mock (demo) builds never touch the network.
+const MODULE_API_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+
+export function moduleApiRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
+  if (MOCK_MODE) return Promise.reject(new ApiError(503, "not available in demo mode"));
+  const reject = (why: string) => Promise.reject(new ApiError(400, `invalid module api path: ${why}`));
+  if (typeof method !== "string" || !MODULE_API_METHODS.has(method)) {
+    return Promise.reject(new ApiError(400, "invalid module api method"));
+  }
+  if (typeof path !== "string" || !path.startsWith("/")) return reject("must start with /");
+  if (path.includes("\\")) return reject("backslash");
+  for (const ch of path) {
+    const code = ch.charCodeAt(0);
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f) || /\s/.test(ch)) {
+      return reject("control or whitespace character");
+    }
+  }
+  const pathname = path.split(/[?#]/)[0];
+  if (pathname.includes("//")) return reject("empty segment");
+  if (/%(2f|5c|2e)/i.test(pathname)) return reject("encoded separator or dot");
+  if (pathname.split("/").some((seg) => seg === "." || seg === "..")) return reject("dot segment");
+  try {
+    if (!new URL(`/api${path}`, window.location.origin).pathname.startsWith("/api/")) return reject("leaves /api/");
+  } catch {
+    return reject("unparseable");
+  }
+  return request<T>(method, path, body);
 }
 
 // uploadBrandingLogo PUTs a RAW image body to the admin logo endpoint (PRD #685).
@@ -1105,6 +1151,59 @@ const realApi = {
     request<{ repos: Repo[] }>(
       "GET",
       `/forge/connections/${connectionId}/projects`,
+    ),
+
+  // Issue tracker connections (PRD #4173 M6). Session-only, except the list, which a
+  // CLI token can read too. The token is write-only: it travels only in the create
+  // body and no response carries it. Reconnecting with the same base URL replaces it.
+  issueTrackerConfig: () =>
+    request<IssueTrackerConfig>("GET", "/issue-trackers/config"),
+  listIssueTrackerConnections: () =>
+    request<{ connections: IssueTrackerConnection[] }>(
+      "GET",
+      "/issue-trackers/connections",
+    ),
+  createIssueTrackerConnection: (kind: string, baseUrl: string, token: string) =>
+    request<{ connection: IssueTrackerConnection }>(
+      "POST",
+      "/issue-trackers/connections",
+      { kind, base_url: baseUrl, token },
+    ),
+  deleteIssueTrackerConnection: (id: string) =>
+    request<null>(
+      "DELETE",
+      `/issue-trackers/connections/${encodeURIComponent(id)}`,
+    ),
+  listIssueTrackerProjects: (id: string) =>
+    request<{ projects: IssueTrackerProject[] }>(
+      "GET",
+      `/issue-trackers/connections/${encodeURIComponent(id)}/projects`,
+    ),
+  listIssueTrackerTags: (id: string) =>
+    request<{ tags: IssueTrackerTag[] }>(
+      "GET",
+      `/issue-trackers/connections/${encodeURIComponent(id)}/tags`,
+    ),
+  // Link a never-enabled repo to one issue tracker project and eligibility tag. Session
+  // only; the link is permanent (no unlink or relink).
+  linkRepoToIssueTracker: (repoId: string, body: IssueTrackerLinkRequest) =>
+    request<{ link: IssueTrackerLinkResult }>(
+      "PUT",
+      `/repos/${encodeURIComponent(repoId)}/issue-tracker-link`,
+      body,
+    ),
+  // A linked repo's State mapping and its project's States. The GET also takes a CLI
+  // token; the PUT is session-only and replaces the whole mapping.
+  getIssueTrackerStates: (repoId: string) =>
+    request<IssueTrackerStatesView>(
+      "GET",
+      `/repos/${encodeURIComponent(repoId)}/issue-tracker-link/states`,
+    ),
+  putIssueTrackerStates: (repoId: string, mapping: IssueTrackerStateMapping) =>
+    request<{ mapping: IssueTrackerStateMapping }>(
+      "PUT",
+      `/repos/${encodeURIComponent(repoId)}/issue-tracker-link/states`,
+      mapping,
     ),
 
   listRepos: () => request<{ repos: Repo[] }>("GET", "/repos"),
@@ -2168,7 +2267,8 @@ const realApi = {
   adminDeleteEgressProfile: (name: string) =>
     request<null>("DELETE", `/admin/egress-profiles/${encodeURIComponent(name)}`),
   // Admin-shared provider definitions (PRD #4324). Reads sit in the admin read group; every
-  // write is a cookie-only admin route. Create is keyless (each user attaches their own key);
+  // write is a cookie-only admin route. Create is keyless (each user attaches their own key)
+  // and sends the engine with its matching protocol;
   // PATCH changes the name and/or model map only (base_url/auth_style are a 400); DELETE is a
   // 409 provider_in_use_as_source while any user has the definition selected.
   adminListSharedProviders: () =>
@@ -2176,8 +2276,7 @@ const realApi = {
   adminCreateSharedProvider: (input: AdminSharedProviderCreateInput) =>
     request<{ provider: AdminSharedProvider }>("POST", "/admin/providers", {
       ...input,
-      engine: "claude",
-      protocol: "anthropic_messages",
+      protocol: input.engine === "codex" ? "openai_responses" : "anthropic_messages",
     }),
   adminPatchSharedProvider: (id: string, body: { name?: string; model_map?: ProviderModelMap }) =>
     request<{ provider: AdminSharedProvider }>("PATCH", `/admin/providers/${encodeURIComponent(id)}`, body),
